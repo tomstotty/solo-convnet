@@ -10,6 +10,10 @@
 - BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并更新
   running_mean/running_var，推理态使用运行统计仿射。
 
+公开推理 API（仅标准库）：
+- load_model(path)：严格校验 train 产物后返回键序为 values、bias 的新 dict。
+- predict_batch(model, x)：对 [N][1][1][4] 输入逐样本计算 logit，返回预测类别。
+
 命令行子命令（仅标准库）：
 - `python convnet.py train OUTPUT`：在 data/tiny.csv 上训练“展平 + Linear”，
   将权重与指标以紧凑 JSON 原子写入 OUTPUT。
@@ -1472,6 +1476,163 @@ def _cmd_evaluate(weights_path, output_path):
     except (_TrainDataError, ValueError, TypeError, OSError):
         return 1
     return 0
+
+
+# ---------------------------------------------------------------------------
+# 公开推理 API：load_model(path)、predict_batch(model, x)
+# ---------------------------------------------------------------------------
+
+_MODEL_KEYS = ["values", "bias"]
+
+
+def load_model(path):
+    """读取并严格校验 train 产物，返回 {"values": ..., "bias": ...} 新 dict。
+
+    完整复用 evaluate 对 train 产物的键名/键序、类型、长度、重复键、有限值
+    及 values[2][4]、bias[2] 校验；返回的 dict 与两层嵌套 list 均为新建副本。
+
+    path 必须是 str，否则抛 TypeError；文件不可读抛 OSError；内容不是合法
+    UTF-8 抛 UnicodeDecodeError；JSON 语法错、重复键、键序/长度/形状/非有限
+    值抛 ValueError；顶层对象或字段类型错抛 TypeError。
+    """
+    if not isinstance(path, str):
+        raise TypeError(
+            "path 必须是 str，得到 %s" % type(path).__name__
+        )
+    with open(path, "rb") as f:
+        raw = f.read()
+    doc = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("权重产物顶层必须是 JSON 对象")
+    if list(doc.keys()) != _EVAL_TOP_KEYS:
+        raise ValueError("权重产物顶层键必须依次为 weights、metrics")
+
+    weights_obj = doc["weights"]
+    if not isinstance(weights_obj, dict):
+        raise TypeError(
+            "weights 必须是 JSON 对象，得到 %s"
+            % type(weights_obj).__name__
+        )
+    if list(weights_obj.keys()) != _EVAL_WEIGHTS_KEYS:
+        raise ValueError("weights 的键必须依次为 values、bias")
+    metrics_obj = doc["metrics"]
+    if not isinstance(metrics_obj, dict):
+        raise TypeError(
+            "metrics 必须是 JSON 对象，得到 %s"
+            % type(metrics_obj).__name__
+        )
+    if list(metrics_obj.keys()) != _EVAL_METRICS_KEYS:
+        raise ValueError("metrics 的键必须依次为 epochs、lr、loss、accuracy")
+
+    values = weights_obj["values"]
+    bias = weights_obj["bias"]
+    if not isinstance(values, list):
+        raise TypeError(
+            "values 必须是嵌套 list，得到 %s" % type(values).__name__
+        )
+    if not isinstance(bias, list):
+        raise TypeError(
+            "bias 必须是 list，得到 %s" % type(bias).__name__
+        )
+    if _shape_of(values, 2, "values") != (
+        _TRAIN_NUM_CLASSES,
+        _TRAIN_NUM_FEATURES,
+    ):
+        raise ValueError("values 的形状必须为 [2][4]")
+    if _shape_of(bias, 1, "bias") != (_TRAIN_NUM_CLASSES,):
+        raise ValueError("bias 的形状必须为 [2]")
+
+    epochs = metrics_obj["epochs"]
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int，得到 %s" % type(epochs).__name__
+        )
+    _check_metrics_float(metrics_obj["lr"], "lr")
+    _check_metrics_float(metrics_obj["accuracy"], "accuracy")
+    loss = metrics_obj["loss"]
+    if not isinstance(loss, list):
+        raise TypeError(
+            "loss 必须是 list，得到 %s" % type(loss).__name__
+        )
+    if len(loss) != _TRAIN_EPOCHS:
+        raise ValueError(
+            "loss 长度 %d 与训练轮数 %d 不符" % (len(loss), _TRAIN_EPOCHS)
+        )
+    for entry in loss:
+        _check_metrics_float(entry, "loss")
+
+    return {"values": _deep_copy(values), "bias": _deep_copy(bias)}
+
+
+def predict_batch(model, x):
+    """对批量输入做线性分类，返回长度 N 的新 int 列表（类别下标）。
+
+    model 必须严格为 load_model 返回的 dict：键依次为 values、bias，
+    values 为 [2][4]、bias 为 [2] 的嵌套 list；x 必须为非空规则
+    list[N][1][1][4]。model 与 x 的全部标量须为有限 int/float（拒绝 bool）。
+
+    按 n→o→i 顺序计算 bias[o] + Σ x[n][0][0][i] * values[o][i]，运算产生
+    非有限值抛 ValueError；取最大 logit，并列时取较小类别。不修改任何实参。
+
+    容器或标量类型错抛 TypeError；键序、嵌套层级、空维、不规则、形状不符或
+    非有限值抛 ValueError。
+    """
+    if not isinstance(model, dict):
+        raise TypeError(
+            "model 必须是 dict，得到 %s" % type(model).__name__
+        )
+    if list(model.keys()) != _MODEL_KEYS:
+        raise ValueError("model 的键必须依次为 values、bias")
+    values = model["values"]
+    bias = model["bias"]
+    if not isinstance(values, list):
+        raise TypeError(
+            "values 必须是嵌套 list，得到 %s" % type(values).__name__
+        )
+    if not isinstance(bias, list):
+        raise TypeError(
+            "bias 必须是 list，得到 %s" % type(bias).__name__
+        )
+    if _shape_of(values, 2, "values") != (
+        _TRAIN_NUM_CLASSES,
+        _TRAIN_NUM_FEATURES,
+    ):
+        raise ValueError("values 的形状必须为 [2][4]")
+    if _shape_of(bias, 1, "bias") != (_TRAIN_NUM_CLASSES,):
+        raise ValueError("bias 的形状必须为 [2]")
+
+    if not isinstance(x, list):
+        raise TypeError("x 必须是嵌套 list，得到 %s" % type(x).__name__)
+    if _shape_of(x, 4, "x") != (
+        len(x),
+        1,
+        1,
+        _TRAIN_NUM_FEATURES,
+    ):
+        raise ValueError("x 的形状必须为 [N][1][1][4]（N >= 1）")
+
+    n_ = len(x)
+    predictions = []
+    for n in range(n_):
+        x_row = x[n][0][0]
+        logits = []
+        for o in range(_TRAIN_NUM_CLASSES):
+            acc = bias[o]
+            w_row = values[o]
+            for i in range(_TRAIN_NUM_FEATURES):
+                acc += x_row[i] * w_row[i]
+            if not math.isfinite(acc):
+                raise ValueError("预测计算产生非有限值（NaN/inf）")
+            logits.append(acc)
+        # 取最大 logit，并列取较小类别。
+        pred = 0
+        for o in range(1, _TRAIN_NUM_CLASSES):
+            if logits[o] > logits[pred]:
+                pred = o
+        predictions.append(pred)
+    return predictions
 
 
 def main(argv):
