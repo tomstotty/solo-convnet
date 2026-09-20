@@ -7,6 +7,7 @@
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
 - Dropout 层：NCHW 嵌套 list，训练态按概率 p 置零并放大保留项，推理态原样复制。
+- BatchNorm2D 层：NCHW 嵌套 list，仅训练态的逐通道批归一化（无运行统计）。
 """
 
 import math
@@ -689,6 +690,203 @@ class Dropout:
         return dx
 
 
+class BatchNorm2D:
+    """二维批归一化层（NCHW，嵌套 list，仅训练态）。
+
+    gamma/beta: 等长非空一维 list，元素为有限 int/float（拒绝 bool），
+    C 为其长度；eps: 正有限 int/float（拒绝 bool）。
+    不维护推理态与运行均值/方差。
+
+    训练前向逐通道（按 n→h→w 汇总该通道全部 M=N*H*W 个值）：
+    mu = sum(x)/M，var = sum((x-mu)^2)/M，
+    z = (x-mu)/sqrt(var+eps)，输出 y = gamma*z + beta，并缓存 z、var、形状。
+    backward 据 dy 逐通道求：
+    dbeta = sum(dy)，dgamma = sum(dy*z)，
+    dx = gamma/sqrt(var+eps) * (dy - (dbeta + z*dgamma)/M)。
+    """
+
+    def __init__(self, gamma, beta, eps=1e-5):
+        _require_list(gamma, "gamma")
+        _require_list(beta, "beta")
+        g_shape = _shape_of(gamma, 1, "gamma")
+        b_shape = _shape_of(beta, 1, "beta")
+        if g_shape[0] != b_shape[0]:
+            raise ValueError(
+                "gamma 长度 %d 与 beta 长度 %d 不符"
+                % (g_shape[0], b_shape[0])
+            )
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+            raise TypeError(
+                "eps 必须是 int/float（拒绝 bool），得到 %s"
+                % type(eps).__name__
+            )
+        if not math.isfinite(eps):
+            raise ValueError("eps 必须是有限值（拒绝 NaN/inf）")
+        if eps <= 0:
+            raise ValueError("eps 必须为正数")
+
+        self._gamma = gamma
+        self._beta = beta
+        self._eps = eps
+        self._channels = g_shape[0]
+
+        self._z = None           # 最近一次成功 forward 的归一化值
+        self._var = None         # 最近一次成功 forward 的逐通道方差
+        self._x_shape = None     # 最近一次成功 forward 的输入形状
+        self._out_shape = None   # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 逐通道批归一化，返回 gamma*z+beta 新 list 并缓存 z、var、形状。"""
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+        if c_ != self._channels:
+            raise ValueError(
+                "输入通道数 %d 与 gamma/beta 长度 %d 不符"
+                % (c_, self._channels)
+            )
+
+        gamma = self._gamma
+        beta = self._beta
+        eps = self._eps
+        m_ = n_ * h_ * w_
+
+        z = []
+        out = []
+        var = []
+        try:
+            for c in range(c_):
+                s_sum = 0.0
+                for n in range(n_):
+                    x_c = x[n][c]
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        for ww in range(w_):
+                            s_sum += x_row[ww]
+                mu = s_sum / m_
+                v_sum = 0.0
+                for n in range(n_):
+                    x_c = x[n][c]
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        for ww in range(w_):
+                            d = x_row[ww] - mu
+                            v_sum += d * d
+                v = v_sum / m_
+                if not (math.isfinite(mu) and math.isfinite(v)):
+                    raise ValueError("前向计算产生非有限值（NaN/inf）")
+                std = math.sqrt(v + eps)
+
+                z_c = []
+                out_c = []
+                g = gamma[c]
+                b = beta[c]
+                for n in range(n_):
+                    x_c = x[n][c]
+                    z_n = []
+                    out_n = []
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        z_row = []
+                        out_row = []
+                        for ww in range(w_):
+                            z_val = (x_row[ww] - mu) / std
+                            y_val = g * z_val + b
+                            if not (math.isfinite(z_val) and math.isfinite(y_val)):
+                                raise ValueError("前向计算产生非有限值（NaN/inf）")
+                            z_row.append(z_val)
+                            out_row.append(y_val)
+                        z_n.append(z_row)
+                        out_n.append(out_row)
+                    z_c.append(z_n)
+                    out_c.append(out_n)
+                z.append(z_c)
+                out.append(out_c)
+                var.append(v)
+
+            # z/out 当前按 [C][N][H][W] 存放，转置为输出所需的 [N][C][H][W]
+            z = [[z[c][n] for c in range(c_)] for n in range(n_)]
+            out = [[out[c][n] for c in range(c_)] for n in range(n_)]
+        except OverflowError:
+            raise ValueError("前向计算产生非有限值（NaN/inf）")
+
+        self._z = z
+        self._var = var
+        self._x_shape = (n_, c_, h_, w_)
+        self._out_shape = (n_, c_, h_, w_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回 (dx, dgamma, dbeta)。
+
+        形状依次同 x、gamma、beta；逐通道按 n→h→w 顺序求
+        dbeta=sum(dy)、dgamma=sum(dy*z)、
+        dx=gamma/sqrt(var+eps)*(dy-(dbeta+z*dgamma)/M)。
+        dy 的形状必须等于最近一次成功 forward 的输出形状。
+        未成功 forward 前调用一律抛 ValueError。
+        """
+        if self._z is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, h_, w_ = self._out_shape
+        m_ = n_ * h_ * w_
+        z = self._z
+        var = self._var
+        gamma = self._gamma
+        eps = self._eps
+
+        dx = _zeros(self._x_shape)
+        dgamma = [0.0] * c_
+        dbeta = [0.0] * c_
+        try:
+            for c in range(c_):
+                # 第一遍：按 n→h→w 求该通道完整的 dbeta、dgamma
+                dg = 0.0
+                db = 0.0
+                for n in range(n_):
+                    z_c = z[n][c]
+                    dy_c = dy[n][c]
+                    for hh in range(h_):
+                        z_row = z_c[hh]
+                        dy_row = dy_c[hh]
+                        for ww in range(w_):
+                            gv = dy_row[ww]
+                            db += gv
+                            dg += gv * z_row[ww]
+                if not (math.isfinite(db) and math.isfinite(dg)):
+                    raise ValueError("反向计算产生非有限值（NaN/inf）")
+                dgamma[c] = dg
+                dbeta[c] = db
+
+                # 第二遍：用通道完整总和计算逐元素 dx
+                std = math.sqrt(var[c] + eps)
+                scale = gamma[c] / std
+                if not math.isfinite(scale):
+                    raise ValueError("反向计算产生非有限值（NaN/inf）")
+                for n in range(n_):
+                    z_c = z[n][c]
+                    dy_c = dy[n][c]
+                    dx_c = dx[n][c]
+                    for hh in range(h_):
+                        z_row = z_c[hh]
+                        dy_row = dy_c[hh]
+                        dx_row = dx_c[hh]
+                        for ww in range(w_):
+                            val = scale * (dy_row[ww] - (db + z_row[ww] * dg) / m_)
+                            if not math.isfinite(val):
+                                raise ValueError("反向计算产生非有限值（NaN/inf）")
+                            dx_row[ww] = val
+        except OverflowError:
+            raise ValueError("反向计算产生非有限值（NaN/inf）")
+        return dx, dgamma, dbeta
+
+
 def _deep_copy(t):
     """递归复制嵌套 list；标量原样返回。"""
     if isinstance(t, list):
@@ -833,3 +1031,5 @@ if __name__ == "__main__":
     print("              Flatten()")
     print("              Linear(weights, bias)")
     print("              ReLU()")
+    print("              Dropout(p=0.5, seed=0)")
+    print("              BatchNorm2D(gamma, beta, eps=1e-5)")
