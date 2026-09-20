@@ -6,6 +6,7 @@
 - Flatten 层：NCHW 嵌套 list 展平为 [N][C*H*W]（按 c→h→w 顺序）。
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
+- Dropout 层：NCHW 嵌套 list，训练态按概率 p 置零并放大保留项，推理态原样复制。
 """
 
 import math
@@ -544,6 +545,147 @@ class ReLU:
             for d in range(d_):
                 if x_row[d] > 0:
                     dx_row[d] = dy_row[d]
+        return dx
+
+
+class Dropout:
+    """Dropout 层（NCHW，嵌套 list）：训练态按概率 p 置零并放大保留项。
+
+    p: 丢弃概率，[0, 1) 的有限 int/float（拒绝 bool）。
+    seed: 随机种子，[0, 2^32-1] 的 int（拒绝 bool）；随机状态 s 初始为 seed。
+    默认训练态；train(mode) 切换模式，mode 仅接收 bool。
+
+    训练前向按 n→c→h→w 顺序逐元素推进线性同余发生器：
+    s = (1664525*s + 1013904223) % 2^32，u = s / 2^32；
+    u < p 时输出 0，否则输出 x/(1-p)，并缓存同形的 0 或 1/(1-p) 掩码。
+    推理前向返回 x 的新副本，不推进 s，缓存全 1 掩码。
+    backward 返回 dy 与最近缓存掩码逐元素相乘的新 list。
+    不读写全局 random 状态；相同 seed、输入与调用序列结果完全相同。
+    """
+
+    def __init__(self, p=0.5, seed=0):
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise TypeError(
+                "p 必须是 int/float（拒绝 bool），得到 %s" % type(p).__name__
+            )
+        if not math.isfinite(p):
+            raise ValueError("p 必须是有限值（拒绝 NaN/inf）")
+        if p < 0 or p >= 1:
+            raise ValueError("p 必须满足 0 <= p < 1")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(
+                "seed 必须是 int（拒绝 bool），得到 %s" % type(seed).__name__
+            )
+        if seed < 0 or seed > 0xFFFFFFFF:
+            raise ValueError("seed 必须满足 0 <= seed <= 2^32-1")
+
+        self._p = p
+        self._seed = seed
+        self._s = seed          # 当前随机状态
+        self._training = True   # 默认训练态
+
+        self._mask = None       # 最近一次成功 forward 的掩码
+        self._out_shape = None  # 最近一次成功 forward 的输出形状
+
+    def train(self, mode=True):
+        """切换训练/推理模式并返回 None；mode 仅接收 bool，否则抛 TypeError。"""
+        if not isinstance(mode, bool):
+            raise TypeError(
+                "mode 必须是 bool，得到 %s" % type(mode).__name__
+            )
+        self._training = mode
+        return None
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 施加 dropout，返回新 list 并缓存掩码。
+
+        训练态按 n→c→h→w 顺序逐元素推进内部随机状态；推理态返回 x 的
+        新副本且不推进随机状态。校验失败不改变实参、随机状态与旧缓存。
+        """
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+
+        if self._training:
+            p = self._p
+            scale = 1 / (1 - p)
+            s = self._s
+            out = []
+            mask = []
+            for n in range(n_):
+                out_n = []
+                mask_n = []
+                for c in range(c_):
+                    x_c = x[n][c]
+                    out_c = []
+                    mask_c = []
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        out_row = []
+                        mask_row = []
+                        for w in range(w_):
+                            s = (1664525 * s + 1013904223) % 4294967296
+                            u = s / 4294967296
+                            if u < p:
+                                out_row.append(0)
+                                mask_row.append(0)
+                            else:
+                                out_row.append(x_row[w] / (1 - p))
+                                mask_row.append(scale)
+                        out_c.append(out_row)
+                        mask_c.append(mask_row)
+                    out_n.append(out_c)
+                    mask_n.append(mask_c)
+                out.append(out_n)
+                mask.append(mask_n)
+            self._s = s
+        else:
+            out = _deep_copy(x)
+            mask = []
+            for n in range(n_):
+                mask_n = []
+                for c in range(c_):
+                    mask_c = []
+                    for hh in range(h_):
+                        mask_c.append([1] * w_)
+                    mask_n.append(mask_c)
+                mask.append(mask_n)
+
+        self._mask = mask
+        self._out_shape = (n_, c_, h_, w_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回与掩码逐元素相乘的新 list。
+
+        dy 的形状必须等于最近一次成功 forward 的输出形状；
+        未成功 forward 前调用一律抛 ValueError。
+        """
+        if self._mask is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, h_, w_ = self._out_shape
+        mask = self._mask
+        dx = []
+        for n in range(n_):
+            dx_n = []
+            for c in range(c_):
+                dx_c = []
+                for hh in range(h_):
+                    dy_row = dy[n][c][hh]
+                    mask_row = mask[n][c][hh]
+                    dx_row = []
+                    for w in range(w_):
+                        dx_row.append(dy_row[w] * mask_row[w])
+                    dx_c.append(dx_row)
+                dx_n.append(dx_c)
+            dx.append(dx_n)
         return dx
 
 
