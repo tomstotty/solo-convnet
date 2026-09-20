@@ -9,9 +9,17 @@
 - Dropout 层：NCHW 嵌套 list，训练态按概率 p 置零并放大保留项，推理态原样复制。
 - BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并更新
   running_mean/running_var，推理态使用运行统计仿射。
+
+命令行子命令（仅标准库）：
+- `python convnet.py train OUTPUT`：在 data/tiny.csv 上训练“展平 + Linear”，
+  将权重与指标以紧凑 JSON 原子写入 OUTPUT。
 """
 
+import json
 import math
+import os
+import sys
+import tempfile
 
 
 def _is_number(value):
@@ -1118,7 +1126,227 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     return (bool(ok), float(max_e), float(max_r))
 
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# 命令行训练：python convnet.py train OUTPUT
+# ---------------------------------------------------------------------------
+
+_TRAIN_DATA_PATH = os.path.join("data", "tiny.csv")
+_TRAIN_EXPECTED_BYTES = b"0,0,0,0,0\n1,1,1,1,1\n"
+_TRAIN_NUM_CLASSES = 2
+_TRAIN_NUM_FEATURES = 4
+_TRAIN_EPOCHS = 50
+_TRAIN_LR = 0.5
+
+
+class _TrainDataError(Exception):
+    """训练数据缺失或字节内容不符。"""
+
+
+def _load_train_samples():
+    """读取 data/tiny.csv，严格校验字节后解析为 (images, labels)。
+
+    images: [N][1][1][4]（NCHW，c→h→w 各为 1）；labels: [N]，取值 0/1。
+    文件缺失、不可读或字节不等于约定内容一律抛 _TrainDataError。
+    """
+    try:
+        with open(_TRAIN_DATA_PATH, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise _TrainDataError("无法读取 %s：%s" % (_TRAIN_DATA_PATH, exc))
+    if raw != _TRAIN_EXPECTED_BYTES:
+        raise _TrainDataError(
+            "%s 的字节内容与预期不符" % _TRAIN_DATA_PATH
+        )
+
+    images = []
+    labels = []
+    for line in raw.decode("utf-8").split("\n"):
+        if line == "":
+            continue
+        fields = line.split(",")
+        if len(fields) != _TRAIN_NUM_FEATURES + 1:
+            raise _TrainDataError("%s 存在字段数不为 5 的行" % _TRAIN_DATA_PATH)
+        values = []
+        for field in fields:
+            if field not in ("0", "1"):
+                raise _TrainDataError(
+                    "%s 含非 0/1 字段：%r" % (_TRAIN_DATA_PATH, field)
+                )
+            values.append(int(field))
+        images.append([[values[:_TRAIN_NUM_FEATURES]]])
+        labels.append(values[_TRAIN_NUM_FEATURES])
+    if not images:
+        raise _TrainDataError("%s 不含任何样本" % _TRAIN_DATA_PATH)
+    return images, labels
+
+
+def _train_run():
+    """执行确定性训练，返回 (weights_values, bias, losses, accuracy)。"""
+    images, labels = _load_train_samples()
+    n_ = len(images)
+
+    flatten = Flatten()
+    weights = [[0.0] * _TRAIN_NUM_FEATURES for _ in range(_TRAIN_NUM_CLASSES)]
+    bias = [0.0] * _TRAIN_NUM_CLASSES
+    linear = Linear(weights, bias)
+
+    losses = []
+    lr = _TRAIN_LR
+    for _ in range(_TRAIN_EPOCHS):
+        flat = flatten.forward(images)
+        logits = linear.forward(flat)
+
+        # 交叉熵前向：softmax 先减去每行最大 logit；记录更新前的批均损失。
+        probs = []
+        loss_sum = 0.0
+        for n in range(n_):
+            row = logits[n]
+            m = row[0]
+            for o in range(1, _TRAIN_NUM_CLASSES):
+                if row[o] > m:
+                    m = row[o]
+            exps = []
+            denom = 0.0
+            for o in range(_TRAIN_NUM_CLASSES):
+                e = math.exp(row[o] - m)
+                exps.append(e)
+                denom += e
+            p = [e / denom for e in exps]
+            probs.append(p)
+            loss_sum += -math.log(p[labels[n]])
+        loss = loss_sum / n_
+        if not math.isfinite(loss):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+        losses.append(loss)
+
+        # 反向：softmax-交叉熵对 logits 的梯度为 p - onehot。
+        grad_logits = [
+            [
+                probs[n][o] - (1.0 if labels[n] == o else 0.0)
+                for o in range(_TRAIN_NUM_CLASSES)
+            ]
+            for n in range(n_)
+        ]
+        _, dw, db = linear.backward(grad_logits)
+
+        # 除 N 后同步 SGD 更新（先全部算出新值再提交）。
+        inv_n = 1.0 / n_
+        new_weights = [
+            [
+                weights[o][i] - lr * dw[o][i] * inv_n
+                for i in range(_TRAIN_NUM_FEATURES)
+            ]
+            for o in range(_TRAIN_NUM_CLASSES)
+        ]
+        new_bias = [
+            bias[o] - lr * db[o] * inv_n
+            for o in range(_TRAIN_NUM_CLASSES)
+        ]
+        for o in range(_TRAIN_NUM_CLASSES):
+            if not math.isfinite(new_bias[o]):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+            for i in range(_TRAIN_NUM_FEATURES):
+                if not math.isfinite(new_weights[o][i]):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+        weights = new_weights
+        bias = new_bias
+        linear = Linear(weights, bias)
+
+    # 损失须逐轮严格下降。
+    for e in range(1, _TRAIN_EPOCHS):
+        if not losses[e] < losses[e - 1]:
+            raise ValueError("训练损失未逐轮严格下降")
+
+    # 末次更新后以最大 logit 预测，并列取小类。
+    final_logits = linear.forward(flatten.forward(images))
+    correct = 0
+    for n in range(n_):
+        row = final_logits[n]
+        pred = 0
+        for o in range(1, _TRAIN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        if pred == labels[n]:
+            correct += 1
+    accuracy = correct / n_
+    if accuracy != 1.0:
+        raise ValueError("训练后 accuracy 不为 1.0")
+    return weights, bias, losses, accuracy
+
+
+def _fmt_float(v):
+    """格式化为固定 1 位整数 + 12 位小数；负零规范化为 0.000000000000。"""
+    if not math.isfinite(v):
+        raise ValueError("出现非有限值（NaN/inf），禁止写入产物")
+    s = "%.12f" % v
+    if s == "-0.000000000000":
+        s = "0.000000000000"
+    return s
+
+
+def _dump_compact(value):
+    """手工生成紧凑 JSON：int 原样、float 固定 12 位小数；键序由 dict 保证。"""
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            json.dumps(k, ensure_ascii=False) + ":" + _dump_compact(v)
+            for k, v in value.items()
+        ) + "}"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return _fmt_float(value)
+    if isinstance(value, list):
+        return "[" + ",".join(_dump_compact(v) for v in value) + "]"
+    raise TypeError("产物含不支持的类型：%s" % type(value).__name__)
+
+
+def _atomic_write_output(output_path, payload):
+    """先写同目录临时文件，再原子替换；任何失败都不改动既有 output_path。"""
+    directory = os.path.dirname(os.path.abspath(output_path))
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-train-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, output_path)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _cmd_train(output_path):
+    """train 子命令主体；数据/计算失败返回 1。"""
+    try:
+        weights, bias, losses, accuracy = _train_run()
+        artifact = {
+            "weights": {"values": weights, "bias": bias},
+            "metrics": {
+                "epochs": _TRAIN_EPOCHS,
+                "lr": float(_TRAIN_LR),
+                "loss": losses,
+                "accuracy": accuracy,
+            },
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (_TrainDataError, ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+def main(argv):
+    """命令行入口：仅接受 `train OUTPUT`；成功 0、参数数目错 2、其余失败 1。"""
+    if len(argv) == 3 and argv[1] == "train":
+        return _cmd_train(argv[2])
+    if len(argv) >= 2 and argv[1] == "train":
+        return 2
+    # 其他入口保持现状（信息打印）。
     print("convnet.py：从零实现的卷积神经网络库（仅标准库）。")
     print("当前可用组件：Conv2D(weights, bias, stride=1, padding=0)")
     print("              MaxPool2D(kernel_size, stride=None, padding=0)")
@@ -1127,3 +1355,8 @@ if __name__ == "__main__":
     print("              ReLU()")
     print("              Dropout(p=0.5, seed=0)")
     print("              BatchNorm2D(gamma, beta, eps=1e-5, momentum=0.1)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
