@@ -6,9 +6,15 @@
 - Flatten 层：NCHW 嵌套 list 展平为 [N][C*H*W]（按 c→h→w 顺序）。
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
+- Dropout 层：训练态按确定性 LCG 随机置零并按 1/(1-p) 缩放，推理态直通。
 """
 
 import math
+
+# Dropout 使用的 32 位线性同余生成器常量（Numerical Recipes）与模数 2^32。
+_DROPOUT_LCG_MUL = 1664525
+_DROPOUT_LCG_INC = 1013904223
+_DROPOUT_MOD = 1 << 32
 
 
 def _is_number(value):
@@ -544,6 +550,167 @@ class ReLU:
             for d in range(d_):
                 if x_row[d] > 0:
                     dx_row[d] = dy_row[d]
+        return dx
+
+
+class Dropout:
+    """Dropout 层（NCHW 嵌套 list [N][C][H][W]）。
+
+    构造参数：
+    - p: 置零概率，须为 [0, 1) 内有限 int/float（拒绝 bool）。
+    - seed: LCG 初始状态，须为 [0, 2^32-1] 内 int（拒绝 bool）。
+
+    train(mode=True) 仅接收 bool，切换训练/推理模式（默认训练态）并返回 None。
+    训练态前向按 n→c→h→w 逐元素先推进
+    s=(1664525*s+1013904223) mod 2^32、u=s/2^32：u < p 输出 0，
+    否则输出 x/(1-p)，并缓存同形的 0 或 1/(1-p) 掩码。
+    推理态前向返回 x 的新副本，不推进随机状态，缓存全 1 掩码。
+    backward(dy) 返回 dy 与缓存掩码逐元素相乘的新 list。
+    随机状态完全由实例自持，不读写全局 random。
+    """
+
+    def __init__(self, p=0.5, seed=0):
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise TypeError(
+                "p 必须是 int/float（拒绝 bool），得到 %s"
+                % type(p).__name__
+            )
+        if not math.isfinite(p):
+            raise ValueError("p 必须为有限值（拒绝 NaN/inf）")
+        if p < 0 or p >= 1:
+            raise ValueError("p 必须位于 [0, 1) 区间")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(
+                "seed 必须是 int（拒绝 bool），得到 %s"
+                % type(seed).__name__
+            )
+        if seed < 0 or seed > _DROPOUT_MOD - 1:
+            raise ValueError("seed 必须位于 [0, 2^32-1] 区间")
+
+        self._p = float(p)
+        self._seed = seed
+        self._s = seed                 # 当前 LCG 状态
+        self._training = True          # 默认训练态
+        self._mask = None              # 最近一次成功 forward 的掩码
+        self._out_shape = None         # 最近一次成功 forward 的输出形状
+
+    def train(self, mode=True):
+        """设置训练（True）/推理（False）模式，返回 None；仅接收 bool。"""
+        if not isinstance(mode, bool):
+            raise TypeError(
+                "mode 必须是 bool，得到 %s" % type(mode).__name__
+            )
+        self._training = mode
+        return None
+
+    def forward(self, x):
+        """训练态随机置零并缩放；推理态返回 x 的新副本。两种模式均缓存掩码。"""
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+
+        # 先在临时结构上完成全部计算，成功后才提交状态，失败不改变 s 与旧缓存。
+        if self._training:
+            scale = 1.0 - self._p
+            keep_scale = 1.0 / scale
+            s = self._s
+            out = []
+            mask = []
+            for n in range(n_):
+                out_n = []
+                mask_n = []
+                x_n = x[n]
+                for c in range(c_):
+                    out_c = []
+                    mask_c = []
+                    x_row_group = x_n[c]
+                    for h in range(h_):
+                        out_row = []
+                        mask_row = []
+                        x_row = x_row_group[h]
+                        for w in range(w_):
+                            s = (
+                                _DROPOUT_LCG_MUL * s + _DROPOUT_LCG_INC
+                            ) % _DROPOUT_MOD
+                            u = s / _DROPOUT_MOD
+                            if u < self._p:
+                                out_row.append(0)
+                                mask_row.append(0)
+                            else:
+                                out_row.append(x_row[w] / scale)
+                                mask_row.append(keep_scale)
+                        out_c.append(out_row)
+                        mask_c.append(mask_row)
+                    out_n.append(out_c)
+                    mask_n.append(mask_c)
+                out.append(out_n)
+                mask.append(mask_n)
+            new_s = s
+        else:
+            out = []
+            mask = []
+            for n in range(n_):
+                out_n = []
+                mask_n = []
+                x_n = x[n]
+                for c in range(c_):
+                    out_c = []
+                    mask_c = []
+                    for h in range(h_):
+                        out_row = []
+                        mask_row = []
+                        x_row = x_n[c][h]
+                        for w in range(w_):
+                            out_row.append(x_row[w])
+                            mask_row.append(1)
+                        out_c.append(out_row)
+                        mask_c.append(mask_row)
+                    out_n.append(out_c)
+                    mask_n.append(mask_c)
+                out.append(out_n)
+                mask.append(mask_n)
+            new_s = self._s
+
+        self._s = new_s
+        self._mask = mask
+        self._out_shape = (n_, c_, h_, w_)
+        return out
+
+    def backward(self, dy):
+        """返回 dy 与最近一次成功 forward 缓存掩码逐元素相乘的新 list。
+
+        dy 的形状必须等于最近一次成功 forward 的输出形状。
+        未成功 forward 前调用一律抛 ValueError；切换模式不改变缓存。
+        """
+        if self._mask is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        mask = self._mask
+        n_, c_, h_, w_ = self._out_shape
+        dx = []
+        for n in range(n_):
+            dx_n = []
+            dy_n = dy[n]
+            mask_n = mask[n]
+            for c in range(c_):
+                dx_c = []
+                dy_c = dy_n[c]
+                mask_c = mask_n[c]
+                for h in range(h_):
+                    dx_row = []
+                    dy_row = dy_c[h]
+                    mask_row = mask_c[h]
+                    for w in range(w_):
+                        dx_row.append(dy_row[w] * mask_row[w])
+                    dx_c.append(dx_row)
+                dx_n.append(dx_c)
+            dx.append(dx_n)
         return dx
 
 
