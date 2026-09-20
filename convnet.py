@@ -6,6 +6,9 @@
 - Flatten 层：NCHW 嵌套 list 展平为 [N][C*H*W]（按 c→h→w 顺序）。
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
+
+另提供 check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4)，
+用中心差分数值梯度核对上述某一层的解析梯度。
 """
 
 import math
@@ -64,6 +67,163 @@ def _zeros(shape):
     if len(shape) == 1:
         return [0] * shape[0]
     return [_zeros(shape[1:]) for _ in range(shape[0])]
+
+
+def _finite_number(value, name):
+    """校验有限 int/float 标量参数（拒绝 bool、NaN/inf），原样返回。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            "%s 必须是 int/float（拒绝 bool），得到 %s"
+            % (name, type(value).__name__)
+        )
+    if not math.isfinite(value):
+        raise ValueError("%s 必须为有限值，不能为 NaN/inf" % name)
+    return value
+
+
+def _leaf_paths(node, prefix=()):
+    """收集嵌套 list 全部标量位置的索引路径（外到内的自然顺序）。"""
+    paths = []
+    if isinstance(node, list):
+        for i, child in enumerate(node):
+            paths.extend(_leaf_paths(child, prefix + (i,)))
+        return paths
+    return [prefix]
+
+
+def _get_at(node, path):
+    for i in path:
+        node = node[i]
+    return node
+
+
+def _set_at(node, path, value):
+    for i in path[:-1]:
+        node = node[i]
+    node[path[-1]] = value
+
+
+def _accumulate_loss(y, dy, acc):
+    """按输出嵌套索引从外到内，把 y*dy 逐标量累加进 acc[0]（初值 0.0）。"""
+    if isinstance(y, list):
+        for i in range(len(y)):
+            _accumulate_loss(y[i], dy[i], acc)
+    else:
+        acc[0] += y * dy
+
+
+def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
+    """用中心差分对一层的解析梯度做数值梯度核对。
+
+    - layer：现有五层（Conv2D/MaxPool2D/Flatten/Linear/ReLU）之一的实例，
+      其余类型一律抛 TypeError。
+    - 对 x 的全部标量核对梯度；有参层（Conv2D/Linear）还核对 weights、bias。
+    - 解析梯度取原值 forward(x) 后 backward(dy) 的对应返回，缓存只算一次。
+    - 标量损失 L：acc=0.0，按输出嵌套索引从外到内 acc += y*dy；
+      数值梯度 n = (L(v+eps)-L(v-eps))/(2*eps)。
+    - e=|a-n|，r=e/max(|a|,|n|,1e-12)，ok 当且仅当每项
+      e <= atol + rtol*max(|a|,|n|)。
+    返回固定类型 (bool, float, float)，不舍入。
+    x、dy、参数及实例内部状态在所有路径（含异常）后原样恢复。
+    """
+    eps = _finite_number(eps, "eps")
+    atol = _finite_number(atol, "atol")
+    rtol = _finite_number(rtol, "rtol")
+    if eps <= 0:
+        raise ValueError("eps 必须为正数")
+    if atol < 0 or rtol < 0:
+        raise ValueError("容差 atol/rtol 必须非负")
+    if not isinstance(layer, _LAYER_TYPES):
+        raise TypeError(
+            "layer 必须是五层（Conv2D/MaxPool2D/Flatten/Linear/ReLU）之一的实例，"
+            "得到 %s" % type(layer).__name__
+        )
+
+    # 进入前的实例缓存状态，所有路径（含异常）结束后原样恢复。
+    state_attrs = ("_x", "_out_shape", "_x_shape", "_winners")
+    saved_state = {
+        attr: getattr(layer, attr)
+        for attr in state_attrs
+        if hasattr(layer, attr)
+    }
+
+    snapshots = []
+    try:
+        # 解析梯度：原值 forward 一次、backward 一次。x、dy 的合法性完全交由
+        # 对应层的 forward/backward 校验；二者成功后结构必定规则，再建立快照。
+        layer.forward(x)
+        if isinstance(layer, _HAS_PARAMS):
+            a_dx, a_dw, a_db = layer.backward(dy)
+            analyticals = {"x": a_dx, "weights": a_dw, "bias": a_db}
+            tensors = (("x", x), ("weights", layer._weights),
+                       ("bias", layer._bias))
+        else:
+            analyticals = {"x": layer.backward(dy)}
+            tensors = (("x", x),)
+
+        # 记录每个待扰动标量的路径与原值，确保任何路径下都能逐标量写回。
+        for tname, tensor in tensors:
+            for path in _leaf_paths(tensor):
+                snapshots.append((tname, tensor, path, _get_at(tensor, path)))
+
+        max_e = 0.0
+        max_r = 0.0
+        ok = True
+
+        for tname, tensor, path, original in snapshots:
+            analytical = analyticals[tname]
+            a = _get_at(analytical, path)
+            if not math.isfinite(a):
+                raise ValueError(
+                    "%s%s 的解析梯度为非有限值（NaN/inf）"
+                    % (tname, list(path))
+                )
+
+            # L(v+eps)
+            _set_at(tensor, path, original + eps)
+            yp = layer.forward(x)
+            accp = [0.0]
+            _accumulate_loss(yp, dy, accp)
+
+            # L(v-eps)
+            _set_at(tensor, path, original - eps)
+            ym = layer.forward(x)
+            accm = [0.0]
+            _accumulate_loss(ym, dy, accm)
+
+            # 立即还原该标量，避免污染其它标量的前向（finally 仅兜底异常）。
+            _set_at(tensor, path, original)
+
+            lp = accp[0]
+            lm = accm[0]
+            if not (math.isfinite(lp) and math.isfinite(lm)):
+                raise ValueError(
+                    "%s%s 的数值损失含非有限值（NaN/inf）"
+                    % (tname, list(path))
+                )
+            n = (lp - lm) / (2 * eps)
+            if not math.isfinite(n):
+                raise ValueError(
+                    "%s%s 的数值梯度为非有限值（NaN/inf）"
+                    % (tname, list(path))
+                )
+
+            e = abs(a - n)
+            r = e / max(abs(a), abs(n), 1e-12)
+            if e > max_e:
+                max_e = e
+            if r > max_r:
+                max_r = r
+            if e > atol + rtol * max(abs(a), abs(n)):
+                ok = False
+    finally:
+        # 逐标量还原所有被扰动张量，并恢复实例进入前的缓存状态。
+        for _, tensor, path, original in snapshots:
+            _set_at(tensor, path, original)
+        for attr, val in saved_state.items():
+            setattr(layer, attr, val)
+
+    return ok, float(max_e), float(max_r)
 
 
 class Conv2D:
@@ -545,6 +705,10 @@ class ReLU:
                 if x_row[d] > 0:
                     dx_row[d] = dy_row[d]
         return dx
+
+
+_HAS_PARAMS = (Conv2D, Linear)
+_LAYER_TYPES = (Conv2D, MaxPool2D, Flatten, Linear, ReLU)
 
 
 if __name__ == "__main__":
