@@ -9,9 +9,23 @@
 - Dropout 层：NCHW 嵌套 list，训练态按概率 p 置零并放大保留项，推理态原样复制。
 - BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并更新
   running_mean/running_var，推理态使用运行统计仿射。
+
+命令行子命令（仅标准库）：
+- python convnet.py train OUTPUT：在 data/tiny.csv 上训练「展平 + Linear」，
+  固定 lr=0.5、50 轮全批量梯度下降，产物以紧凑 JSON 原子写入 OUTPUT。
 """
 
 import math
+import os
+import sys
+import tempfile
+
+
+# train 子命令的固定超参与数据文件字节内容。
+_TRAIN_EPOCHS = 50
+_TRAIN_LR = 0.5
+_TRAIN_CLASSES = 2
+_TINY_CSV_BYTES = b"0,0,0,0,0\n1,1,1,1,1\n"
 
 
 def _is_number(value):
@@ -1118,7 +1132,236 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     return (bool(ok), float(max_e), float(max_r))
 
 
+def _load_tiny_dataset():
+    """读取 data/tiny.csv 并严格校验字节与内容，返回 (images, labels)。
+
+    字节必须恰好为 _TINY_CSV_BYTES；每行前四项按 c→h→w 表示单通道
+    1×1×4 图像，末项为类别（0 或 1）。任何不符均抛异常。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "tiny.csv")
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw != _TINY_CSV_BYTES:
+        raise ValueError("data/tiny.csv 字节内容与预期不符")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("data/tiny.csv 不是合法 UTF-8") from exc
+
+    images = []
+    labels = []
+    for line in text.split("\n"):
+        if line == "":
+            continue
+        fields = line.split(",")
+        if len(fields) != 5:
+            raise ValueError("data/tiny.csv 每行必须恰好有 5 个字段")
+        pixels = []
+        for token in fields[:4]:
+            value = int(token)
+            pixels.append(value)
+        label = int(fields[4])
+        if label not in (0, 1):
+            raise ValueError("data/tiny.csv 类别必须为 0 或 1")
+        images.append([[pixels]])
+        labels.append(label)
+    if not images:
+        raise ValueError("data/tiny.csv 没有任何数据行")
+    return images, labels
+
+
+def _softmax_with_loss(logits, label):
+    """对单样本 logits 做减最大值的 softmax，返回 (概率, 交叉熵损失)。"""
+    m = max(logits)
+    exps = [math.exp(v - m) for v in logits]
+    total = sum(exps)
+    probs = [e / total for e in exps]
+    loss = -math.log(probs[label])
+    return probs, loss
+
+
+def _train_model():
+    """在 tiny 数据集上训练展平 + Linear 模型，返回 (weights, bias, losses, accuracy)。
+
+    weights [2][4]、bias [2] 全零初始化；固定 lr=0.5、训练 50 轮。
+    每轮按 n→o→i 递增累计全批量梯度，softmax 交叉熵梯度 (p-onehot) 除以 N
+    后做同步 SGD；loss 记录更新前的批次均值，须逐轮严格下降。
+    末次更新后以最大 logit 预测（并列取小类），accuracy 须为 1.0。
+    """
+    images, labels = _load_tiny_dataset()
+    n_samples = len(images)
+
+    # 展平：[N][C][H][W] 按 c→h→w 展平为 [N][C*H*W]。
+    flat = []
+    for image in images:
+        row = []
+        for c in image:
+            for h in c:
+                for w in h:
+                    row.append(float(w))
+        flat.append(row)
+    n_features = len(flat[0])
+
+    classes = _TRAIN_CLASSES
+    weights = [[0.0] * n_features for _ in range(classes)]
+    bias = [0.0] * classes
+    lr = _TRAIN_LR
+
+    losses = []
+    for _epoch in range(_TRAIN_EPOCHS):
+        probs_rows = []
+        loss_sum = 0.0
+        for n in range(n_samples):
+            x_row = flat[n]
+            logits = []
+            for o in range(classes):
+                acc = bias[o]
+                w_row = weights[o]
+                for i in range(n_features):
+                    acc += x_row[i] * w_row[i]
+                logits.append(acc)
+            probs, loss = _softmax_with_loss(logits, labels[n])
+            probs_rows.append(probs)
+            loss_sum += loss
+
+        mean_loss = loss_sum / n_samples
+        losses.append(mean_loss)
+
+        # 按 n→o→i 递增累计梯度。
+        dw = [[0.0] * n_features for _ in range(classes)]
+        db = [0.0] * classes
+        for n in range(n_samples):
+            x_row = flat[n]
+            for o in range(classes):
+                g = probs_rows[n][o] - (1.0 if labels[n] == o else 0.0)
+                db[o] += g
+                for i in range(n_features):
+                    dw[o][i] += g * x_row[i]
+
+        # 除以 N 后同步 SGD 更新。
+        scale = lr / n_samples
+        for o in range(classes):
+            bias[o] -= scale * db[o]
+            w_row = weights[o]
+            dw_row = dw[o]
+            for i in range(n_features):
+                w_row[i] -= scale * dw_row[i]
+
+    for idx in range(len(losses) - 1):
+        if not (losses[idx + 1] < losses[idx]):
+            raise ValueError("训练损失未逐轮严格下降")
+
+    correct = 0
+    for n in range(n_samples):
+        x_row = flat[n]
+        best_o = 0
+        best_logit = None
+        for o in range(classes):
+            acc = bias[o]
+            w_row = weights[o]
+            for i in range(n_features):
+                acc += x_row[i] * w_row[i]
+            if best_logit is None or acc > best_logit:
+                best_logit = acc
+                best_o = o
+        if best_o == labels[n]:
+            correct += 1
+    accuracy = correct / n_samples
+    if accuracy != 1.0:
+        raise ValueError("训练后 accuracy 必须为 1.0")
+
+    for o in range(classes):
+        if not math.isfinite(bias[o]):
+            raise ValueError("计算产生非有限值（NaN/inf）")
+        for i in range(n_features):
+            if not math.isfinite(weights[o][i]):
+                raise ValueError("计算产生非有限值（NaN/inf）")
+    for value in losses:
+        if not math.isfinite(value):
+            raise ValueError("计算产生非有限值（NaN/inf）")
+
+    return weights, bias, losses, float(accuracy)
+
+
+def _format_float(value):
+    """固定 12 位小数；负零归一化为 0.000000000000。"""
+    if not math.isfinite(value):
+        raise ValueError("产物中存在非有限值（NaN/inf）")
+    text = "%.12f" % value
+    if text == "-0.000000000000":
+        text = "0.000000000000"
+    return text
+
+
+def _float_list_json(values):
+    return "[" + ",".join(_format_float(v) for v in values) + "]"
+
+
+def _build_artifact(weights, bias, losses, accuracy):
+    """按规定键序构造紧凑 JSON 字符串（UTF-8、无 ASCII 转义、末尾 LF）。"""
+    values_json = "[" + ",".join(_float_list_json(row) for row in weights) + "]"
+    bias_json = _float_list_json(bias)
+    loss_json = _float_list_json(losses)
+    lr_text = _format_float(_TRAIN_LR)
+    acc_text = _format_float(accuracy)
+    return (
+        '{"weights":{"values":'
+        + values_json
+        + ',"bias":'
+        + bias_json
+        + '},"metrics":{"epochs":'
+        + str(_TRAIN_EPOCHS)
+        + ',"lr":'
+        + lr_text
+        + ',"loss":'
+        + loss_json
+        + ',"accuracy":'
+        + acc_text
+        + "}}\n"
+    )
+
+
+def _atomic_write(path, text):
+    """先写同目录临时文件再原子替换；任何失败都不改变既有 path。"""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".%s.tmp." % os.path.basename(path), dir=directory
+    )
+    try:
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except BaseException:
+        raise
+
+
+def _cmd_train(output_path):
+    weights, bias, losses, accuracy = _train_model()
+    artifact = _build_artifact(weights, bias, losses, accuracy)
+    _atomic_write(output_path, artifact)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "train":
+        if len(sys.argv) != 3:
+            sys.stderr.write("用法: python convnet.py train OUTPUT\n")
+            sys.exit(2)
+        try:
+            _cmd_train(sys.argv[2])
+        except Exception as exc:
+            sys.stderr.write("train 失败: %s\n" % exc)
+            sys.exit(1)
+        sys.exit(0)
+
     print("convnet.py：从零实现的卷积神经网络库（仅标准库）。")
     print("当前可用组件：Conv2D(weights, bias, stride=1, padding=0)")
     print("              MaxPool2D(kernel_size, stride=None, padding=0)")
