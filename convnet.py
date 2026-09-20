@@ -20,6 +20,12 @@
 - `python convnet.py evaluate WEIGHTS OUTPUT`：读取 train 产物 WEIGHTS，
   在 data/tiny.csv 上逐样本预测，将样本数、预测与准确率以紧凑 JSON
   原子写入 OUTPUT。
+- `python convnet.py fitcnn OUTPUT`：在 data/tiny.csv 上训练
+  “Conv2D(1×1,2 核) → MaxPool2D(2,2,0) → Flatten → Linear”，
+  四特征重排为 [N][1][2][2]，将权重与指标以紧凑 JSON 原子写入 OUTPUT。
+- `python convnet.py evalcnn WEIGHTS OUTPUT`：读取 fitcnn 产物 WEIGHTS，
+  以同一网络在 data/tiny.csv 上逐样本预测，将样本数、预测与准确率以
+  紧凑 JSON 原子写入 OUTPUT。
 """
 
 import json
@@ -1348,6 +1354,186 @@ def _cmd_train(output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行 CNN 训练：python convnet.py fitcnn OUTPUT
+# ---------------------------------------------------------------------------
+
+_CNN_NUM_CLASSES = 2
+_CNN_NUM_FEATURES = 4
+_CNN_EPOCHS = 20
+_CNN_LR = 0.1
+_CNN_CONV_INIT = [[[[1.0]]], [[[-1.0]]]]   # [2][1][1][1]：两枚 1×1 卷积核
+_CNN_LINEAR_INIT = [[-1.0, 1.0], [1.0, -1.0]]  # [2][2]
+
+
+def _load_cnn_samples():
+    """沿用 train 的数据校验，将四特征按行优先重排为 [N][1][2][2]。"""
+    flat_images, labels = _load_train_samples()
+    images = []
+    for n in range(len(flat_images)):
+        row = flat_images[n][0][0]
+        images.append([[[row[0], row[1]], [row[2], row[3]]]])
+    return images, labels
+
+
+def _cnn_forward(conv_w, conv_b, lin_w, lin_b, images):
+    """Conv2D(1×1) → MaxPool2D(2,2,0) → Flatten → Linear 一次前向。"""
+    conv = Conv2D(conv_w, conv_b)
+    pool = MaxPool2D(2, 2, 0)
+    flatten = Flatten()
+    linear = Linear(lin_w, lin_b)
+    conv_out = conv.forward(images)
+    pool_out = pool.forward(conv_out)
+    flat = flatten.forward(pool_out)
+    return linear.forward(flat)
+
+
+def _fitcnn_run():
+    """执行确定性 CNN 训练，返回 (conv_w, conv_b, lin_w, lin_b, losses, accuracy)。"""
+    images, labels = _load_cnn_samples()
+    n_ = len(images)
+
+    conv_w = _deep_copy(_CNN_CONV_INIT)
+    conv_b = [0.0] * _CNN_NUM_CLASSES
+    lin_w = _deep_copy(_CNN_LINEAR_INIT)
+    lin_b = [0.0] * _CNN_NUM_CLASSES
+
+    losses = []
+    lr = _CNN_LR
+    for _ in range(_CNN_EPOCHS):
+        conv = Conv2D(conv_w, conv_b)
+        pool = MaxPool2D(2, 2, 0)
+        flatten = Flatten()
+        linear = Linear(lin_w, lin_b)
+
+        conv_out = conv.forward(images)
+        pool_out = pool.forward(conv_out)
+        flat = flatten.forward(pool_out)
+        logits = linear.forward(flat)
+
+        # 交叉熵前向：softmax 先减去每行最大 logit；记录更新前的批均损失。
+        probs = []
+        loss_sum = 0.0
+        for n in range(n_):
+            row = logits[n]
+            m = row[0]
+            for o in range(1, _CNN_NUM_CLASSES):
+                if row[o] > m:
+                    m = row[o]
+            exps = []
+            denom = 0.0
+            for o in range(_CNN_NUM_CLASSES):
+                e = math.exp(row[o] - m)
+                exps.append(e)
+                denom += e
+            p = [e / denom for e in exps]
+            probs.append(p)
+            loss_sum += -math.log(p[labels[n]])
+        loss = loss_sum / n_
+        if not math.isfinite(loss):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+        losses.append(loss)
+
+        # 反向：softmax-交叉熵对 logits 的梯度为 p - onehot，沿链逐层回传。
+        grad_logits = [
+            [
+                probs[n][o] - (1.0 if labels[n] == o else 0.0)
+                for o in range(_CNN_NUM_CLASSES)
+            ]
+            for n in range(n_)
+        ]
+        dx_flat, dlw, dlb = linear.backward(grad_logits)
+        dx_pool = flatten.backward(dx_flat)
+        dx_conv = pool.backward(dx_pool)
+        _, dcw, dcb = conv.backward(dx_conv)
+
+        # 除 N 后同步 SGD 更新（先全部算出新值再提交）。
+        inv_n = 1.0 / n_
+        new_conv_w = [
+            [
+                [
+                    [
+                        conv_w[o][c][kh][kw] - lr * dcw[o][c][kh][kw] * inv_n
+                        for kw in range(1)
+                    ]
+                    for kh in range(1)
+                ]
+                for c in range(1)
+            ]
+            for o in range(_CNN_NUM_CLASSES)
+        ]
+        new_conv_b = [
+            conv_b[o] - lr * dcb[o] * inv_n
+            for o in range(_CNN_NUM_CLASSES)
+        ]
+        new_lin_w = [
+            [
+                lin_w[o][i] - lr * dlw[o][i] * inv_n
+                for i in range(_CNN_NUM_CLASSES)
+            ]
+            for o in range(_CNN_NUM_CLASSES)
+        ]
+        new_lin_b = [
+            lin_b[o] - lr * dlb[o] * inv_n
+            for o in range(_CNN_NUM_CLASSES)
+        ]
+        for new_tensor in (new_conv_w, new_conv_b, new_lin_w, new_lin_b):
+            flat_vals = []
+            _flatten_into(new_tensor, flat_vals)
+            for v in flat_vals:
+                if not math.isfinite(v):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+        conv_w, conv_b = new_conv_w, new_conv_b
+        lin_w, lin_b = new_lin_w, new_lin_b
+
+    # 末次更新后以同一网络前向，最大 logit 预测，并列取小类。
+    final_logits = _cnn_forward(conv_w, conv_b, lin_w, lin_b, images)
+    correct = 0
+    for n in range(n_):
+        row = final_logits[n]
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        if pred == labels[n]:
+            correct += 1
+    accuracy = correct / n_
+    if accuracy != 1.0:
+        raise ValueError("训练后 accuracy 不为 1.0")
+    if not losses[-1] < losses[0]:
+        raise ValueError("末次 loss 未小于首次 loss")
+    conv_changed = any(
+        conv_w[o][0][0][0] != _CNN_CONV_INIT[o][0][0][0]
+        for o in range(_CNN_NUM_CLASSES)
+    )
+    if not conv_changed:
+        raise ValueError("训练后卷积权重未发生改变")
+    return conv_w, conv_b, lin_w, lin_b, losses, accuracy
+
+
+def _cmd_fitcnn(output_path):
+    """fitcnn 子命令主体；数据/计算失败返回 1。"""
+    try:
+        conv_w, conv_b, lin_w, lin_b, losses, accuracy = _fitcnn_run()
+        artifact = {
+            "model": {
+                "conv": {"values": conv_w, "bias": conv_b},
+                "linear": {"values": lin_w, "bias": lin_b},
+            },
+            "metrics": {
+                "epochs": _CNN_EPOCHS,
+                "lr": float(_CNN_LR),
+                "loss": losses,
+                "accuracy": accuracy,
+            },
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (_TrainDataError, ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 命令行评估：python convnet.py evaluate WEIGHTS OUTPUT
 # ---------------------------------------------------------------------------
 
@@ -1461,6 +1647,131 @@ def _cmd_evaluate(weights_path, output_path):
             pred = 0
             for o in range(1, _TRAIN_NUM_CLASSES):
                 if logits[o] > logits[pred]:
+                    pred = o
+            predictions.append(pred)
+            if pred == labels[n]:
+                correct += 1
+
+        artifact = {
+            "sample_count": n_,
+            "predictions": predictions,
+            "accuracy": correct / n_,
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (_TrainDataError, ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 命令行 CNN 评估：python convnet.py evalcnn WEIGHTS OUTPUT
+# ---------------------------------------------------------------------------
+
+_CNN_EVAL_TOP_KEYS = ["model", "metrics"]
+_CNN_MODEL_KEYS = ["conv", "linear"]
+_CNN_LAYER_KEYS = ["values", "bias"]
+_CNN_METRICS_KEYS = ["epochs", "lr", "loss", "accuracy"]
+
+
+def _load_cnn_artifact(weights_path):
+    """读取并严格校验 fitcnn 产物，返回 (conv_values, conv_bias, lin_values, lin_bias)。
+
+    顶层及 model/conv/linear/metrics 各层的键名、键序、类型与形状均须与
+    fitcnn 写出的公开契约一致；拒绝重复键，conv values 须为 [2][1][1][1]、
+    conv bias 为 [2]，linear values 为 [2][2]、linear bias 为 [2]，
+    数值限有限 int/float 且拒绝 bool。文件不可读、UTF-8/JSON 非法或
+    结构/数值不符时抛 OSError/ValueError/TypeError。
+    """
+    with open(weights_path, "rb") as f:
+        raw = f.read()
+    doc = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("CNN 产物顶层必须是 JSON 对象")
+    if list(doc.keys()) != _CNN_EVAL_TOP_KEYS:
+        raise ValueError("CNN 产物顶层键必须依次为 model、metrics")
+
+    model_obj = doc["model"]
+    if not isinstance(model_obj, dict) or (
+        list(model_obj.keys()) != _CNN_MODEL_KEYS
+    ):
+        raise ValueError("model 的键必须依次为 conv、linear")
+    metrics_obj = doc["metrics"]
+    if not isinstance(metrics_obj, dict) or (
+        list(metrics_obj.keys()) != _CNN_METRICS_KEYS
+    ):
+        raise ValueError("metrics 的键必须依次为 epochs、lr、loss、accuracy")
+
+    conv_obj = model_obj["conv"]
+    if not isinstance(conv_obj, dict) or (
+        list(conv_obj.keys()) != _CNN_LAYER_KEYS
+    ):
+        raise ValueError("conv 的键必须依次为 values、bias")
+    linear_obj = model_obj["linear"]
+    if not isinstance(linear_obj, dict) or (
+        list(linear_obj.keys()) != _CNN_LAYER_KEYS
+    ):
+        raise ValueError("linear 的键必须依次为 values、bias")
+
+    conv_values = conv_obj["values"]
+    conv_bias = conv_obj["bias"]
+    lin_values = linear_obj["values"]
+    lin_bias = linear_obj["bias"]
+    if _shape_of(conv_values, 4, "conv values") != (2, 1, 1, 1):
+        raise ValueError("conv values 的形状必须为 [2][1][1][1]")
+    if _shape_of(conv_bias, 1, "conv bias") != (2,):
+        raise ValueError("conv bias 的形状必须为 [2]")
+    if _shape_of(lin_values, 2, "linear values") != (2, 2):
+        raise ValueError("linear values 的形状必须为 [2][2]")
+    if _shape_of(lin_bias, 1, "linear bias") != (2,):
+        raise ValueError("linear bias 的形状必须为 [2]")
+
+    epochs = metrics_obj["epochs"]
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int，得到 %s" % type(epochs).__name__
+        )
+    _check_metrics_float(metrics_obj["lr"], "lr")
+    _check_metrics_float(metrics_obj["accuracy"], "accuracy")
+    loss = metrics_obj["loss"]
+    if not isinstance(loss, list):
+        raise TypeError(
+            "loss 必须是 list，得到 %s" % type(loss).__name__
+        )
+    if len(loss) != _CNN_EPOCHS:
+        raise ValueError(
+            "loss 长度 %d 与训练轮数 %d 不符" % (len(loss), _CNN_EPOCHS)
+        )
+    for entry in loss:
+        _check_metrics_float(entry, "loss")
+    return conv_values, conv_bias, lin_values, lin_bias
+
+
+def _cmd_evalcnn(weights_path, output_path):
+    """evalcnn 子命令主体；权重/数据/计算/写出失败返回 1。"""
+    try:
+        conv_values, conv_bias, lin_values, lin_bias = _load_cnn_artifact(
+            weights_path
+        )
+        images, labels = _load_cnn_samples()
+        n_ = len(images)
+
+        logits = _cnn_forward(
+            conv_values, conv_bias, lin_values, lin_bias, images
+        )
+        predictions = []
+        correct = 0
+        for n in range(n_):
+            row = logits[n]
+            for o in range(_CNN_NUM_CLASSES):
+                if not math.isfinite(row[o]):
+                    raise ValueError("评估计算产生非有限值（NaN/inf）")
+            # 取最大 logit，并列取较小类别。
+            pred = 0
+            for o in range(1, _CNN_NUM_CLASSES):
+                if row[o] > row[pred]:
                     pred = o
             predictions.append(pred)
             if pred == labels[n]:
@@ -1636,7 +1947,7 @@ def predict_batch(model, x):
 
 
 def main(argv):
-    """命令行入口：仅接受 `train OUTPUT` 与 `evaluate WEIGHTS OUTPUT`。
+    """命令行入口：接受 train/fitcnn OUTPUT 与 evaluate/evalcnn WEIGHTS OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -1644,7 +1955,16 @@ def main(argv):
         return _cmd_train(argv[2])
     if len(argv) == 4 and argv[1] == "evaluate":
         return _cmd_evaluate(argv[2], argv[3])
-    if len(argv) >= 2 and argv[1] in ("train", "evaluate"):
+    if len(argv) == 3 and argv[1] == "fitcnn":
+        return _cmd_fitcnn(argv[2])
+    if len(argv) == 4 and argv[1] == "evalcnn":
+        return _cmd_evalcnn(argv[2], argv[3])
+    if len(argv) >= 2 and argv[1] in (
+        "train",
+        "evaluate",
+        "fitcnn",
+        "evalcnn",
+    ):
         return 2
     # 其他入口保持现状（信息打印）。
     print("convnet.py：从零实现的卷积神经网络库（仅标准库）。")
