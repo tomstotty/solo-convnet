@@ -1,6 +1,8 @@
 """convnet.py — 从零实现的卷积神经网络组件（仅 Python 标准库）。
 
-当前提供 Conv2D 层：NCHW 嵌套 list、互相关（不翻转核）、零补边。
+当前提供：
+- Conv2D 层：NCHW 嵌套 list、互相关（不翻转核）、零补边。
+- MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较。
 """
 
 import math
@@ -204,6 +206,131 @@ class Conv2D:
         return dx, dw, db
 
 
+class MaxPool2D:
+    """二维最大池化层（NCHW，嵌套 list，逐通道池化）。
+
+    kernel_size: 正方形窗口边长 K（正 int）。
+    stride: 步长 S（正 int）；为 None 时取 S = K。
+    padding: 零补边宽度 P（非负 int 且 P < K）；补边位置不参与比较。
+    输入 x: [N][C][H][W]，输出: [N][C][OH][OW]，
+    OH = (H + 2P - K) // S + 1，OW = (W + 2P - K) // S + 1。
+    窗口内按 kh→kw 扫描，并列最大只取首个位置。
+    """
+
+    def __init__(self, kernel_size, stride=None, padding=0):
+        kernel_size = _check_nonnegative_int(kernel_size, "kernel_size")
+        if kernel_size <= 0:
+            raise ValueError("kernel_size 必须为正整数")
+        if stride is None:
+            stride = kernel_size
+        else:
+            stride = _check_nonnegative_int(stride, "stride")
+            if stride <= 0:
+                raise ValueError("stride 必须为正整数")
+        padding = _check_nonnegative_int(padding, "padding")
+        if padding < 0:
+            raise ValueError("padding 必须为非负整数")
+        if padding >= kernel_size:
+            raise ValueError("padding 必须小于 kernel_size")
+
+        self._kernel_size = kernel_size
+        self._stride = stride
+        self._padding = padding
+
+        self._x_shape = None   # 最近一次成功 forward 的输入形状
+        self._out_shape = None  # 最近一次成功 forward 的输出形状
+        self._winners = None   # 每个输出位置的最大值来源 (ih, iw)
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 做最大池化，返回新 list 并缓存获胜位置。"""
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+        k = self._kernel_size
+        s = self._stride
+        p = self._padding
+        if k > h_ + 2 * p or k > w_ + 2 * p:
+            raise ValueError("池化窗口在补边后仍越界：kernel_size 大于补边后的输入")
+        oh_ = (h_ + 2 * p - k) // s + 1
+        ow_ = (w_ + 2 * p - k) // s + 1
+
+        out = []
+        winners = []
+        for n in range(n_):
+            out_n = []
+            win_n = []
+            for c in range(c_):
+                x_c = x[n][c]
+                out_c = []
+                win_c = []
+                for oh in range(oh_):
+                    base_h = oh * s - p
+                    row = []
+                    win_row = []
+                    for ow in range(ow_):
+                        base_w = ow * s - p
+                        best = None
+                        best_pos = None
+                        for kh in range(k):
+                            ih = base_h + kh
+                            if ih < 0 or ih >= h_:
+                                continue
+                            x_row = x_c[ih]
+                            for kw in range(k):
+                                iw = base_w + kw
+                                if 0 <= iw < w_:
+                                    v = x_row[iw]
+                                    if best is None or v > best:
+                                        best = v
+                                        best_pos = (ih, iw)
+                        row.append(best)
+                        win_row.append(best_pos)
+                    out_c.append(row)
+                    win_c.append(win_row)
+                out_n.append(out_c)
+                win_n.append(win_c)
+            out.append(out_n)
+            winners.append(win_n)
+
+        self._x_shape = (n_, c_, h_, w_)
+        self._out_shape = (n_, c_, oh_, ow_)
+        self._winners = winners
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回与输入同形状的 dx。
+
+        dy 的形状必须等于最近一次成功 forward 的输出形状；
+        梯度按 n→c→oh→ow 顺序累加到 forward 记录的获胜位置。
+        未成功 forward 前调用一律抛 ValueError。
+        """
+        if self._winners is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, oh_, ow_ = self._out_shape
+        dx = _zeros(self._x_shape)
+        winners = self._winners
+        for n in range(n_):
+            for c in range(c_):
+                dx_c = dx[n][c]
+                dy_c = dy[n][c]
+                win_c = winners[n][c]
+                for oh in range(oh_):
+                    dy_row = dy_c[oh]
+                    win_row = win_c[oh]
+                    for ow in range(ow_):
+                        ih, iw = win_row[ow]
+                        dx_c[ih][iw] += dy_row[ow]
+        return dx
+
+
 if __name__ == "__main__":
     print("convnet.py：从零实现的卷积神经网络库（仅标准库）。")
     print("当前可用组件：Conv2D(weights, bias, stride=1, padding=0)")
+    print("              MaxPool2D(kernel_size, stride=None, padding=0)")
