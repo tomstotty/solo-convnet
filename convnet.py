@@ -16,6 +16,10 @@
 - `python convnet.py evaluate WEIGHTS OUTPUT`：读取 train 产物 WEIGHTS，
   在 data/tiny.csv 上逐样本预测，将样本数、预测与准确率以紧凑 JSON
   原子写入 OUTPUT。
+
+公开函数：
+- load_model(path)：读取 train 产物，返回 {"values": ..., "bias": ...}。
+- predict_batch(model, x)：对 [N][1][1][4] 输入批量预测，返回 int list。
 """
 
 import json
@@ -1472,6 +1476,92 @@ def _cmd_evaluate(weights_path, output_path):
     except (_TrainDataError, ValueError, TypeError, OSError):
         return 1
     return 0
+
+
+# ---------------------------------------------------------------------------
+# 公开接口：加载 train 产物与批量预测
+# ---------------------------------------------------------------------------
+
+
+def load_model(path):
+    """读取 train 产物，返回键序 values,bias 的新 dict（嵌套 list 均为新副本）。
+
+    path 必须为 str，否则抛 TypeError。校验完全复用 evaluate 对 train 产物
+    的公开契约：键名/键序、类型、长度、重复键、有限值及 values[2][4]、
+    bias[2]。文件不可读抛 OSError，非法 UTF-8 抛 UnicodeDecodeError，
+    JSON 语法、重复键、键序/长度/形状/非有限抛 ValueError，
+    对象/字段类型错抛 TypeError。
+    """
+    if not isinstance(path, str):
+        raise TypeError(
+            "path 必须是 str，得到 %s" % type(path).__name__
+        )
+    values, bias = _load_weights_artifact(path)
+    return {"values": _deep_copy(values), "bias": _deep_copy(bias)}
+
+
+def predict_batch(model, x):
+    """对 x: [N][1][1][4] 逐样本线性预测，返回长度 N 的新 int list。
+
+    model 必须严格为 load_model 返回形态的 dict：类型为 dict（否则
+    TypeError），键依次且仅为 values、bias（否则 ValueError）；values 为
+    [O][4]、bias 为 [O] 的嵌套 list，x 为非空规则 list [N][1][1][4]，
+    三者标量均为有限 int/float 且拒绝 bool。容器/标量类型错抛 TypeError；
+    键序、层级、空维、不规则、形状、非有限抛 ValueError。
+
+    按 n→o→i 计算 logit = bias[o] + Σ x[n][0][0][i]*values[o][i]；
+    运算产生非有限值抛 ValueError。取最大 logit，并列取较小类别。
+    不修改实参。
+    """
+    if not isinstance(model, dict):
+        raise TypeError(
+            "model 必须是 dict，得到 %s" % type(model).__name__
+        )
+    if list(model.keys()) != _EVAL_WEIGHTS_KEYS:
+        raise ValueError("model 的键必须依次为 values、bias")
+
+    values = model["values"]
+    bias = model["bias"]
+    _require_list(values, "values")
+    _require_list(bias, "bias")
+    v_shape = _shape_of(values, 2, "values")
+    b_shape = _shape_of(bias, 1, "bias")
+    if v_shape[1] != _TRAIN_NUM_FEATURES:
+        raise ValueError(
+            "values 的输入维度 %d 必须为 %d"
+            % (v_shape[1], _TRAIN_NUM_FEATURES)
+        )
+    if b_shape[0] != v_shape[0]:
+        raise ValueError(
+            "bias 长度 %d 与 values 输出维度 %d 不符"
+            % (b_shape[0], v_shape[0])
+        )
+
+    _require_list(x, "x")
+    n_, c_, h_, w_ = _shape_of(x, 4, "x")
+    if (c_, h_, w_) != (1, 1, _TRAIN_NUM_FEATURES):
+        raise ValueError("x 的形状必须为 [N][1][1][4]")
+
+    num_classes = v_shape[0]
+    predictions = []
+    for n in range(n_):
+        x_row = x[n][0][0]
+        logits = []
+        for o in range(num_classes):
+            acc = bias[o]
+            w_row = values[o]
+            for i in range(_TRAIN_NUM_FEATURES):
+                acc += x_row[i] * w_row[i]
+            if not math.isfinite(acc):
+                raise ValueError("预测计算产生非有限值（NaN/inf）")
+            logits.append(acc)
+        # 取最大 logit，并列取较小类别。
+        pred = 0
+        for o in range(1, num_classes):
+            if logits[o] > logits[pred]:
+                pred = o
+        predictions.append(pred)
+    return predictions
 
 
 def main(argv):
