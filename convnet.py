@@ -7,7 +7,8 @@
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
 - Dropout 层：NCHW 嵌套 list，训练态按概率 p 置零并放大保留项，推理态原样复制。
-- BatchNorm2D 层：NCHW 嵌套 list，逐通道训练态批归一化（不做推理态与运行统计）。
+- BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并
+  更新 running_mean/running_var，推理态使用运行统计量。
 """
 
 import math
@@ -691,19 +692,29 @@ class Dropout:
 
 
 class BatchNorm2D:
-    """二维批归一化层（NCHW，嵌套 list，仅训练态）。
+    """二维批归一化层（NCHW，嵌套 list，训练/推理双模式）。
 
     gamma、beta: 等长非空一维 list，元素为有限 int/float（拒绝 bool）；
     长度 C 即通道数。eps: 正的有限 int/float（拒绝 bool）。
-    不维护推理态与运行均值/方差；每次 forward 仅按当前批次统计：
+    momentum: [0, 1] 的有限 int/float（拒绝 bool），运行统计的更新权重。
+    默认训练态；train(mode) 切换模式，mode 仅接收 bool，返回 None。
+
+    公开属性 running_mean、running_var：长度 C 的 list，初值分别全 0.0、
+    全 1.0，未训练即可推理。训练态 forward 成功后逐通道更新：
+    running = (1-momentum)*旧值 + momentum*批次统计。
+
+    训练态每次 forward 按当前批次统计：
     M = N*H*W，μ = Σx/M，v = Σ(x-μ)^2/M，z = (x-μ)/sqrt(v+eps)，
-    y = gamma*z + beta。backward 返回 (dx, dgamma, dbeta)：
+    y = gamma*z + beta。推理态逐元素输出
+    y = gamma*(x-running_mean)/sqrt(running_var+eps) + beta，
+    不更新运行统计量与训练缓存。backward 使用最近一次成功训练态
+    forward 的缓存，返回 (dx, dgamma, dbeta)：
     dbeta = Σdy、dgamma = Σ(dy*z)，
     dx = gamma/sqrt(v+eps) * (dy - (dbeta + z*dgamma)/M)，
     求和均按 n→h→w 逐通道进行。
     """
 
-    def __init__(self, gamma, beta, eps=1e-5):
+    def __init__(self, gamma, beta, eps=1e-5, momentum=0.1):
         _require_list(gamma, "gamma")
         _require_list(beta, "beta")
         g_shape = _shape_of(gamma, 1, "gamma")
@@ -722,17 +733,50 @@ class BatchNorm2D:
             raise ValueError("eps 必须是有限值（拒绝 NaN/inf）")
         if eps <= 0:
             raise ValueError("eps 必须为正数")
+        if isinstance(momentum, bool) or not isinstance(momentum, (int, float)):
+            raise TypeError(
+                "momentum 必须是 int/float（拒绝 bool），得到 %s"
+                % type(momentum).__name__
+            )
+        if not math.isfinite(momentum):
+            raise ValueError("momentum 必须是有限值（拒绝 NaN/inf）")
+        if momentum < 0 or momentum > 1:
+            raise ValueError("momentum 必须满足 0 <= momentum <= 1")
 
         self._gamma = gamma
         self._beta = beta
         self._eps = eps
+        self._momentum = momentum
+        self._training = True   # 默认训练态
 
-        self._z = None           # 最近一次成功 forward 缓存的归一化值 z
-        self._var = None         # 最近一次成功 forward 缓存的每通道方差 v
-        self._out_shape = None   # 最近一次成功 forward 的输出形状
+        c_ = g_shape[0]
+        self.running_mean = [0.0] * c_   # 逐通道运行均值
+        self.running_var = [1.0] * c_    # 逐通道运行方差
+
+        self._z = None           # 最近一次成功训练态 forward 缓存的归一化值 z
+        self._var = None         # 最近一次成功训练态 forward 缓存的每通道方差 v
+        self._out_shape = None   # 最近一次成功训练态 forward 的输出形状
+
+    def train(self, mode=True):
+        """切换训练/推理模式并返回 None；mode 仅接收 bool，否则抛 TypeError。
+
+        仅设置模式标志，不清除训练缓存与运行统计量。
+        """
+        if not isinstance(mode, bool):
+            raise TypeError(
+                "mode 必须是 bool，得到 %s" % type(mode).__name__
+            )
+        self._training = mode
+        return None
 
     def forward(self, x):
-        """对 x: [N][C][H][W] 逐通道训练态归一化，返回新 list 并缓存 z、v、形状。"""
+        """对 x: [N][C][H][W] 逐通道归一化，返回同形新 list。
+
+        训练态按当前批次统计归一化，成功后缓存 z、v、形状并更新
+        running_mean/running_var；推理态使用 running_mean/running_var，
+        不更新统计量与训练缓存。校验或计算失败不改变实参、运行统计量
+        与旧缓存。
+        """
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
         if c_ != len(self._gamma):
@@ -740,6 +784,9 @@ class BatchNorm2D:
                 "输入通道数 %d 与 gamma/beta 长度 %d 不符"
                 % (c_, len(self._gamma))
             )
+
+        if not self._training:
+            return self._forward_infer(x, n_, c_, h_, w_)
 
         gamma = self._gamma
         beta = self._beta
@@ -809,16 +856,64 @@ class BatchNorm2D:
                         if not (math.isfinite(yval) and math.isfinite(zval)):
                             raise ValueError("前向计算产生非有限值（NaN/inf）")
 
+        momentum = self._momentum
+        keep = 1.0 - momentum
+        running_mean = self.running_mean
+        running_var = self.running_var
+        for c in range(c_):
+            running_mean[c] = keep * running_mean[c] + momentum * means[c]
+            running_var[c] = keep * running_var[c] + momentum * variances[c]
+
         self._z = z_cache
         self._var = variances
         self._out_shape = (n_, c_, h_, w_)
+        return out
+
+    def _forward_infer(self, x, n_, c_, h_, w_):
+        """推理态前向：y = gamma*(x-running_mean)/sqrt(running_var+eps)+beta。
+
+        返回同形新 list；不更新运行统计量与训练缓存。
+        """
+        gamma = self._gamma
+        beta = self._beta
+        eps = self._eps
+        running_mean = self.running_mean
+        running_var = self.running_var
+
+        out = []
+        for n in range(n_):
+            out_n = []
+            for c in range(c_):
+                inv = 1.0 / math.sqrt(running_var[c] + eps)
+                gc = gamma[c]
+                bc = beta[c]
+                mu = running_mean[c]
+                x_c = x[n][c]
+                out_c = []
+                for hh in range(h_):
+                    x_row = x_c[hh]
+                    out_row = []
+                    for ww in range(w_):
+                        out_row.append(gc * (x_row[ww] - mu) * inv + bc)
+                    out_c.append(out_row)
+                out_n.append(out_c)
+            out.append(out_n)
+
+        for n in range(n_):
+            for c in range(c_):
+                for hh in range(h_):
+                    for ww in range(w_):
+                        if not math.isfinite(out[n][c][hh][ww]):
+                            raise ValueError("前向计算产生非有限值（NaN/inf）")
         return out
 
     def backward(self, dy):
         """根据上游梯度 dy 返回 (dx, dgamma, dbeta)。
 
         形状依次同 x、gamma、beta；dy 的形状必须等于最近一次成功
-        forward 的输出形状。未成功 forward 前调用一律抛 ValueError。
+        训练态 forward 的输出形状，缓存来自该次训练态 forward（推理态
+        forward 不写缓存，模式切换不清缓存）。无训练缓存时调用一律抛
+        ValueError。
         """
         if self._z is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -1033,4 +1128,4 @@ if __name__ == "__main__":
     print("              Linear(weights, bias)")
     print("              ReLU()")
     print("              Dropout(p=0.5, seed=0)")
-    print("              BatchNorm2D(gamma, beta, eps=1e-5)")
+    print("              BatchNorm2D(gamma, beta, eps=1e-5, momentum=0.1)")
