@@ -3,6 +3,9 @@
 当前提供：
 - Conv2D 层：NCHW 嵌套 list、互相关（不翻转核）、零补边。
 - MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较。
+- Flatten 层：把 [N][C][H][W] 按 c→h→w 展平为 [N][C*H*W]。
+- Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I]、输出 [N][O]。
+- ReLU 层：二维 [N][D] 逐元素截断负值。
 """
 
 import math
@@ -330,7 +333,219 @@ class MaxPool2D:
         return dx
 
 
+class Flatten:
+    """展平层：把 [N][C][H][W] 按 c→h→w 顺序展平为 [N][C*H*W]。
+
+    无参数；backward 把梯度还原为最近一次成功 forward 的输入形状。
+    """
+
+    def __init__(self):
+        self._in_shape = None    # 最近一次成功 forward 的输入形状
+        self._out_shape = None   # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """展平 x: [N][C][H][W] 为 [N][C*H*W]，返回新 list 并缓存形状。"""
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+        d_ = c_ * h_ * w_
+
+        out = []
+        for n in range(n_):
+            row = []
+            x_n = x[n]
+            for c in range(c_):
+                x_c = x_n[c]
+                for h in range(h_):
+                    row.extend(x_c[h])
+            out.append(row)
+
+        self._in_shape = (n_, c_, h_, w_)
+        self._out_shape = (n_, d_)
+        return out
+
+    def backward(self, dy):
+        """把上游梯度 dy: [N][C*H*W] 还原为 [N][C][H][W] 的新 list。
+
+        dy 的形状必须等于最近一次成功 forward 的输出形状。
+        未成功 forward 前调用一律抛 ValueError。
+        """
+        if self._in_shape is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 2, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, h_, w_ = self._in_shape
+        dx = []
+        for n in range(n_):
+            dy_n = dy[n]
+            dx_n = []
+            idx = 0
+            for c in range(c_):
+                plane = []
+                for h in range(h_):
+                    plane.append(dy_n[idx:idx + w_])
+                    idx += w_
+                dx_n.append(plane)
+            dx.append(dx_n)
+        return dx
+
+
+class Linear:
+    """全连接层（嵌套 list）。
+
+    weights: [O][I]，bias: [O]，输入 x: [N][I]，输出: [N][O]。
+    out[n][o] = bias[o] + sum_i(x[n][i] * weights[o][i])，i 递增累加。
+    """
+
+    def __init__(self, weights, bias):
+        _require_list(weights, "weights")
+        _require_list(bias, "bias")
+        w_shape = _shape_of(weights, 2, "weights")
+        b_shape = _shape_of(bias, 1, "bias")
+        if b_shape[0] != w_shape[0]:
+            raise ValueError(
+                "bias 长度 %d 与 weights 输出维度 %d 不符"
+                % (b_shape[0], w_shape[0])
+            )
+
+        self._weights = weights
+        self._bias = bias
+        self._w_shape = w_shape  # (O, I)
+
+        self._x = None           # 最近一次成功 forward 的输入
+        self._out_shape = None   # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """对 x: [N][I] 做仿射变换，返回 [N][O] 的新 list 并缓存输入。"""
+        _require_list(x, "x")
+        n_, i_ = _shape_of(x, 2, "x")
+        o_, w_i = self._w_shape
+        if i_ != w_i:
+            raise ValueError(
+                "输入维度 %d 与 weights 输入维度 %d 不符" % (i_, w_i)
+            )
+
+        weights = self._weights
+        bias = self._bias
+        out = []
+        for n in range(n_):
+            x_n = x[n]
+            row = []
+            for o in range(o_):
+                w_o = weights[o]
+                acc = bias[o]
+                for i in range(i_):
+                    acc += x_n[i] * w_o[i]
+                row.append(acc)
+            out.append(row)
+
+        self._x = x
+        self._out_shape = (n_, o_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回 (dx, dweights, dbias)。
+
+        形状依次同 x [N][I]、weights [O][I]、bias [O]，均为新 list。
+        dx[n][i] 对 o 递增求和；dweights[o][i]、dbias[o] 对 n 递增求和。
+        dy 的形状必须等于最近一次成功 forward 的输出形状。
+        未成功 forward 前调用一律抛 ValueError；梯度不跨调用累积。
+        """
+        if self._x is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 2, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        x = self._x
+        weights = self._weights
+        n_, o_ = self._out_shape
+        i_ = self._w_shape[1]
+
+        dx = _zeros((n_, i_))
+        dw = _zeros((o_, i_))
+        db = _zeros((o_,))
+
+        for n in range(n_):
+            x_n = x[n]
+            dx_n = dx[n]
+            dy_n = dy[n]
+            for o in range(o_):
+                g = dy_n[o]
+                db[o] += g
+                w_o = weights[o]
+                dw_o = dw[o]
+                for i in range(i_):
+                    dw_o[i] += g * x_n[i]
+                    dx_n[i] += g * w_o[i]
+        return dx, dw, db
+
+
+class ReLU:
+    """逐元素修正线性单元（仅限二维 [N][D]）。
+
+    forward: v > 0 取 v，否则取 0；零点梯度为 0。
+    backward 仅在最近一次成功 forward 的输入严格大于 0 处传递 dy。
+    """
+
+    def __init__(self):
+        self._x = None           # 最近一次成功 forward 的输入
+        self._out_shape = None   # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """对 x: [N][D] 逐元素取正部，返回新 list 并缓存输入。"""
+        _require_list(x, "x")
+        n_, d_ = _shape_of(x, 2, "x")
+
+        out = []
+        for n in range(n_):
+            x_n = x[n]
+            out.append([v if v > 0 else 0 for v in x_n])
+
+        self._x = x
+        self._out_shape = (n_, d_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回与输入同形状的 dx（新 list）。
+
+        仅当最近输入对应位置严格大于 0 时传递 dy，其余（含零点）为 0。
+        dy 的形状必须等于最近一次成功 forward 的输出形状。
+        未成功 forward 前调用一律抛 ValueError；梯度不跨调用累积。
+        """
+        if self._x is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 2, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        x = self._x
+        n_, d_ = self._out_shape
+        dx = []
+        for n in range(n_):
+            x_n = x[n]
+            dy_n = dy[n]
+            dx.append([dy_n[d] if x_n[d] > 0 else 0 for d in range(d_)])
+        return dx
+
+
 if __name__ == "__main__":
     print("convnet.py：从零实现的卷积神经网络库（仅标准库）。")
     print("当前可用组件：Conv2D(weights, bias, stride=1, padding=0)")
     print("              MaxPool2D(kernel_size, stride=None, padding=0)")
+    print("              Flatten()")
+    print("              Linear(weights, bias)")
+    print("              ReLU()")
