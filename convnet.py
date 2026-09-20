@@ -13,6 +13,8 @@
 命令行子命令（仅标准库）：
 - `python convnet.py train OUTPUT`：在 data/tiny.csv 上训练“展平 + Linear”，
   将权重与指标以紧凑 JSON 原子写入 OUTPUT。
+- `python convnet.py evaluate WEIGHTS OUTPUT`：读取 train 产物 WEIGHTS，
+  在 data/tiny.csv 上逐样本预测，将评估结果以紧凑 JSON 原子写入 OUTPUT。
 """
 
 import json
@@ -1340,11 +1342,189 @@ def _cmd_train(output_path):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# 命令行评估：python convnet.py evaluate WEIGHTS OUTPUT
+# ---------------------------------------------------------------------------
+
+
+class _WeightsError(Exception):
+    """WEIGHTS 文件缺失、不可读或内容不符 train 产物契约。"""
+
+
+def _weights_no_duplicates(pairs):
+    """json object_pairs_hook：按键序构造 dict，发现重复键即拒绝。"""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _WeightsError("WEIGHTS 含重复键：%r" % key)
+        obj[key] = value
+    return obj
+
+
+def _weights_bad_constant(name):
+    """json parse_constant：拒绝 NaN/Infinity 等非有限字面量。"""
+    raise _WeightsError("WEIGHTS 含非法数值字面量：%s" % name)
+
+
+def _check_artifact_number(value, name):
+    """合法数值：有限 int/float，拒绝 bool。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _WeightsError(
+            "%s 必须是 int/float（拒绝 bool），得到 %s"
+            % (name, type(value).__name__)
+        )
+    if isinstance(value, float) and not math.isfinite(value):
+        raise _WeightsError("%s 含有非有限值（NaN/inf）" % name)
+
+
+def _check_artifact_keys(obj, expected, name):
+    """校验 JSON 对象的键名与键序完全等于 expected。"""
+    if not isinstance(obj, dict):
+        raise _WeightsError(
+            "%s 必须是 JSON 对象，得到 %s" % (name, type(obj).__name__)
+        )
+    if list(obj.keys()) != expected:
+        raise _WeightsError(
+            "%s 的键名或键序不符，期望 %r" % (name, expected)
+        )
+
+
+def _load_weights_artifact(path):
+    """读取并严格校验 WEIGHTS（train 的完整产物），返回 (values, bias)。
+
+    顶层及 weights、metrics 两层的键名、键序、类型与长度均须与 train
+    写出的公开契约一致；拒绝重复键；values 为 [2][4]、bias 为 [2]，
+    数值限有限 int/float 且拒绝 bool。任何不符一律抛 _WeightsError。
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise _WeightsError("无法读取 %s：%s" % (path, exc))
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _WeightsError("%s 不是合法 UTF-8：%s" % (path, exc))
+    try:
+        doc = json.loads(
+            text,
+            object_pairs_hook=_weights_no_duplicates,
+            parse_constant=_weights_bad_constant,
+        )
+    except _WeightsError:
+        raise
+    except ValueError as exc:
+        raise _WeightsError("%s 不是合法 JSON：%s" % (path, exc))
+
+    _check_artifact_keys(doc, ["weights", "metrics"], "WEIGHTS 顶层")
+    weights = doc["weights"]
+    metrics = doc["metrics"]
+    _check_artifact_keys(weights, ["values", "bias"], "weights")
+    _check_artifact_keys(
+        metrics, ["epochs", "lr", "loss", "accuracy"], "metrics"
+    )
+
+    values = weights["values"]
+    bias = weights["bias"]
+    if not isinstance(values, list) or len(values) != _TRAIN_NUM_CLASSES:
+        raise _WeightsError(
+            "values 必须是长度 %d 的 list" % _TRAIN_NUM_CLASSES
+        )
+    for o in range(_TRAIN_NUM_CLASSES):
+        row = values[o]
+        if not isinstance(row, list) or len(row) != _TRAIN_NUM_FEATURES:
+            raise _WeightsError(
+                "values[%d] 必须是长度 %d 的 list" % (o, _TRAIN_NUM_FEATURES)
+            )
+        for i in range(_TRAIN_NUM_FEATURES):
+            _check_artifact_number(row[i], "values[%d][%d]" % (o, i))
+    if not isinstance(bias, list) or len(bias) != _TRAIN_NUM_CLASSES:
+        raise _WeightsError("bias 必须是长度 %d 的 list" % _TRAIN_NUM_CLASSES)
+    for o in range(_TRAIN_NUM_CLASSES):
+        _check_artifact_number(bias[o], "bias[%d]" % o)
+
+    epochs = metrics["epochs"]
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise _WeightsError(
+            "epochs 必须是 int（拒绝 bool），得到 %s" % type(epochs).__name__
+        )
+    _check_artifact_number(metrics["lr"], "lr")
+    loss = metrics["loss"]
+    if not isinstance(loss, list) or len(loss) != _TRAIN_EPOCHS:
+        raise _WeightsError("loss 必须是长度 %d 的 list" % _TRAIN_EPOCHS)
+    for e in range(_TRAIN_EPOCHS):
+        _check_artifact_number(loss[e], "loss[%d]" % e)
+    _check_artifact_number(metrics["accuracy"], "accuracy")
+    return values, bias
+
+
+def _evaluate_run(values, bias):
+    """在 data/tiny.csv 上逐样本预测，返回 (predictions, accuracy)。
+
+    按 n→o→i 计算 logit = bias[o] + Σ x[i]*values[o][i]，取最大者预测，
+    并列取较小类别；产生非有限值抛 ValueError。
+    """
+    images, labels = _load_train_samples()
+    n_ = len(images)
+    predictions = []
+    correct = 0
+    for n in range(n_):
+        x = images[n][0][0]
+        logits = []
+        for o in range(_TRAIN_NUM_CLASSES):
+            acc = bias[o]
+            w_row = values[o]
+            for i in range(_TRAIN_NUM_FEATURES):
+                acc += x[i] * w_row[i]
+            if not math.isfinite(acc):
+                raise ValueError("评估计算产生非有限值（NaN/inf）")
+            logits.append(acc)
+        pred = 0
+        for o in range(1, _TRAIN_NUM_CLASSES):
+            if logits[o] > logits[pred]:
+                pred = o
+        predictions.append(pred)
+        if pred == labels[n]:
+            correct += 1
+    return predictions, correct / n_
+
+
+def _cmd_evaluate(weights_path, output_path):
+    """evaluate 子命令主体；WEIGHTS/数据/计算/写出失败返回 1。"""
+    try:
+        values, bias = _load_weights_artifact(weights_path)
+        predictions, accuracy = _evaluate_run(values, bias)
+        artifact = {
+            "sample_count": len(predictions),
+            "predictions": predictions,
+            "accuracy": accuracy,
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (
+        _TrainDataError,
+        _WeightsError,
+        ValueError,
+        TypeError,
+        OverflowError,
+        OSError,
+    ):
+        return 1
+    return 0
+
+
 def main(argv):
-    """命令行入口：仅接受 `train OUTPUT`；成功 0、参数数目错 2、其余失败 1。"""
+    """命令行入口：仅接受 `train OUTPUT` 与 `evaluate WEIGHTS OUTPUT`。
+
+    成功 0、参数数目错 2、其余失败 1。
+    """
     if len(argv) == 3 and argv[1] == "train":
         return _cmd_train(argv[2])
     if len(argv) >= 2 and argv[1] == "train":
+        return 2
+    if len(argv) == 4 and argv[1] == "evaluate":
+        return _cmd_evaluate(argv[2], argv[3])
+    if len(argv) >= 2 and argv[1] == "evaluate":
         return 2
     # 其他入口保持现状（信息打印）。
     print("convnet.py：从零实现的卷积神经网络库（仅标准库）。")
