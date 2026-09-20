@@ -7,6 +7,7 @@
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
 - Dropout 层：NCHW 嵌套 list，训练态按概率 p 置零并放大保留项，推理态原样复制。
+- BatchNorm2D 层：NCHW 嵌套 list，逐通道训练态批归一化（不做推理态与运行统计）。
 """
 
 import math
@@ -689,6 +690,204 @@ class Dropout:
         return dx
 
 
+class BatchNorm2D:
+    """二维批归一化层（NCHW，嵌套 list，仅训练态）。
+
+    gamma、beta: 等长非空一维 list，元素为有限 int/float（拒绝 bool）；
+    长度 C 即通道数。eps: 正的有限 int/float（拒绝 bool）。
+    不维护推理态与运行均值/方差；每次 forward 仅按当前批次统计：
+    M = N*H*W，μ = Σx/M，v = Σ(x-μ)^2/M，z = (x-μ)/sqrt(v+eps)，
+    y = gamma*z + beta。backward 返回 (dx, dgamma, dbeta)：
+    dbeta = Σdy、dgamma = Σ(dy*z)，
+    dx = gamma/sqrt(v+eps) * (dy - (dbeta + z*dgamma)/M)，
+    求和均按 n→h→w 逐通道进行。
+    """
+
+    def __init__(self, gamma, beta, eps=1e-5):
+        _require_list(gamma, "gamma")
+        _require_list(beta, "beta")
+        g_shape = _shape_of(gamma, 1, "gamma")
+        b_shape = _shape_of(beta, 1, "beta")
+        if b_shape[0] != g_shape[0]:
+            raise ValueError(
+                "beta 长度 %d 与 gamma 长度 %d 不符"
+                % (b_shape[0], g_shape[0])
+            )
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+            raise TypeError(
+                "eps 必须是 int/float（拒绝 bool），得到 %s"
+                % type(eps).__name__
+            )
+        if not math.isfinite(eps):
+            raise ValueError("eps 必须是有限值（拒绝 NaN/inf）")
+        if eps <= 0:
+            raise ValueError("eps 必须为正数")
+
+        self._gamma = gamma
+        self._beta = beta
+        self._eps = eps
+
+        self._z = None           # 最近一次成功 forward 缓存的归一化值 z
+        self._var = None         # 最近一次成功 forward 缓存的每通道方差 v
+        self._out_shape = None   # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 逐通道训练态归一化，返回新 list 并缓存 z、v、形状。"""
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+        if c_ != len(self._gamma):
+            raise ValueError(
+                "输入通道数 %d 与 gamma/beta 长度 %d 不符"
+                % (c_, len(self._gamma))
+            )
+
+        gamma = self._gamma
+        beta = self._beta
+        eps = self._eps
+        m_ = n_ * h_ * w_
+        means = []
+        variances = []
+        for c in range(c_):
+            acc = 0.0
+            for n in range(n_):
+                x_c = x[n][c]
+                for hh in range(h_):
+                    x_row = x_c[hh]
+                    for ww in range(w_):
+                        acc += x_row[ww]
+            mu = acc / m_
+            sq = 0.0
+            for n in range(n_):
+                x_c = x[n][c]
+                for hh in range(h_):
+                    x_row = x_c[hh]
+                    for ww in range(w_):
+                        d = x_row[ww] - mu
+                        sq += d * d
+            v = sq / m_
+            means.append(mu)
+            variances.append(v)
+
+        out = []
+        z_cache = []
+        for n in range(n_):
+            out_n = []
+            z_n = []
+            for c in range(c_):
+                inv = 1.0 / math.sqrt(variances[c] + eps)
+                gc = gamma[c]
+                bc = beta[c]
+                mu = means[c]
+                x_c = x[n][c]
+                out_c = []
+                z_c = []
+                for hh in range(h_):
+                    x_row = x_c[hh]
+                    out_row = []
+                    z_row = []
+                    for ww in range(w_):
+                        zval = (x_row[ww] - mu) * inv
+                        yval = gc * zval + bc
+                        z_row.append(zval)
+                        out_row.append(yval)
+                    z_c.append(z_row)
+                    out_c.append(out_row)
+                z_n.append(z_c)
+                out_n.append(out_c)
+            out.append(out_n)
+            z_cache.append(z_n)
+
+        for c in range(c_):
+            if not math.isfinite(means[c]) or not math.isfinite(variances[c]):
+                raise ValueError("前向计算产生非有限值（NaN/inf）")
+        for n in range(n_):
+            for c in range(c_):
+                for hh in range(h_):
+                    for ww in range(w_):
+                        yval = out[n][c][hh][ww]
+                        zval = z_cache[n][c][hh][ww]
+                        if not (math.isfinite(yval) and math.isfinite(zval)):
+                            raise ValueError("前向计算产生非有限值（NaN/inf）")
+
+        self._z = z_cache
+        self._var = variances
+        self._out_shape = (n_, c_, h_, w_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回 (dx, dgamma, dbeta)。
+
+        形状依次同 x、gamma、beta；dy 的形状必须等于最近一次成功
+        forward 的输出形状。未成功 forward 前调用一律抛 ValueError。
+        """
+        if self._z is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, h_, w_ = self._out_shape
+        m_ = n_ * h_ * w_
+        gamma = self._gamma
+        eps = self._eps
+        z_cache = self._z
+        variances = self._var
+
+        dgamma = [0.0] * c_
+        dbeta = [0.0] * c_
+        for c in range(c_):
+            sg = 0.0
+            sb = 0.0
+            for n in range(n_):
+                dy_c = dy[n][c]
+                z_c = z_cache[n][c]
+                for hh in range(h_):
+                    dy_row = dy_c[hh]
+                    z_row = z_c[hh]
+                    for ww in range(w_):
+                        g = dy_row[ww]
+                        sb += g
+                        sg += g * z_row[ww]
+            dgamma[c] = sg
+            dbeta[c] = sb
+
+        dx = []
+        inv_m = 1.0 / m_
+        for n in range(n_):
+            dx_n = []
+            for c in range(c_):
+                scale = gamma[c] / math.sqrt(variances[c] + eps)
+                dy_c = dy[n][c]
+                z_c = z_cache[n][c]
+                dx_c = []
+                for hh in range(h_):
+                    dy_row = dy_c[hh]
+                    z_row = z_c[hh]
+                    dx_row = []
+                    for ww in range(w_):
+                        zval = z_row[ww]
+                        corr = (dbeta[c] + zval * dgamma[c]) * inv_m
+                        dx_row.append(scale * (dy_row[ww] - corr))
+                    dx_c.append(dx_row)
+                dx_n.append(dx_c)
+            dx.append(dx_n)
+
+        for c in range(c_):
+            if not (math.isfinite(dgamma[c]) and math.isfinite(dbeta[c])):
+                raise ValueError("反向计算产生非有限值（NaN/inf）")
+        for n in range(n_):
+            for c in range(c_):
+                for hh in range(h_):
+                    for ww in range(w_):
+                        if not math.isfinite(dx[n][c][hh][ww]):
+                            raise ValueError("反向计算产生非有限值（NaN/inf）")
+        return dx, dgamma, dbeta
+
+
 def _deep_copy(t):
     """递归复制嵌套 list；标量原样返回。"""
     if isinstance(t, list):
@@ -833,3 +1032,5 @@ if __name__ == "__main__":
     print("              Flatten()")
     print("              Linear(weights, bias)")
     print("              ReLU()")
+    print("              Dropout(p=0.5, seed=0)")
+    print("              BatchNorm2D(gamma, beta, eps=1e-5)")
