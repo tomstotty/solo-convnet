@@ -46,6 +46,12 @@
 - `python convnet.py evalnorm WEIGHTS OUTPUT`：读取 fitnorm 产物 WEIGHTS，
   以保存的 BN 运行统计在推理态网络上逐样本预测，将样本数、预测与
   准确率以紧凑 JSON 原子写入 OUTPUT。
+- `python convnet.py gradcheck CONFIG OUTPUT`：读取 UTF-8 JSON CONFIG
+  （键依次为 x、labels、eps、atol、rtol，x 为有限数的规则
+  list[N][1][2][2]、N≥1），新建与 fitnorm 初始参数、层配置相同的七层
+  训练链并以 SoftmaxCrossEntropy 为损失层调用 check_train_gradients，
+  将 ok、max_e、max_r 以紧凑 JSON 原子写入 OUTPUT；ok 真退出 0、
+  假退出 1，其余失败退出 1 且不改 OUTPUT。
 """
 
 import json
@@ -3037,6 +3043,93 @@ def _cmd_evalnorm(weights_path, output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行梯度检查：python convnet.py gradcheck CONFIG OUTPUT
+# ---------------------------------------------------------------------------
+
+_GRADCHECK_CONFIG_KEYS = ["x", "labels", "eps", "atol", "rtol"]
+
+
+def _load_gradcheck_config(config_path):
+    """读取并严格校验 gradcheck 的 CONFIG，返回 (x, labels, eps, atol, rtol)。
+
+    CONFIG 须为 UTF-8 JSON 对象，键仅依次为 x、labels、eps、atol、rtol，
+    重复、缺失、额外或错序键一律非法；x 须为有限 int/float（拒绝 bool）
+    的规则 list[N][1][2][2] 且 N≥1。labels 与 eps/atol/rtol 的校验交给
+    SoftmaxCrossEntropy.forward 与 check_train_gradients 完成。
+    文件不可读、UTF-8/JSON 非法或结构/数值不符时抛 OSError/ValueError/TypeError。
+    """
+    with open(config_path, "rb") as f:
+        raw = f.read()
+    doc = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("CONFIG 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _GRADCHECK_CONFIG_KEYS:
+        raise ValueError(
+            "CONFIG 键必须依次为 x、labels、eps、atol、rtol"
+        )
+
+    x = doc["x"]
+    _require_list(x, "x")
+    x_shape = _shape_of(x, 4, "x")
+    if x_shape[1:] != (1, 2, 2):
+        raise ValueError("x 的形状必须为 [N][1][2][2]")
+    if x_shape[0] < 1:
+        raise ValueError("x 的样本数 N 必须 >= 1")
+
+    labels = doc["labels"]
+    eps = doc["eps"]
+    atol = doc["atol"]
+    rtol = doc["rtol"]
+    return x, labels, eps, atol, rtol
+
+
+def _cmd_gradcheck(config_path, output_path):
+    """gradcheck 子命令主体；配置/检查/写出失败返回 1，ok 假也返回 1。"""
+    try:
+        if os.path.abspath(config_path) == os.path.abspath(output_path):
+            raise ValueError("CONFIG 与 OUTPUT 不能是同一路径")
+        x, labels, eps, atol, rtol = _load_gradcheck_config(config_path)
+
+        # 每次新建与 fitnorm 初始参数、层配置相同的七层训练链。
+        conv = Conv2D(_deep_copy(_CNN_CONV_INIT), [0.0] * _CNN_NUM_CLASSES)
+        bn = BatchNorm2D(
+            _deep_copy(_NORM_GAMMA_INIT),
+            _deep_copy(_NORM_BETA_INIT),
+            _NORM_EPS,
+            _NORM_MOMENTUM,
+        )
+        dropout = Dropout(_NORM_DROPOUT_P, _NORM_DROPOUT_SEED)
+        pool = MaxPool2D(2, 2, 0)
+        flatten = Flatten()
+        linear = Linear(
+            _deep_copy(_CNN_LINEAR_INIT), [0.0] * _CNN_NUM_CLASSES
+        )
+        loss = SoftmaxCrossEntropy()
+
+        ok, max_e, max_r = check_train_gradients(
+            conv, bn, dropout, pool, flatten, linear, loss,
+            x, labels, eps=eps, atol=atol, rtol=rtol,
+        )
+        if not (
+            isinstance(ok, bool)
+            and isinstance(max_e, float)
+            and isinstance(max_r, float)
+            and math.isfinite(max_e)
+            and math.isfinite(max_r)
+        ):
+            raise ValueError("梯度检查结果非法或含非有限值（NaN/inf）")
+
+        artifact = {"ok": ok, "max_e": max_e, "max_r": max_r}
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
 # 公开推理 API：load_model(path)、predict_batch(model, x)
 # ---------------------------------------------------------------------------
 
@@ -3457,8 +3550,8 @@ def train_norm(layers, x, labels, epochs=20, lr=0.1):
 
 
 def main(argv):
-    """命令行入口：接受 train/fitcnn/fitnorm OUTPUT 与
-    evaluate/evalcnn/evalnorm WEIGHTS OUTPUT。
+    """命令行入口：接受 train/fitcnn/fitnorm OUTPUT、
+    evaluate/evalcnn/evalnorm WEIGHTS OUTPUT 与 gradcheck CONFIG OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -3474,6 +3567,8 @@ def main(argv):
         return _cmd_fitnorm(argv[2])
     if len(argv) == 4 and argv[1] == "evalnorm":
         return _cmd_evalnorm(argv[2], argv[3])
+    if len(argv) == 4 and argv[1] == "gradcheck":
+        return _cmd_gradcheck(argv[2], argv[3])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -3481,6 +3576,7 @@ def main(argv):
         "evalcnn",
         "fitnorm",
         "evalnorm",
+        "gradcheck",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
