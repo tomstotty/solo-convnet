@@ -22,6 +22,10 @@
   Conv2D→BatchNorm2D→Dropout→MaxPool2D→Flatten→Linear→SoftmaxCrossEntropy
   七层按序前向、自损失层起逆序反传，做一次同步 SGD 更新，返回 float
   批均损失；任何异常都把七层恢复到入口状态。
+- train_norm(layers, x, labels, epochs=20, lr=0.1)：连续训练 epochs 轮，
+  返回各轮更新前批均损失的新 list[float]；末轮更新后仅以更新后的
+  Conv2D 输出做一次训练态 BN 前向刷新运行统计；任何异常都把七层
+  整体恢复到函数入口状态。
 
 命令行子命令（仅标准库）：
 - `python convnet.py train OUTPUT`：在 data/tiny.csv 上训练“展平 + Linear”，
@@ -3005,7 +3009,8 @@ def predict_batch(model, x):
 
 
 # ---------------------------------------------------------------------------
-# 公开训练 API：train_norm_step(layers, x, labels, lr=0.1)
+# 公开训练 API：train_norm_step(layers, x, labels, lr=0.1) 与
+# train_norm(layers, x, labels, epochs=20, lr=0.1)
 # ---------------------------------------------------------------------------
 
 # 七层每个实例的全部可变状态：缓存（每次成功 forward 覆盖）、模式无关的
@@ -3083,25 +3088,15 @@ def _restore_layers(layers, snap):
     )
 
 
-def train_norm_step(layers, x, labels, lr=0.1):
-    """七层网络（Conv2D/BN/Dropout/MaxPool/Flatten/Linear/SoftmaxCE）的
-    一步标准化训练：按列表顺序前向，自损失层 backward() 起逆序反传，
-    以新 list 同步把 conv 的 weights/bias、BN 的 gamma/beta、linear 的
-    weights/bias 各减去 lr 乘对应梯度，返回 float 批均损失。
+def _validate_train_norm_args(layers, lr):
+    """train_norm_step 与 train_norm 共用的 layers/lr 校验。
 
-    layers 必须是恰含上述七层实例（类型与顺序均固定）的 list：容器或成员
-    类型错抛 TypeError，长度错抛 ValueError；BatchNorm2D 与 Dropout 必须
-    处于训练态，否则抛 ValueError。lr 必须是正的有限 int/float（拒绝
-    bool）：类型错抛 TypeError，非有限或非正抛 ValueError。
-
-    损失层梯度已按批均（含 1/N），参数更新时不再除 N。被调层方法的输入
-    校验错误（类型/形状/取值）原样传播。损失、梯度或更新后的参数含非有限
-    值抛 ValueError。
-
-    成功时替换层内参数，前向产生的正常缓存、BN 运行统计与 Dropout 随机
-    推进均保留；任何路径都不修改 x、labels 及构造参数所用的原 list；
-    一旦出错（含校验与非有限值），七层全部恢复到入口状态（含随机状态、
-    运行统计与旧缓存），如同本次调用从未发生。
+    layers 必须是恰含 Conv2D/BatchNorm2D/Dropout/MaxPool2D/Flatten/
+    Linear/SoftmaxCrossEntropy 七层实例（类型与顺序均固定）的 list：
+    容器或成员类型错抛 TypeError，长度错抛 ValueError；BatchNorm2D 与
+    Dropout 必须处于训练态，否则抛 ValueError。lr 必须是正的有限
+    int/float（拒绝 bool）：类型错抛 TypeError，非有限或非正抛
+    ValueError。
     """
     if not isinstance(layers, list):
         raise TypeError(
@@ -3127,11 +3122,9 @@ def train_norm_step(layers, x, labels, lr=0.1):
                 "layers[%d] 必须是 %s 实例，得到 %s"
                 % (idx, name, type(layer).__name__)
             )
-    bn = layers[1]
-    dropout = layers[2]
-    if not bn._training:
+    if not layers[1]._training:
         raise ValueError("BatchNorm2D 必须处于训练态")
-    if not dropout._training:
+    if not layers[2]._training:
         raise ValueError("Dropout 必须处于训练态")
     if isinstance(lr, bool) or not isinstance(lr, (int, float)):
         raise TypeError(
@@ -3140,7 +3133,36 @@ def train_norm_step(layers, x, labels, lr=0.1):
     if not math.isfinite(lr) or lr <= 0:
         raise ValueError("lr 必须是正的有限值")
 
-    conv, _, _, pool, flatten, linear, loss = layers
+
+def _require_finite_grads(grad):
+    """递归检查梯度树的全部标量，任一非有限值抛 ValueError。"""
+    flat_vals = []
+    _flatten_into(grad, flat_vals)
+    for g in flat_vals:
+        if not math.isfinite(g):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+
+def train_norm_step(layers, x, labels, lr=0.1):
+    """七层网络（Conv2D/BN/Dropout/MaxPool/Flatten/Linear/SoftmaxCE）的
+    一步标准化训练：按列表顺序前向，自损失层 backward() 起逆序反传，
+    以新 list 同步把 conv 的 weights/bias、BN 的 gamma/beta、linear 的
+    weights/bias 各减去 lr 乘对应梯度，返回 float 批均损失。
+
+    layers 与 lr 的校验见 _validate_train_norm_args。损失层梯度已按
+    批均（含 1/N），参数更新时不再除 N。被调层方法的输入校验错误
+    （类型/形状/取值）原样传播。损失、梯度或更新后的参数含非有限值抛
+    ValueError：损失层及每个反向层返回后，递归检查全部传播梯度、参数
+    梯度与最终输入梯度，任一非有限值即抛错。
+
+    成功时替换层内参数，前向产生的正常缓存、BN 运行统计与 Dropout 随机
+    推进均保留；任何路径都不修改 x、labels 及构造参数所用的原 list；
+    一旦出错（含校验与非有限值），七层全部恢复到入口状态（含随机状态、
+    运行统计与旧缓存），如同本次调用从未发生。
+    """
+    _validate_train_norm_args(layers, lr)
+
+    conv, bn, dropout, pool, flatten, linear, loss = layers
     snapshot = _snapshot_layers(layers)
     try:
         # 按列表顺序前向；各层输入错误由其 forward 原样抛出。
@@ -3154,21 +3176,28 @@ def train_norm_step(layers, x, labels, lr=0.1):
         if not math.isfinite(loss_value):
             raise ValueError("训练计算产生非有限值（NaN/inf）")
 
-        # 自损失层起逆序反传；损失梯度已批均，不再除 N。
+        # 自损失层起逆序反传；损失梯度已批均，不再除 N。每层返回后
+        # 立即递归检查其全部输出梯度（含参数梯度与最终输入梯度）。
         grad_logits = loss.backward()
+        _require_finite_grads(grad_logits)
         dx_flat, dlw, dlb = linear.backward(grad_logits)
+        _require_finite_grads(dx_flat)
+        _require_finite_grads(dlw)
+        _require_finite_grads(dlb)
         dx_pool = flatten.backward(dx_flat)
+        _require_finite_grads(dx_pool)
         dx_drop = pool.backward(dx_pool)
+        _require_finite_grads(dx_drop)
         dx_bn = dropout.backward(dx_drop)
+        _require_finite_grads(dx_bn)
         dx_conv, dgamma, dbeta = bn.backward(dx_bn)
-        _, dcw, dcb = conv.backward(dx_conv)
-
-        for grad in (dlw, dlb, dgamma, dbeta, dcw, dcb):
-            flat_vals = []
-            _flatten_into(grad, flat_vals)
-            for g in flat_vals:
-                if not math.isfinite(g):
-                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+        _require_finite_grads(dx_conv)
+        _require_finite_grads(dgamma)
+        _require_finite_grads(dbeta)
+        dx_input, dcw, dcb = conv.backward(dx_conv)
+        _require_finite_grads(dx_input)
+        _require_finite_grads(dcw)
+        _require_finite_grads(dcb)
 
         # 全部新参数先在独立新 list 中算出并校验，再同步提交，保证
         # 失败时层内参数与构造参数原 list 均不被改动。
@@ -3195,6 +3224,48 @@ def train_norm_step(layers, x, labels, lr=0.1):
         linear._weights = new_lin_w
         linear._bias = new_lin_b
         return float(loss_value)
+    except BaseException:
+        _restore_layers(layers, snapshot)
+        raise
+
+
+def train_norm(layers, x, labels, epochs=20, lr=0.1):
+    """七层网络（Conv2D/BN/Dropout/MaxPool/Flatten/Linear/SoftmaxCE）的
+    多轮标准化训练：连续执行 epochs 轮 train_norm_step，返回各轮更新前
+    批均损失组成的新 list[float]。
+
+    layers、x、labels、lr 的校验以及前反向次序、同步 SGD 更新均沿用
+    train_norm_step；损失梯度已批均，不额外除批量。epochs 必须是正
+    int（拒绝 bool）：类型错抛 TypeError，非正抛 ValueError。
+
+    末轮更新后，以更新后的 Conv2D 输出仅执行一次训练态 BN 前向，刷新
+    running_mean/running_var；不经过后续层，也不更新任何参数。
+
+    任一失败（含校验与非有限值）都把七层的参数引用、模式、缓存、BN
+    运行统计、Dropout 随机状态与掩码整体恢复到函数入口状态，且不修改
+    x、labels 及构造参数所用的原 list；成功时保留全部参数更新、BN
+    统计刷新结果与 Dropout 随机推进，BN 与 Dropout 仍处于训练态。
+    相同入口状态结果完全确定。
+    """
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int（拒绝 bool），得到 %s"
+            % type(epochs).__name__
+        )
+    if epochs <= 0:
+        raise ValueError("epochs 必须为正整数")
+    _validate_train_norm_args(layers, lr)
+
+    conv, bn = layers[0], layers[1]
+    snapshot = _snapshot_layers(layers)
+    try:
+        losses = []
+        for _ in range(epochs):
+            losses.append(train_norm_step(layers, x, labels, lr))
+        # 末轮更新后，仅用更新后的 Conv2D 输出做一次训练态 BN 前向，
+        # 刷新运行统计；不经过后续层，也不更新参数。
+        bn.forward(conv.forward(x))
+        return losses
     except BaseException:
         _restore_layers(layers, snapshot)
         raise
