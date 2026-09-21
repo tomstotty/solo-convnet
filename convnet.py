@@ -1032,25 +1032,39 @@ def _flatten_into(t, out):
 def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验层的前向/反向实现。
 
-    layer 限 Conv2D/MaxPool2D/Flatten/Linear/ReLU 实例，其余抛 TypeError。
-    解析梯度 a 取自原值 forward(x) 后 backward(dy) 的对应返回（有参层
-    还包含 dweights、dbias）。对每个标量 v，定义标量损失 L：acc=0.0，
-    按输出嵌套索引从外到内递增执行 acc += y*dy（y 为前向输出），数值
-    梯度 n = (L(v+eps) - L(v-eps)) / (2*eps)。
+    layer 限 Conv2D/MaxPool2D/Flatten/Linear/ReLU/Dropout/BatchNorm2D
+    实例，其余抛 TypeError。解析梯度 a 取自原值 forward(x) 后 backward(dy)
+    的对应返回：Conv2D/Linear 还包含 dweights、dbias；BatchNorm2D 按
+    x、gamma、beta 顺序检查 dx、dgamma、dbeta；Dropout 只检查 x。
+    对每个标量 v，定义标量损失 L：acc=0.0，按输出嵌套索引从外到内递增
+    执行 acc += y*dy（y 为前向输出），数值梯度
+    n = (L(v+eps) - L(v-eps)) / (2*eps)，各目标内部标量按嵌套序遍历。
+
+    BatchNorm2D 仅在训练态检查，推理态一律抛 ValueError；每次数值前向都
+    重新按当前批次统计（gamma/beta 扰动不影响归一化值 z）。
+    Dropout 训练态以入口随机状态 _s 为基准：解析梯度前向及每次正、负
+    扰动前向之前都把 _s 恢复为入口值，使各次前向重放同一掩码，故同一
+    入口状态结果确定；推理态不推进随机状态，按恒等映射检查。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
     ok 当且仅当每项 e <= atol + rtol * max(abs(a), abs(n))。
 
-    eps/atol/rtol 须为有限 int/float（拒绝 bool）：类型错抛 TypeError；
-    eps 非正、容差为负或任一非有限抛 ValueError。x、dy 的校验及异常
-    完全沿用对应层的 forward/backward；计算产生非有限值抛 ValueError。
-    x、dy、参数及实例状态在所有成功或异常路径均原样恢复。
+    校验顺序固定为 layer、eps/atol/rtol、BatchNorm2D 模式、forward(x)、
+    backward(dy)：layer 或数值参数类型错抛 TypeError；BatchNorm2D 推理态、
+    eps 非正、容差为负或任一参数非有限抛 ValueError；x、dy 的校验及异常
+    完全沿用对应层的 forward/backward（形状或非有限错误抛 ValueError）；
+    计算产生非有限值抛 ValueError。x、dy、参数、训练/推理模式、Dropout
+    随机状态与掩码、BatchNorm2D 运行统计与旧缓存在所有成功或异常路径均
+    原样恢复，实参内容不变。
     """
-    if not isinstance(layer, (Conv2D, MaxPool2D, Flatten, Linear, ReLU)):
+    if not isinstance(
+        layer,
+        (Conv2D, MaxPool2D, Flatten, Linear, ReLU, Dropout, BatchNorm2D),
+    ):
         raise TypeError(
-            "layer 必须是 Conv2D/MaxPool2D/Flatten/Linear/ReLU 实例，得到 %s"
-            % type(layer).__name__
+            "layer 必须是 Conv2D/MaxPool2D/Flatten/Linear/ReLU/"
+            "Dropout/BatchNorm2D 实例，得到 %s" % type(layer).__name__
         )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
         if isinstance(val, bool) or not isinstance(val, (int, float)):
@@ -1067,8 +1081,17 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     if rtol < 0:
         raise ValueError("rtol 必须为非负数")
 
+    is_batchnorm = isinstance(layer, BatchNorm2D)
+    is_dropout = isinstance(layer, Dropout)
+    if is_batchnorm and not layer._training:
+        raise ValueError("BatchNorm2D 仅在训练态支持梯度检查")
+
     saved_state = dict(layer.__dict__)
+    dropout_entry_s = layer._s if is_dropout else None
     try:
+        # Dropout 训练态：解析梯度前向先回到入口随机状态，掩码随后可重放。
+        if is_dropout and layer._training:
+            layer._s = dropout_entry_s
         layer.forward(x)  # x 的校验沿用该层 forward
         grad = layer.backward(dy)  # dy 的校验沿用该层 backward
         if isinstance(layer, (Conv2D, Linear)):
@@ -1078,7 +1101,15 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
                 ("weights", layer._weights, dw),
                 ("bias", layer._bias, db),
             )
+        elif is_batchnorm:
+            dx, dgamma, dbeta = grad
+            targets = (
+                ("x", x, dx),
+                ("gamma", layer._gamma, dgamma),
+                ("beta", layer._beta, dbeta),
+            )
         else:
+            # MaxPool2D/Flatten/ReLU/Dropout（训练态与推理态）只检查 x。
             targets = (("x", x, grad),)
 
         def loss(x_arg):
@@ -1096,6 +1127,11 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
             rec(y, dy)
             return acc
 
+        def replay_dropout_mask():
+            """正/负扰动前恢复入口随机状态，使训练前向重放同一掩码。"""
+            if is_dropout and layer._training:
+                layer._s = dropout_entry_s
+
         ok = True
         max_e = 0.0
         max_r = 0.0
@@ -1107,11 +1143,17 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
                 layer._weights = work
             elif name == "bias":
                 layer._bias = work
+            elif name == "gamma":
+                layer._gamma = work
+            elif name == "beta":
+                layer._beta = work
             idx = 0
             for container, i in _leaf_slots(work):
                 v = container[i]
+                replay_dropout_mask()
                 container[i] = v + eps
                 lp = loss(work if name == "x" else x)
+                replay_dropout_mask()
                 container[i] = v - eps
                 lm = loss(work if name == "x" else x)
                 container[i] = v
