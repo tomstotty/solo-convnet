@@ -1386,6 +1386,193 @@ def check_cnn_gradients(
     return (bool(ok), float(max_e), float(max_r))
 
 
+def check_norm_gradients(
+    conv, bn, dropout, pool, flatten, linear, x, dy,
+    eps=1e-6, atol=1e-6, rtol=1e-4,
+):
+    """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→MaxPool2D→Flatten→Linear 训练链。
+
+    conv/bn/dropout/pool/flatten/linear 须依次为 Conv2D/BatchNorm2D/Dropout/
+    MaxPool2D/Flatten/Linear 实例，其余抛 TypeError；bn 或 dropout 非训练态
+    抛 ValueError。前向按 conv→bn→dropout→pool→flatten→linear 执行，解析
+    梯度按 linear→flatten→pool→dropout→bn→conv 逆序取各层 backward 结果。
+    标量损失 L：acc=0.0，按线性层输出的嵌套索引从外到内递增执行
+    acc += y*dy（y 为整链前向输出）。
+
+    数值梯度依次扰动 x、conv 的 weights/bias、bn 的 gamma/beta、linear 的
+    weights/bias（各张量内部按嵌套序），n = (L(v+eps) - L(v-eps)) / (2*eps)。
+    每次前向（含解析梯度前向与每次正、负扰动前向）之前都把 dropout 的随机
+    状态 _s 恢复为入口值，使各次前向重放同一掩码，故同一入口状态结果确定。
+    BatchNorm2D 每次数值前向都重新按当前批次统计。任一次前向中任一池化
+    有效窗口并列最大（补边位置不参与比较）一律抛 ValueError——max 在
+    并列点梯度无定义。
+
+    令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
+    (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
+    ok 当且仅当每项 e <= atol + rtol * max(abs(a), abs(n))。
+
+    eps/atol/rtol 须为有限 int/float（拒绝 bool）：类型错抛 TypeError；
+    eps 非正、容差为负或任一非有限抛 ValueError。x、dy 的校验及异常
+    完全沿用各层 forward/backward；计算产生非有限值抛 ValueError。
+    x、dy、参数及六层实例状态（训练/推理模式、缓存、Dropout 随机状态与
+    掩码、BatchNorm2D 运行统计）在所有成功或异常路径均原样恢复。
+    """
+    if not isinstance(conv, Conv2D):
+        raise TypeError(
+            "conv 必须是 Conv2D 实例，得到 %s" % type(conv).__name__
+        )
+    if not isinstance(bn, BatchNorm2D):
+        raise TypeError(
+            "bn 必须是 BatchNorm2D 实例，得到 %s" % type(bn).__name__
+        )
+    if not isinstance(dropout, Dropout):
+        raise TypeError(
+            "dropout 必须是 Dropout 实例，得到 %s" % type(dropout).__name__
+        )
+    if not isinstance(pool, MaxPool2D):
+        raise TypeError(
+            "pool 必须是 MaxPool2D 实例，得到 %s" % type(pool).__name__
+        )
+    if not isinstance(flatten, Flatten):
+        raise TypeError(
+            "flatten 必须是 Flatten 实例，得到 %s" % type(flatten).__name__
+        )
+    if not isinstance(linear, Linear):
+        raise TypeError(
+            "linear 必须是 Linear 实例，得到 %s" % type(linear).__name__
+        )
+    for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise TypeError(
+                "%s 必须是 int/float（拒绝 bool），得到 %s"
+                % (name, type(val).__name__)
+            )
+        if not math.isfinite(val):
+            raise ValueError("%s 必须是有限值（拒绝 NaN/inf）" % name)
+    if eps <= 0:
+        raise ValueError("eps 必须为正数")
+    if atol < 0:
+        raise ValueError("atol 必须为非负数")
+    if rtol < 0:
+        raise ValueError("rtol 必须为非负数")
+    if not bn._training:
+        raise ValueError("BatchNorm2D 仅在训练态支持梯度检查")
+    if not dropout._training:
+        raise ValueError("Dropout 仅在训练态支持梯度检查")
+
+    saved_state = (
+        dict(conv.__dict__),
+        dict(bn.__dict__),
+        dict(dropout.__dict__),
+        dict(pool.__dict__),
+        dict(flatten.__dict__),
+        dict(linear.__dict__),
+    )
+    dropout_entry_s = dropout._s
+    try:
+        def chain_forward(x_arg):
+            # 每次前向前恢复入口随机状态，使训练前向重放同一掩码。
+            dropout._s = dropout_entry_s
+            conv_out = conv.forward(x_arg)
+            bn_out = bn.forward(conv_out)
+            drop_out = dropout.forward(bn_out)
+            _check_pool_window_ties(pool, drop_out)
+            pool_out = pool.forward(drop_out)
+            flat = flatten.forward(pool_out)
+            return linear.forward(flat)
+
+        def loss(x_arg):
+            y = chain_forward(x_arg)
+            acc = 0.0
+
+            def rec(a, b):
+                nonlocal acc
+                if isinstance(a, list):
+                    for i in range(len(a)):
+                        rec(a[i], b[i])
+                else:
+                    acc += a * b
+
+            rec(y, dy)
+            return acc
+
+        # 前向按 conv→bn→dropout→pool→flatten→linear；x 的校验沿各层
+        # forward，池化并列最大在此一并检出。
+        chain_forward(x)
+
+        # 解析梯度按 linear→flatten→pool→dropout→bn→conv 逆序；
+        # dy 校验沿 linear.backward。
+        dx_flat, dlw, dlb = linear.backward(dy)
+        dx_pool = flatten.backward(dx_flat)
+        dx_drop = pool.backward(dx_pool)
+        dx_bn = dropout.backward(dx_drop)
+        dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+        dx, dcw, dcb = conv.backward(dx_conv)
+
+        targets = (
+            ("x", x, dx),
+            ("conv_weights", conv._weights, dcw),
+            ("conv_bias", conv._bias, dcb),
+            ("bn_gamma", bn._gamma, dgamma),
+            ("bn_beta", bn._beta, dbeta),
+            ("linear_weights", linear._weights, dlw),
+            ("linear_bias", linear._bias, dlb),
+        )
+
+        ok = True
+        max_e = 0.0
+        max_r = 0.0
+        for name, original, analytic in targets:
+            analytic_flat = []
+            _flatten_into(analytic, analytic_flat)
+            work = _deep_copy(original)  # 只扰动副本，原张量不被修改
+            if name == "conv_weights":
+                conv._weights = work
+            elif name == "conv_bias":
+                conv._bias = work
+            elif name == "bn_gamma":
+                bn._gamma = work
+            elif name == "bn_beta":
+                bn._beta = work
+            elif name == "linear_weights":
+                linear._weights = work
+            elif name == "linear_bias":
+                linear._bias = work
+            idx = 0
+            for container, i in _leaf_slots(work):
+                v = container[i]
+                container[i] = v + eps
+                lp = loss(work if name == "x" else x)
+                container[i] = v - eps
+                lm = loss(work if name == "x" else x)
+                container[i] = v
+                if not (math.isfinite(lp) and math.isfinite(lm)):
+                    raise ValueError("数值梯度计算产生非有限值（NaN/inf）")
+                n = (lp - lm) / (2 * eps)
+                a = analytic_flat[idx]
+                idx += 1
+                if not (math.isfinite(a) and math.isfinite(n)):
+                    raise ValueError("梯度计算产生非有限值（NaN/inf）")
+                aa = abs(a)
+                an = abs(n)
+                e = abs(a - n)
+                r = e / max(aa, an, 1e-12)
+                if e > atol + rtol * max(aa, an):
+                    ok = False
+                if e > max_e:
+                    max_e = e
+                if r > max_r:
+                    max_r = r
+    finally:
+        for layer, state in zip(
+            (conv, bn, dropout, pool, flatten, linear), saved_state
+        ):
+            layer.__dict__.clear()
+            layer.__dict__.update(state)
+
+    return (bool(ok), float(max_e), float(max_r))
+
+
 # ---------------------------------------------------------------------------
 # 命令行训练：python convnet.py train OUTPUT
 # ---------------------------------------------------------------------------
