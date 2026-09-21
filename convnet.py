@@ -10,6 +10,8 @@
 - Dropout 层：NCHW 嵌套 list，训练态按概率 p 置零并放大保留项，推理态原样复制。
 - BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并更新
   running_mean/running_var，推理态使用运行统计仿射。
+- SoftmaxCrossEntropy 层：logits [N][K] 与 labels [N]，forward 返回
+  数值稳定的平均交叉熵损失（float），backward 返回梯度 (p-one_hot)/N。
 
 公开推理 API（仅标准库）：
 - load_model(path)：严格校验 train 产物后返回键序为 values、bias 的新 dict。
@@ -1100,6 +1102,96 @@ class BatchNorm2D:
                         if not math.isfinite(dx[n][c][hh][ww]):
                             raise ValueError("反向计算产生非有限值（NaN/inf）")
         return dx, dgamma, dbeta
+
+
+class SoftmaxCrossEntropy:
+    """Softmax + 交叉熵损失层：logits [N][K]，labels [N]（N、K ≥ 1）。
+
+    forward 逐行做数值稳定的 softmax（减去行最大值 m），按 k 递增求
+    e[k]=exp(row[k]-m)、s=Σe、p[k]=e[k]/s，再按 n 递增累计
+    m + log(s) - row[label] 并除以 N，返回 float 标量损失；仅在成功时
+    以新 list 缓存概率与标签（覆盖旧缓存），失败保留旧缓存。
+    backward 返回对 logits 的梯度 [N][K]：(p - one_hot(label)) / N，
+    元素均为 float；未成功 forward 前调用抛 ValueError。
+    """
+
+    def __init__(self):
+        self._probs = None   # 最近一次成功 forward 的 softmax 概率 [N][K]
+        self._labels = None  # 最近一次成功 forward 的标签副本 [N]
+
+    def forward(self, logits, labels):
+        """计算平均交叉熵损失（float），成功时缓存概率与标签副本。"""
+        _require_list(logits, "logits")
+        _require_list(labels, "labels")
+        n_, k_ = _shape_of(logits, 2, "logits")
+        if len(labels) != n_:
+            raise ValueError(
+                "labels 长度 %d 与 logits 样本数 %d 不符"
+                % (len(labels), n_)
+            )
+        for t in range(n_):
+            lab = labels[t]
+            if isinstance(lab, bool) or not isinstance(lab, int):
+                raise TypeError(
+                    "labels 的元素必须是 int（拒绝 bool），得到 %s"
+                    % type(lab).__name__
+                )
+            if lab < 0 or lab >= k_:
+                raise ValueError(
+                    "labels[%d]=%d 超出类别范围 [0, %d)" % (t, lab, k_)
+                )
+
+        probs = []
+        total = 0.0
+        for n in range(n_):
+            row = logits[n]
+            m = row[0]
+            for k in range(1, k_):
+                if row[k] > m:
+                    m = row[k]
+            e = []
+            s = 0.0
+            for k in range(k_):
+                ev = math.exp(row[k] - m)
+                e.append(ev)
+                s += ev
+            p_row = []
+            for k in range(k_):
+                p_row.append(e[k] / s)
+            probs.append(p_row)
+            total += m + math.log(s) - row[labels[n]]
+        loss = total / n_
+        if not math.isfinite(loss):
+            raise ValueError("损失计算产生非有限值（NaN/inf）")
+
+        self._probs = probs
+        self._labels = list(labels)
+        return float(loss)
+
+    def backward(self):
+        """返回 logits 的梯度 [N][K]：(p - one_hot(label)) / N。
+
+        每次调用都返回新的独立 list，元素均为 float；
+        未成功 forward 前调用抛 ValueError。
+        """
+        if self._probs is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        probs = self._probs
+        labels = self._labels
+        n_ = len(probs)
+        k_ = len(probs[0])
+        grad = []
+        for n in range(n_):
+            p_row = probs[n]
+            lab = labels[n]
+            g_row = []
+            for k in range(k_):
+                g = (p_row[k] - (1.0 if k == lab else 0.0)) / n_
+                if not math.isfinite(g):
+                    raise ValueError("梯度计算产生非有限值（NaN/inf）")
+                g_row.append(float(g))
+            grad.append(g_row)
+        return grad
 
 
 def _deep_copy(t):
