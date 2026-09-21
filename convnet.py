@@ -91,6 +91,62 @@ def _check_nonnegative_int(value, name):
     return value
 
 
+def _normalize_stride(stride):
+    """stride 接受正 int 或恰含 (SH, SW) 的 tuple，拒绝 bool。
+
+    int 展开为 (S, S)；整体或成员类型错抛 TypeError，tuple 长度错或
+    任一步幅非正抛 ValueError。
+    """
+    if isinstance(stride, bool) or not isinstance(stride, (int, tuple)):
+        raise TypeError(
+            "stride 必须是 int 或 tuple，得到 %s" % type(stride).__name__
+        )
+    if isinstance(stride, int):
+        if stride <= 0:
+            raise ValueError("stride 必须为正整数")
+        return (stride, stride)
+    if len(stride) != 2:
+        raise ValueError("stride tuple 必须恰含 (SH, SW) 两个成员")
+    for axis, value in zip(("SH", "SW"), stride):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                "stride 的 %s 必须是 int，得到 %s"
+                % (axis, type(value).__name__)
+            )
+        if value <= 0:
+            raise ValueError("stride 的 %s 必须为正整数" % axis)
+    return (stride[0], stride[1])
+
+
+def _normalize_padding(padding):
+    """padding 接受非负 int 或恰含 (PT, PB, PL, PR) 的 tuple，拒绝 bool。
+
+    int 展开为 (P, P, P, P)；整体或成员类型错抛 TypeError，tuple 长度错
+    或任一补边为负抛 ValueError。
+    """
+    if isinstance(padding, bool) or not isinstance(padding, (int, tuple)):
+        raise TypeError(
+            "padding 必须是 int 或 tuple，得到 %s" % type(padding).__name__
+        )
+    if isinstance(padding, int):
+        if padding < 0:
+            raise ValueError("padding 必须为非负整数")
+        return (padding, padding, padding, padding)
+    if len(padding) != 4:
+        raise ValueError(
+            "padding tuple 必须恰含 (PT, PB, PL, PR) 四个成员"
+        )
+    for side, value in zip(("PT", "PB", "PL", "PR"), padding):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                "padding 的 %s 必须是 int，得到 %s"
+                % (side, type(value).__name__)
+            )
+        if value < 0:
+            raise ValueError("padding 的 %s 必须为非负整数" % side)
+    return (padding[0], padding[1], padding[2], padding[3])
+
+
 def _zeros(shape):
     if len(shape) == 1:
         return [0] * shape[0]
@@ -101,16 +157,18 @@ class Conv2D:
     """二维互相关层（NCHW，嵌套 list，零补边）。
 
     weights: [O][C][KH][KW]，bias: [O]，输入 x: [N][C][H][W]。
-    输出: [N][O][floor((H+2P-KH)/S)+1][floor((W+2P-KW)/S)+1]。
+    stride: 正 int（展开为 (S, S)）或恰含 (SH, SW) 的 tuple。
+    padding: 非负 int（展开为 (P, P, P, P)）或恰含
+    (PT, PB, PL, PR) 的 tuple（上/下/左/右）。
+    输出: [N][O][OH][OW]，
+    OH = (H + PT + PB - KH) // SH + 1，
+    OW = (W + PL + PR - KW) // SW + 1，
+    不能整除时舍弃底部或右侧余量。
     """
 
     def __init__(self, weights, bias, stride=1, padding=0):
-        stride = _check_nonnegative_int(stride, "stride")
-        if stride <= 0:
-            raise ValueError("stride 必须为正整数")
-        padding = _check_nonnegative_int(padding, "padding")
-        if padding < 0:
-            raise ValueError("padding 必须为非负整数")
+        stride = _normalize_stride(stride)
+        padding = _normalize_padding(padding)
 
         _require_list(weights, "weights")
         _require_list(bias, "bias")
@@ -124,8 +182,8 @@ class Conv2D:
 
         self._weights = weights
         self._bias = bias
-        self._stride = stride
-        self._padding = padding
+        self._stride = stride            # (SH, SW)
+        self._padding = padding          # (PT, PB, PL, PR)
         self._w_shape = w_shape  # (O, C, KH, KW)
 
         self._x = None           # 最近一次成功 forward 的输入
@@ -140,12 +198,12 @@ class Conv2D:
             raise ValueError(
                 "输入通道数 %d 与 weights 通道数 %d 不符" % (c_, w_c)
             )
-        s = self._stride
-        p = self._padding
-        if kh_ > h_ + 2 * p or kw_ > w_ + 2 * p:
+        sh, sw = self._stride
+        pt, pb, pl, pr = self._padding
+        if kh_ > h_ + pt + pb or kw_ > w_ + pl + pr:
             raise ValueError("核在补边后仍越界：核尺寸大于补边后的输入")
-        oh_ = (h_ + 2 * p - kh_) // s + 1
-        ow_ = (w_ + 2 * p - kw_) // s + 1
+        oh_ = (h_ + pt + pb - kh_) // sh + 1
+        ow_ = (w_ + pl + pr - kw_) // sw + 1
 
         weights = self._weights
         bias = self._bias
@@ -156,9 +214,9 @@ class Conv2D:
                 out_o = []
                 for oh in range(oh_):
                     row = []
-                    base_h = oh * s - p
+                    base_h = oh * sh - pt
                     for ow in range(ow_):
-                        base_w = ow * s - p
+                        base_w = ow * sw - pl
                         acc = bias[o]
                         for c in range(c_):
                             x_c = x[n][c]
@@ -186,7 +244,8 @@ class Conv2D:
         """根据上游梯度 dy 返回 (dx, dweights, dbias)。
 
         dy 的形状必须等于最近一次成功 forward 的输出形状。
-        未成功 forward 前调用一律抛 ValueError。
+        未成功 forward 前调用一律抛 ValueError。补边位置不产生 dx，
+        多个输出位置对同一输入位置的梯度累加。
         """
         if self._x is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -204,8 +263,8 @@ class Conv2D:
         _, c_, kh_, kw_ = self._w_shape
         h_ = len(x[0][0])
         w_ = len(x[0][0][0])
-        s = self._stride
-        p = self._padding
+        sh, sw = self._stride
+        pt, pb, pl, pr = self._padding
 
         dx = _zeros((n_, c_, h_, w_))
         dw = _zeros(self._w_shape)
@@ -214,11 +273,11 @@ class Conv2D:
         for n in range(n_):
             for o in range(o_ch):
                 for oh in range(oh_):
-                    base_h = oh * s - p
+                    base_h = oh * sh - pt
                     for ow in range(ow_):
                         g = dy[n][o][oh][ow]
                         db[o] += g
-                        base_w = ow * s - p
+                        base_w = ow * sw - pl
                         for c in range(c_):
                             x_c = x[n][c]
                             dx_c = dx[n][c]
