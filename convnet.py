@@ -4115,8 +4115,10 @@ def predict_batch(model, x):
 
 
 # ---------------------------------------------------------------------------
-# 公开训练 API：train_norm_step(layers, x, labels, lr=0.1) 与
-# train_norm(layers, x, labels, epochs=20, lr=0.1)
+# 公开训练 API：train_norm_step(layers, x, labels, lr=0.1)、
+# train_norm(layers, x, labels, epochs=20, lr=0.1) 与
+# train_norm_batches(layers, x, labels, batch_size=1, epochs=1, lr=0.1,
+#                    seed=0, shuffle=True)
 # ---------------------------------------------------------------------------
 
 # 七层每个实例的全部可变状态：缓存（每次成功 forward 覆盖）、模式无关的
@@ -4371,6 +4373,89 @@ def train_norm(layers, x, labels, epochs=20, lr=0.1):
         # 末轮更新后，仅用更新后的 Conv2D 输出做一次训练态 BN 前向，
         # 刷新运行统计；不经过后续层，也不更新参数。
         bn.forward(conv.forward(x))
+        return losses
+    except BaseException:
+        _restore_layers(layers, snapshot)
+        raise
+
+
+def train_norm_batches(layers, x, labels, batch_size=1, epochs=1, lr=0.1,
+                       seed=0, shuffle=True):
+    """七层网络（Conv2D/BN/Dropout/MaxPool/Flatten/Linear/SoftmaxCE）的
+    小批量标准化训练：每轮把 N 个样本按 order 顺序每 batch_size 项分批
+    （末批可短），逐批调用 train_norm_step 完成一步同步 SGD 更新，返回
+    按轮、批顺序排列的各批更新前批均损失组成的新 list[float]，长度为
+    epochs * ceil(N / batch_size)。
+
+    layers、x、labels、lr 的校验以及前反向次序、同步更新均沿用
+    train_norm_step；labels 与 x 的样本数不等抛 ValueError。
+    batch_size 与 epochs 必须是正 int，seed 必须是 [0, 2^32 - 1] 内的
+    int（均拒绝 bool）：类型错抛 TypeError，范围错抛 ValueError；
+    shuffle 非 bool 抛 TypeError。
+
+    每轮 order 初始为 [0, …, N-1]；shuffle 为真时从 i = N-1 降至 1
+    执行 s = (1664525 * s + 1013904223) % 2^32、j = s % (i + 1) 并交换
+    order[i]、order[j]，s 自 seed 起跨轮延续；shuffle 为假时不推进 s，
+    每轮按原顺序分批。
+
+    任一失败（含校验与非有限值）都把七层的参数引用、模式、缓存、BN
+    运行统计、Dropout 随机状态与掩码整体恢复到函数入口状态，且不修改
+    x、labels 及构造参数所用的原 list；成功时保留全部参数更新、BN
+    统计推进与 Dropout 随机推进。相同入口状态结果完全确定。
+    """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError(
+            "batch_size 必须是 int（拒绝 bool），得到 %s"
+            % type(batch_size).__name__
+        )
+    if batch_size <= 0:
+        raise ValueError("batch_size 必须为正整数")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int（拒绝 bool），得到 %s"
+            % type(epochs).__name__
+        )
+    if epochs <= 0:
+        raise ValueError("epochs 必须为正整数")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            "seed 必须是 int（拒绝 bool），得到 %s" % type(seed).__name__
+        )
+    if seed < 0 or seed > 0xFFFFFFFF:
+        raise ValueError("seed 必须在 [0, 2^32 - 1] 范围内")
+    if not isinstance(shuffle, bool):
+        raise TypeError(
+            "shuffle 必须是 bool，得到 %s" % type(shuffle).__name__
+        )
+    _validate_train_norm_args(layers, lr)
+    _require_list(x, "x")
+    _require_list(labels, "labels")
+    n_samples = len(x)
+    if len(labels) != n_samples:
+        raise ValueError(
+            "labels 长度 %d 与 x 样本数 %d 不符"
+            % (len(labels), n_samples)
+        )
+
+    snapshot = _snapshot_layers(layers)
+    try:
+        losses = []
+        s = seed
+        for _ in range(epochs):
+            order = list(range(n_samples))
+            if shuffle:
+                # Fisher–Yates 洗牌：LCG 状态 s 自 seed 起跨轮延续。
+                for i in range(n_samples - 1, 0, -1):
+                    s = (1664525 * s + 1013904223) % (1 << 32)
+                    j = s % (i + 1)
+                    order[i], order[j] = order[j], order[i]
+            for start in range(0, n_samples, batch_size):
+                idx = order[start:start + batch_size]
+                batch_x = [x[k] for k in idx]
+                batch_labels = [labels[k] for k in idx]
+                losses.append(
+                    train_norm_step(layers, batch_x, batch_labels, lr)
+                )
         return losses
     except BaseException:
         _restore_layers(layers, snapshot)
