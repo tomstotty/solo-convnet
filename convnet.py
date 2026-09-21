@@ -46,6 +46,12 @@
 - `python convnet.py evalnorm WEIGHTS OUTPUT`：读取 fitnorm 产物 WEIGHTS，
   以保存的 BN 运行统计在推理态网络上逐样本预测，将样本数、预测与
   准确率以紧凑 JSON 原子写入 OUTPUT。
+- `python convnet.py fitdata DATA OUTPUT`：读取本地 UTF-8 JSON DATA
+  （键依次为 x、labels；x 为有限数（拒绝 bool）的规则 list[N][1][2][2]、
+  N>=2，labels 为等长 int 0/1（拒绝 bool）list），新建与 fitnorm 相同的
+  初值与七层配置（Dropout seed=7）调用
+  train_norm(layers, x, labels, epochs=20, lr=0.1)，将与 fitnorm 同构的
+  模型与指标（loss 换为本次 20 项、accuracy 为 1.0）以紧凑 JSON 原子写入 OUTPUT。
 - `python convnet.py gradcheck CONFIG OUTPUT`：读取 UTF-8 JSON CONFIG
   （键依次为 x、labels、eps、atol、rtol，x 为有限数的规则
   list[N][1][2][2]、N≥1），新建与 fitnorm 初始参数、层配置相同的七层
@@ -2617,6 +2623,177 @@ def _cmd_fitnorm(output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行外部数据 BatchNorm 训练：python convnet.py fitdata DATA OUTPUT
+# ---------------------------------------------------------------------------
+
+_FITDATA_DATA_KEYS = ["x", "labels"]
+
+
+def _load_fitdata_data(data_path):
+    """读取并严格校验 fitdata 的 DATA，返回 (x, labels)。
+
+    DATA 须为 UTF-8 JSON 对象，键仅依次为 x、labels，重复、缺失、额外或
+    错序键一律非法；x 须为有限 int/float（拒绝 bool）的规则
+    list[N][1][2][2]，N>=2；labels 须为与样本等长的 list，元素为 int 0 或
+    1（拒绝 bool）。文件不可读、UTF-8/JSON 非法或结构/数值不符时抛
+    OSError/ValueError/TypeError。
+    """
+    with open(data_path, "rb") as f:
+        raw = f.read()
+    doc = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("DATA 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _FITDATA_DATA_KEYS:
+        raise ValueError("DATA 键必须依次为 x、labels")
+
+    x = doc["x"]
+    _require_list(x, "x")
+    x_shape = _shape_of(x, 4, "x")
+    if x_shape[1:] != (1, 2, 2):
+        raise ValueError("x 的形状必须为 [N][1][2][2]")
+    if x_shape[0] < 2:
+        raise ValueError("x 的样本数 N 必须 >= 2")
+
+    labels = doc["labels"]
+    _require_list(labels, "labels")
+    n_ = x_shape[0]
+    if len(labels) != n_:
+        raise ValueError(
+            "labels 长度 %d 与样本数 %d 不符" % (len(labels), n_)
+        )
+    for idx, label in enumerate(labels):
+        if isinstance(label, bool) or not isinstance(label, int):
+            raise TypeError(
+                "labels[%d] 必须是 int 0 或 1（拒绝 bool），得到 %s"
+                % (idx, type(label).__name__)
+            )
+        if label != 0 and label != 1:
+            raise ValueError(
+                "labels[%d] = %d 必须为 0 或 1" % (idx, label)
+            )
+    return x, labels
+
+
+def _fitdata_run(x, labels):
+    """在外部 DATA 上以 train_norm 训练并重建推理态网络校验。
+
+    新建与 fitnorm 初值、七层配置一致的训练链（Dropout seed=7），调用
+    train_norm(layers, x, labels, epochs=20, lr=0.1)。训练后要求：20 项
+    更新前批均 loss 末项严格小于首项；conv 权重/偏置、BN gamma/beta、
+    linear 权重/偏置六组参数至少一组相对初值改变。随后以最终参数与 BN
+    运行统计重建推理态网络（关闭 Dropout），逐样本取最大 logit 为预测、
+    并列取小类，要求全部 logit 有限且 accuracy 恰为 1.0。
+
+    返回 (conv_w, conv_b, gamma, beta, running_mean, running_var,
+    lin_w, lin_b, losses)。任一要求不满足或出现非有限计算抛 ValueError。
+    """
+    n_ = len(x)
+    conv = Conv2D(_deep_copy(_CNN_CONV_INIT), [0.0] * _CNN_NUM_CLASSES)
+    bn = BatchNorm2D(
+        _deep_copy(_NORM_GAMMA_INIT),
+        _deep_copy(_NORM_BETA_INIT),
+        _NORM_EPS,
+        _NORM_MOMENTUM,
+    )
+    dropout = Dropout(_NORM_DROPOUT_P, _NORM_DROPOUT_SEED)
+    pool = MaxPool2D(2, 2, 0)
+    flatten = Flatten()
+    linear = Linear(
+        _deep_copy(_CNN_LINEAR_INIT), [0.0] * _CNN_NUM_CLASSES
+    )
+    loss_layer = SoftmaxCrossEntropy()
+    layers = [conv, bn, dropout, pool, flatten, linear, loss_layer]
+
+    losses = train_norm(
+        layers, x, labels, epochs=_NORM_EPOCHS, lr=_NORM_LR
+    )
+
+    if not losses[-1] < losses[0]:
+        raise ValueError("末次 loss 未小于首次 loss")
+
+    conv_w, conv_b = conv._weights, conv._bias
+    gamma, beta = bn._gamma, bn._beta
+    running_mean, running_var = bn.running_mean, bn.running_var
+    lin_w, lin_b = linear._weights, linear._bias
+
+    init_groups = (
+        _CNN_CONV_INIT, [0.0] * _CNN_NUM_CLASSES,
+        _NORM_GAMMA_INIT, _NORM_BETA_INIT,
+        _CNN_LINEAR_INIT, [0.0] * _CNN_NUM_CLASSES,
+    )
+    final_groups = (conv_w, conv_b, gamma, beta, lin_w, lin_b)
+    if not any(before != after for before, after in zip(
+        init_groups, final_groups
+    )):
+        raise ValueError("训练后六组参数均未改变")
+
+    # 以最终参数与 BN 运行统计重建推理态网络，Dropout 关闭，逐样本预测。
+    logits, _, _ = _norm_forward(
+        conv_w, conv_b, gamma, beta,
+        running_mean, running_var, lin_w, lin_b,
+        x, False,
+    )
+    correct = 0
+    for i in range(n_):
+        row = logits[i]
+        for o in range(_CNN_NUM_CLASSES):
+            if not math.isfinite(row[o]):
+                raise ValueError("推理计算产生非有限值（NaN/inf）")
+        # 取最大 logit，并列取较小类别。
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        if pred == labels[i]:
+            correct += 1
+    accuracy = correct / n_
+    if accuracy != 1.0:
+        raise ValueError("训练后 accuracy 不为 1.0")
+    return (
+        conv_w, conv_b, gamma, beta, running_mean, running_var,
+        lin_w, lin_b, losses,
+    )
+
+
+def _cmd_fitdata(data_path, output_path):
+    """fitdata 子命令主体；数据/训练/写出失败返回 1，且不改动 OUTPUT。"""
+    try:
+        if os.path.abspath(data_path) == os.path.abspath(output_path):
+            raise ValueError("DATA 与 OUTPUT 不能是同一路径")
+        x, labels = _load_fitdata_data(data_path)
+        (
+            conv_w, conv_b, gamma, beta, running_mean, running_var,
+            lin_w, lin_b, losses,
+        ) = _fitdata_run(x, labels)
+        artifact = {
+            "model": {
+                "conv": {"values": conv_w, "bias": conv_b},
+                "batchnorm": {
+                    "gamma": gamma,
+                    "beta": beta,
+                    "running_mean": running_mean,
+                    "running_var": running_var,
+                },
+                "linear": {"values": lin_w, "bias": lin_b},
+            },
+            "metrics": {
+                "epochs": _NORM_EPOCHS,
+                "lr": float(_NORM_LR),
+                "seed": _NORM_DROPOUT_SEED,
+                "loss": losses,
+                "accuracy": 1.0,
+            },
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 命令行评估：python convnet.py evaluate WEIGHTS OUTPUT
 # ---------------------------------------------------------------------------
 
@@ -3550,8 +3727,9 @@ def train_norm(layers, x, labels, epochs=20, lr=0.1):
 
 
 def main(argv):
-    """命令行入口：接受 train/fitcnn/fitnorm OUTPUT、
-    evaluate/evalcnn/evalnorm WEIGHTS OUTPUT 与 gradcheck CONFIG OUTPUT。
+    """命令行入口：接受 train/fitcnn/fitnorm OUTPUT，
+    evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT，
+    以及 gradcheck CONFIG OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -3565,6 +3743,8 @@ def main(argv):
         return _cmd_evalcnn(argv[2], argv[3])
     if len(argv) == 3 and argv[1] == "fitnorm":
         return _cmd_fitnorm(argv[2])
+    if len(argv) == 4 and argv[1] == "fitdata":
+        return _cmd_fitdata(argv[2], argv[3])
     if len(argv) == 4 and argv[1] == "evalnorm":
         return _cmd_evalnorm(argv[2], argv[3])
     if len(argv) == 4 and argv[1] == "gradcheck":
@@ -3575,6 +3755,7 @@ def main(argv):
         "fitcnn",
         "evalcnn",
         "fitnorm",
+        "fitdata",
         "evalnorm",
         "gradcheck",
     ):
