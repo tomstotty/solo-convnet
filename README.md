@@ -3,6 +3,8 @@
 从零实现的卷积神经网络库，仅用 Python 标准库、不联网。
 
 - 入口：`python convnet.py <子命令>`
+- 子命令：`train`/`evaluate`（展平+Linear）、`fitcnn`/`evalcnn`（CNN）、
+  `fitnorm`/`evalnorm`（CNN+BatchNorm2D+Dropout，推理用保存的运行统计）。
 - 训练必须完全确定：相同种子、相同数据与超参数产生逐字节相同的权重与指标。
 - 数据集与权重全部来自仓库内的本地文件，不下载任何外部资源。
 

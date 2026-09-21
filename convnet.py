@@ -26,6 +26,12 @@
 - `python convnet.py evalcnn WEIGHTS OUTPUT`：读取 fitcnn 产物 WEIGHTS，
   以同一网络在 data/tiny.csv 上逐样本预测，将样本数、预测与准确率以
   紧凑 JSON 原子写入 OUTPUT。
+- `python convnet.py fitnorm OUTPUT`：网络沿用 fitcnn，仅在 Conv2D 后
+  依次插入 BatchNorm2D(eps=1e-5, momentum=1.0) 与 Dropout(0.25, seed=7)，
+  在 data/tiny.csv 上训练并将权重与指标以紧凑 JSON 原子写入 OUTPUT。
+- `python convnet.py evalnorm WEIGHTS OUTPUT`：读取 fitnorm 产物 WEIGHTS，
+  以保存的 BN 运行统计做推理态前向，在 data/tiny.csv 上逐样本预测，
+  将样本数、预测与准确率以紧凑 JSON 原子写入 OUTPUT。
 """
 
 import json
@@ -1774,6 +1780,213 @@ def _cmd_fitcnn(output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行 BN 训练：python convnet.py fitnorm OUTPUT
+# ---------------------------------------------------------------------------
+
+_NORM_DROPOUT_P = 0.25
+_NORM_SEED = 7
+_NORM_BN_EPS = 1e-5
+_NORM_BN_MOMENTUM = 1.0
+
+
+def _fitnorm_run():
+    """执行确定性 CNN+BatchNorm+Dropout 训练。
+
+    网络沿用 fitcnn，仅在 Conv2D 后依次插入 BatchNorm2D 与 Dropout：
+    Conv2D(1×1,2 核) → BatchNorm2D(eps=1e-5, momentum=1.0) → Dropout(0.25, seed=7)
+    → MaxPool2D(2,2,0) → Flatten → Linear。Dropout 随机状态跨轮延续。
+    返回 (conv_w, conv_b, gamma, beta, running_mean, running_var,
+          lin_w, lin_b, losses, accuracy)。
+    """
+    images, labels = _load_cnn_samples()
+    n_ = len(images)
+
+    conv_w = _deep_copy(_CNN_CONV_INIT)
+    conv_b = [0.0] * _CNN_NUM_CLASSES
+    gamma = [1.0] * _CNN_NUM_CLASSES
+    beta = [0.0] * _CNN_NUM_CLASSES
+    lin_w = _deep_copy(_CNN_LINEAR_INIT)
+    lin_b = [0.0] * _CNN_NUM_CLASSES
+
+    # 全程仅这一个 Dropout 实例，其随机状态跨轮延续。
+    dropout = Dropout(_NORM_DROPOUT_P, _NORM_SEED)
+
+    losses = []
+    lr = _CNN_LR
+    for _ in range(_CNN_EPOCHS):
+        conv = Conv2D(conv_w, conv_b)
+        bn = BatchNorm2D(gamma, beta, _NORM_BN_EPS, _NORM_BN_MOMENTUM)
+        pool = MaxPool2D(2, 2, 0)
+        flatten = Flatten()
+        linear = Linear(lin_w, lin_b)
+
+        conv_out = conv.forward(images)
+        bn_out = bn.forward(conv_out)
+        drop_out = dropout.forward(bn_out)
+        pool_out = pool.forward(drop_out)
+        flat = flatten.forward(pool_out)
+        logits = linear.forward(flat)
+
+        # 交叉熵前向：softmax 先减去每行最大 logit；记录更新前的批均损失。
+        probs = []
+        loss_sum = 0.0
+        for n in range(n_):
+            row = logits[n]
+            m = row[0]
+            for o in range(1, _CNN_NUM_CLASSES):
+                if row[o] > m:
+                    m = row[o]
+            exps = []
+            denom = 0.0
+            for o in range(_CNN_NUM_CLASSES):
+                e = math.exp(row[o] - m)
+                exps.append(e)
+                denom += e
+            p = [e / denom for e in exps]
+            probs.append(p)
+            loss_sum += -math.log(p[labels[n]])
+        loss = loss_sum / n_
+        if not math.isfinite(loss):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+        losses.append(loss)
+
+        # 反向：softmax-交叉熵对 logits 的梯度为 p - onehot，沿链逐层回传。
+        grad_logits = [
+            [
+                probs[n][o] - (1.0 if labels[n] == o else 0.0)
+                for o in range(_CNN_NUM_CLASSES)
+            ]
+            for n in range(n_)
+        ]
+        dx_flat, dlw, dlb = linear.backward(grad_logits)
+        dx_pool = flatten.backward(dx_flat)
+        dx_drop = pool.backward(dx_pool)
+        dx_bn = dropout.backward(dx_drop)
+        dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+        _, dcw, dcb = conv.backward(dx_conv)
+
+        # 除 N 后同步 SGD 更新（先全部算出新值再提交）。
+        inv_n = 1.0 / n_
+        new_conv_w = [
+            [
+                [
+                    [
+                        conv_w[o][c][kh][kw] - lr * dcw[o][c][kh][kw] * inv_n
+                        for kw in range(1)
+                    ]
+                    for kh in range(1)
+                ]
+                for c in range(1)
+            ]
+            for o in range(_CNN_NUM_CLASSES)
+        ]
+        new_conv_b = [
+            conv_b[o] - lr * dcb[o] * inv_n
+            for o in range(_CNN_NUM_CLASSES)
+        ]
+        new_gamma = [
+            gamma[c] - lr * dgamma[c] * inv_n
+            for c in range(_CNN_NUM_CLASSES)
+        ]
+        new_beta = [
+            beta[c] - lr * dbeta[c] * inv_n
+            for c in range(_CNN_NUM_CLASSES)
+        ]
+        new_lin_w = [
+            [
+                lin_w[o][i] - lr * dlw[o][i] * inv_n
+                for i in range(_CNN_NUM_CLASSES)
+            ]
+            for o in range(_CNN_NUM_CLASSES)
+        ]
+        new_lin_b = [
+            lin_b[o] - lr * dlb[o] * inv_n
+            for o in range(_CNN_NUM_CLASSES)
+        ]
+        for new_tensor in (
+            new_conv_w, new_conv_b, new_gamma, new_beta, new_lin_w, new_lin_b,
+        ):
+            flat_vals = []
+            _flatten_into(new_tensor, flat_vals)
+            for v in flat_vals:
+                if not math.isfinite(v):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+        conv_w, conv_b = new_conv_w, new_conv_b
+        gamma, beta = new_gamma, new_beta
+        lin_w, lin_b = new_lin_w, new_lin_b
+
+    # 末次更新后用最终 conv 与全批仅刷新一次 BN 运行统计，再切推理态。
+    conv = Conv2D(conv_w, conv_b)
+    bn = BatchNorm2D(gamma, beta, _NORM_BN_EPS, _NORM_BN_MOMENTUM)
+    bn.forward(conv.forward(images))
+    bn.train(False)
+    dropout.train(False)
+
+    # 以推理态整链前向，最大 logit 预测，并列取小类。
+    pool = MaxPool2D(2, 2, 0)
+    flatten = Flatten()
+    linear = Linear(lin_w, lin_b)
+    conv_out = conv.forward(images)
+    bn_out = bn.forward(conv_out)
+    drop_out = dropout.forward(bn_out)
+    pool_out = pool.forward(drop_out)
+    flat = flatten.forward(pool_out)
+    final_logits = linear.forward(flat)
+    correct = 0
+    for n in range(n_):
+        row = final_logits[n]
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        if pred == labels[n]:
+            correct += 1
+    accuracy = correct / n_
+    if accuracy != 1.0:
+        raise ValueError("训练后 accuracy 不为 1.0")
+    if not losses[-1] < losses[0]:
+        raise ValueError("末次 loss 未小于首次 loss")
+    return (
+        conv_w, conv_b, gamma, beta,
+        list(bn.running_mean), list(bn.running_var),
+        lin_w, lin_b, losses, accuracy,
+    )
+
+
+def _cmd_fitnorm(output_path):
+    """fitnorm 子命令主体；数据/计算失败返回 1。"""
+    try:
+        (
+            conv_w, conv_b, gamma, beta, running_mean, running_var,
+            lin_w, lin_b, losses, accuracy,
+        ) = _fitnorm_run()
+        artifact = {
+            "model": {
+                "conv": {"values": conv_w, "bias": conv_b},
+                "batchnorm": {
+                    "gamma": gamma,
+                    "beta": beta,
+                    "running_mean": running_mean,
+                    "running_var": running_var,
+                },
+                "linear": {"values": lin_w, "bias": lin_b},
+            },
+            "metrics": {
+                "epochs": _CNN_EPOCHS,
+                "lr": float(_CNN_LR),
+                "seed": _NORM_SEED,
+                "loss": losses,
+                "accuracy": accuracy,
+            },
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (_TrainDataError, ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 命令行评估：python convnet.py evaluate WEIGHTS OUTPUT
 # ---------------------------------------------------------------------------
 
@@ -2030,6 +2243,179 @@ def _cmd_evalcnn(weights_path, output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行 BN 评估：python convnet.py evalnorm WEIGHTS OUTPUT
+# ---------------------------------------------------------------------------
+
+_NORM_EVAL_TOP_KEYS = ["model", "metrics"]
+_NORM_MODEL_KEYS = ["conv", "batchnorm", "linear"]
+_NORM_BN_KEYS = ["gamma", "beta", "running_mean", "running_var"]
+_NORM_METRICS_KEYS = ["epochs", "lr", "seed", "loss", "accuracy"]
+
+
+def _load_norm_artifact(weights_path):
+    """读取并严格校验 fitnorm 产物。
+
+    返回 (conv_values, conv_bias, gamma, beta, running_mean, running_var,
+          lin_values, lin_bias)。顶层及 model/conv/batchnorm/linear/metrics
+    各层的键名、键序、类型与形状均须与 fitnorm 写出的公开契约一致；拒绝
+    重复键，conv values 须为 [2][1][1][1]、conv bias 为 [2]，batchnorm 四个
+    字段均为 [2]，linear values 为 [2][2]、linear bias 为 [2]，数值限有限
+    int/float 且拒绝 bool。文件不可读、UTF-8/JSON 非法或结构/数值不符时
+    抛 OSError/ValueError/TypeError。
+    """
+    with open(weights_path, "rb") as f:
+        raw = f.read()
+    doc = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("BN 产物顶层必须是 JSON 对象")
+    if list(doc.keys()) != _NORM_EVAL_TOP_KEYS:
+        raise ValueError("BN 产物顶层键必须依次为 model、metrics")
+
+    model_obj = doc["model"]
+    if not isinstance(model_obj, dict) or (
+        list(model_obj.keys()) != _NORM_MODEL_KEYS
+    ):
+        raise ValueError("model 的键必须依次为 conv、batchnorm、linear")
+    metrics_obj = doc["metrics"]
+    if not isinstance(metrics_obj, dict) or (
+        list(metrics_obj.keys()) != _NORM_METRICS_KEYS
+    ):
+        raise ValueError(
+            "metrics 的键必须依次为 epochs、lr、seed、loss、accuracy"
+        )
+
+    conv_obj = model_obj["conv"]
+    if not isinstance(conv_obj, dict) or (
+        list(conv_obj.keys()) != _CNN_LAYER_KEYS
+    ):
+        raise ValueError("conv 的键必须依次为 values、bias")
+    bn_obj = model_obj["batchnorm"]
+    if not isinstance(bn_obj, dict) or (
+        list(bn_obj.keys()) != _NORM_BN_KEYS
+    ):
+        raise ValueError(
+            "batchnorm 的键必须依次为 gamma、beta、running_mean、running_var"
+        )
+    linear_obj = model_obj["linear"]
+    if not isinstance(linear_obj, dict) or (
+        list(linear_obj.keys()) != _CNN_LAYER_KEYS
+    ):
+        raise ValueError("linear 的键必须依次为 values、bias")
+
+    conv_values = conv_obj["values"]
+    conv_bias = conv_obj["bias"]
+    gamma = bn_obj["gamma"]
+    beta = bn_obj["beta"]
+    running_mean = bn_obj["running_mean"]
+    running_var = bn_obj["running_var"]
+    lin_values = linear_obj["values"]
+    lin_bias = linear_obj["bias"]
+    if _shape_of(conv_values, 4, "conv values") != (2, 1, 1, 1):
+        raise ValueError("conv values 的形状必须为 [2][1][1][1]")
+    if _shape_of(conv_bias, 1, "conv bias") != (2,):
+        raise ValueError("conv bias 的形状必须为 [2]")
+    for name, tensor in (
+        ("gamma", gamma),
+        ("beta", beta),
+        ("running_mean", running_mean),
+        ("running_var", running_var),
+    ):
+        if _shape_of(tensor, 1, name) != (2,):
+            raise ValueError("%s 的形状必须为 [2]" % name)
+    if _shape_of(lin_values, 2, "linear values") != (2, 2):
+        raise ValueError("linear values 的形状必须为 [2][2]")
+    if _shape_of(lin_bias, 1, "linear bias") != (2,):
+        raise ValueError("linear bias 的形状必须为 [2]")
+
+    epochs = metrics_obj["epochs"]
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int，得到 %s" % type(epochs).__name__
+        )
+    _check_metrics_float(metrics_obj["lr"], "lr")
+    seed = metrics_obj["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            "seed 必须是 int，得到 %s" % type(seed).__name__
+        )
+    _check_metrics_float(metrics_obj["accuracy"], "accuracy")
+    loss = metrics_obj["loss"]
+    if not isinstance(loss, list):
+        raise TypeError(
+            "loss 必须是 list，得到 %s" % type(loss).__name__
+        )
+    if len(loss) != _CNN_EPOCHS:
+        raise ValueError(
+            "loss 长度 %d 与训练轮数 %d 不符" % (len(loss), _CNN_EPOCHS)
+        )
+    for entry in loss:
+        _check_metrics_float(entry, "loss")
+    return (
+        conv_values, conv_bias, gamma, beta, running_mean, running_var,
+        lin_values, lin_bias,
+    )
+
+
+def _cmd_evalnorm(weights_path, output_path):
+    """evalnorm 子命令主体；权重/数据/计算/写出失败返回 1。"""
+    try:
+        (
+            conv_values, conv_bias, gamma, beta, running_mean, running_var,
+            lin_values, lin_bias,
+        ) = _load_norm_artifact(weights_path)
+        images, labels = _load_cnn_samples()
+        n_ = len(images)
+
+        # 以产物保存的 running 统计做推理态前向；Dropout 推理态为恒等映射。
+        conv = Conv2D(conv_values, conv_bias)
+        bn = BatchNorm2D(gamma, beta, _NORM_BN_EPS, _NORM_BN_MOMENTUM)
+        bn.running_mean = list(running_mean)
+        bn.running_var = list(running_var)
+        bn.train(False)
+        dropout = Dropout(_NORM_DROPOUT_P, _NORM_SEED)
+        dropout.train(False)
+        pool = MaxPool2D(2, 2, 0)
+        flatten = Flatten()
+        linear = Linear(lin_values, lin_bias)
+
+        conv_out = conv.forward(images)
+        bn_out = bn.forward(conv_out)
+        drop_out = dropout.forward(bn_out)
+        pool_out = pool.forward(drop_out)
+        flat = flatten.forward(pool_out)
+        logits = linear.forward(flat)
+
+        predictions = []
+        correct = 0
+        for n in range(n_):
+            row = logits[n]
+            for o in range(_CNN_NUM_CLASSES):
+                if not math.isfinite(row[o]):
+                    raise ValueError("评估计算产生非有限值（NaN/inf）")
+            # 取最大 logit，并列取较小类别。
+            pred = 0
+            for o in range(1, _CNN_NUM_CLASSES):
+                if row[o] > row[pred]:
+                    pred = o
+            predictions.append(pred)
+            if pred == labels[n]:
+                correct += 1
+
+        artifact = {
+            "sample_count": n_,
+            "predictions": predictions,
+            "accuracy": correct / n_,
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (_TrainDataError, ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 公开推理 API：load_model(path)、predict_batch(model, x)
 # ---------------------------------------------------------------------------
 
@@ -2187,7 +2573,8 @@ def predict_batch(model, x):
 
 
 def main(argv):
-    """命令行入口：接受 train/fitcnn OUTPUT 与 evaluate/evalcnn WEIGHTS OUTPUT。
+    """命令行入口：接受 train/fitcnn/fitnorm OUTPUT 与
+    evaluate/evalcnn/evalnorm WEIGHTS OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -2199,11 +2586,17 @@ def main(argv):
         return _cmd_fitcnn(argv[2])
     if len(argv) == 4 and argv[1] == "evalcnn":
         return _cmd_evalcnn(argv[2], argv[3])
+    if len(argv) == 3 and argv[1] == "fitnorm":
+        return _cmd_fitnorm(argv[2])
+    if len(argv) == 4 and argv[1] == "evalnorm":
+        return _cmd_evalnorm(argv[2], argv[3])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
         "fitcnn",
         "evalcnn",
+        "fitnorm",
+        "evalnorm",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
