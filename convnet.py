@@ -3299,6 +3299,96 @@ def _cmd_evaldata(weights_path, data_path, output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行数据驱动预测：python convnet.py predictdata WEIGHTS DATA OUTPUT
+# ---------------------------------------------------------------------------
+
+_PREDICTDATA_KEYS = ["x"]
+
+
+def _load_predictdata(data_path):
+    """读取并严格校验 predictdata 的 DATA，返回 x。
+
+    DATA 须为 UTF-8 JSON 对象，键仅依次为 x，重复、缺失、额外或错序键
+    一律非法；x 须为有限 int/float（拒绝 bool）的规则 list[N][1][2][2]
+    且 N>=1。文件不可读、UTF-8/JSON 非法或结构/类型/取值不符时抛
+    OSError/ValueError/TypeError。
+    """
+    with open(data_path, "rb") as f:
+        raw = f.read()
+    doc = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("DATA 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _PREDICTDATA_KEYS:
+        raise ValueError("DATA 键必须仅为 x")
+
+    x = doc["x"]
+    _require_list(x, "x")
+    x_shape = _shape_of(x, 4, "x")
+    if x_shape[1:] != (1, 2, 2):
+        raise ValueError("x 的形状必须为 [N][1][2][2]")
+    if x_shape[0] < 1:
+        raise ValueError("x 的样本数 N 必须 >= 1")
+    return x
+
+
+def _cmd_predictdata(weights_path, data_path, output_path):
+    """predictdata 子命令主体；权重/数据/推理/写出失败返回 1 且不改 OUTPUT。
+
+    WEIGHTS 沿用 evalnorm 对 fitnorm/fitdata 产物的全部校验（metrics 合法
+    值不参与推理）；以保存参数与 BN 运行统计重建推理态网络（BN、Dropout
+    均为推理态），逐样本产出两个有限 logit，取最大者、并列取较小类别。
+    """
+    try:
+        if os.path.abspath(output_path) == os.path.abspath(weights_path):
+            raise ValueError("OUTPUT 与 WEIGHTS 不能是同一路径")
+        if os.path.abspath(output_path) == os.path.abspath(data_path):
+            raise ValueError("OUTPUT 与 DATA 不能是同一路径")
+        (
+            conv_values, conv_bias, gamma, beta,
+            running_mean, running_var, lin_values, lin_bias,
+        ) = _load_norm_artifact(weights_path)
+        x = _load_predictdata(data_path)
+        n_ = len(x)
+
+        # 推理态：BN 用保存的运行统计仿射，Dropout 为恒等映射。
+        logits, _, _ = _norm_forward(
+            conv_values, conv_bias, gamma, beta,
+            running_mean, running_var, lin_values, lin_bias,
+            x, False,
+        )
+        predictions = []
+        out_logits = []
+        for n in range(n_):
+            row = logits[n]
+            out_row = []
+            for o in range(_CNN_NUM_CLASSES):
+                value = float(row[o])
+                if not math.isfinite(value):
+                    raise ValueError("推理计算产生非有限值（NaN/inf）")
+                out_row.append(value)
+            # 取最大 logit，并列取较小类别。
+            pred = 0
+            for o in range(1, _CNN_NUM_CLASSES):
+                if out_row[o] > out_row[pred]:
+                    pred = o
+            predictions.append(pred)
+            out_logits.append(out_row)
+
+        artifact = {
+            "sample_count": n_,
+            "predictions": predictions,
+            "logits": out_logits,
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 命令行梯度检查：python convnet.py gradcheck CONFIG OUTPUT
 # ---------------------------------------------------------------------------
 
@@ -3808,7 +3898,7 @@ def train_norm(layers, x, labels, epochs=20, lr=0.1):
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm OUTPUT、
     evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
-    evaldata WEIGHTS DATA OUTPUT 与 gradcheck CONFIG OUTPUT。
+    evaldata/predictdata WEIGHTS DATA OUTPUT 与 gradcheck CONFIG OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -3828,6 +3918,8 @@ def main(argv):
         return _cmd_fitdata(argv[2], argv[3])
     if len(argv) == 5 and argv[1] == "evaldata":
         return _cmd_evaldata(argv[2], argv[3], argv[4])
+    if len(argv) == 5 and argv[1] == "predictdata":
+        return _cmd_predictdata(argv[2], argv[3], argv[4])
     if len(argv) == 4 and argv[1] == "gradcheck":
         return _cmd_gradcheck(argv[2], argv[3])
     if len(argv) >= 2 and argv[1] in (
@@ -3839,6 +3931,7 @@ def main(argv):
         "evalnorm",
         "fitdata",
         "evaldata",
+        "predictdata",
         "gradcheck",
     ):
         return 2
