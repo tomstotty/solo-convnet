@@ -3,7 +3,9 @@
 当前提供：
 - Conv2D 层：NCHW 嵌套 list、互相关（不翻转核）、零补边；stride 可为
   正 int 或 (SH, SW) tuple，padding 可为非负 int 或 (PT,PB,PL,PR) tuple。
-- MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较。
+- MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、零补边；kernel_size 可为
+  正 int 或 (KH, KW) tuple，stride 可为正 int 或 (SH, SW) tuple，
+  padding 可为非负 int 或 (PT,PB,PL,PR) tuple，补边位置不参与比较。
 - Flatten 层：NCHW 嵌套 list 展平为 [N][C*H*W]（按 c→h→w 顺序）。
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
@@ -92,8 +94,36 @@ def _check_nonnegative_int(value, name):
     return value
 
 
+def _check_kernel2d(value):
+    """校验二维核尺寸：正 int 或恰含 (KH, KW) 的正 int tuple（拒绝 bool）。
+
+    int 展开为 (K, K)；整体类型错抛 TypeError，tuple 长度错或成员非正
+    抛 ValueError，成员类型错（含 bool）抛 TypeError。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, tuple)):
+        raise TypeError(
+            "kernel_size 必须是 int 或 tuple，得到 %s" % type(value).__name__
+        )
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError("kernel_size 必须为正整数")
+        return (value, value)
+    if len(value) != 2:
+        raise ValueError("kernel_size tuple 必须恰含 (KH, KW) 两个元素")
+    kh_, kw_ = value
+    for member_name, member in (("KH", kh_), ("KW", kw_)):
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError(
+                "kernel_size 的 %s 必须是 int，得到 %s"
+                % (member_name, type(member).__name__)
+            )
+        if member <= 0:
+            raise ValueError("kernel_size 的 %s 必须为正整数" % member_name)
+    return (kh_, kw_)
+
+
 def _check_stride2d(value):
-    """校验 Conv2D 步长：正 int 或恰含 (SH, SW) 的正 int tuple（拒绝 bool）。
+    """校验 Conv2D/MaxPool2D 步长：正 int 或恰含 (SH, SW) 的正 int tuple（拒绝 bool）。
 
     int 展开为 (S, S)；整体类型错抛 TypeError，tuple 长度错或成员非正
     抛 ValueError，成员类型错（含 bool）抛 TypeError。
@@ -121,7 +151,7 @@ def _check_stride2d(value):
 
 
 def _check_padding2d(value):
-    """校验 Conv2D 补边：非负 int 或恰含 (PT, PB, PL, PR) 的非负 int tuple。
+    """校验 Conv2D/MaxPool2D 补边：非负 int 或恰含 (PT, PB, PL, PR) 的非负 int tuple。
 
     int 展开为 (P, P, P, P)；拒绝 bool。整体类型错抛 TypeError，tuple
     长度错抛 ValueError，成员类型错（含 bool）抛 TypeError，成员为负
@@ -306,33 +336,34 @@ class Conv2D:
 class MaxPool2D:
     """二维最大池化层（NCHW，嵌套 list，逐通道池化）。
 
-    kernel_size: 正方形窗口边长 K（正 int）。
-    stride: 步长 S（正 int）；为 None 时取 S = K。
-    padding: 零补边宽度 P（非负 int 且 P < K）；补边位置不参与比较。
+    kernel_size: 正 int（展开为 (K, K)）或恰含 (KH, KW) 的正 int tuple。
+    stride: 正 int（展开为 (S, S)）或恰含 (SH, SW) 的正 int tuple；
+    为 None 时取 (KH, KW)。
+    padding: 非负 int（展开为四边同值）或恰含
+    (PT, PB, PL, PR) 的非负 int tuple，分别为上/下/左/右补边，
+    且须满足 PT、PB < KH，PL、PR < KW；补边位置不参与比较。
     输入 x: [N][C][H][W]，输出: [N][C][OH][OW]，
-    OH = (H + 2P - K) // S + 1，OW = (W + 2P - K) // S + 1。
-    窗口内按 kh→kw 扫描，并列最大只取首个位置。
+    OH = (H + PT + PB - KH) // SH + 1，
+    OW = (W + PL + PR - KW) // SW + 1。
+    核超过补边后对应尺寸时抛 ValueError；不能整除时舍弃底部或右侧余量。
+    窗口内按 kh→kw 扫描，并列最大只取首个真实坐标。
     """
 
     def __init__(self, kernel_size, stride=None, padding=0):
-        kernel_size = _check_nonnegative_int(kernel_size, "kernel_size")
-        if kernel_size <= 0:
-            raise ValueError("kernel_size 必须为正整数")
+        kh_, kw_ = _check_kernel2d(kernel_size)
         if stride is None:
-            stride = kernel_size
+            sh_, sw_ = kh_, kw_
         else:
-            stride = _check_nonnegative_int(stride, "stride")
-            if stride <= 0:
-                raise ValueError("stride 必须为正整数")
-        padding = _check_nonnegative_int(padding, "padding")
-        if padding < 0:
-            raise ValueError("padding 必须为非负整数")
-        if padding >= kernel_size:
-            raise ValueError("padding 必须小于 kernel_size")
+            sh_, sw_ = _check_stride2d(stride)
+        pt_, pb_, pl_, pr_ = _check_padding2d(padding)
+        if pt_ >= kh_ or pb_ >= kh_:
+            raise ValueError("padding 的 PT、PB 必须小于 KH")
+        if pl_ >= kw_ or pr_ >= kw_:
+            raise ValueError("padding 的 PL、PR 必须小于 KW")
 
-        self._kernel_size = kernel_size
-        self._stride = stride
-        self._padding = padding
+        self._kernel_size = (kh_, kw_)
+        self._stride = (sh_, sw_)
+        self._padding = (pt_, pb_, pl_, pr_)
 
         self._x_shape = None   # 最近一次成功 forward 的输入形状
         self._out_shape = None  # 最近一次成功 forward 的输出形状
@@ -342,13 +373,13 @@ class MaxPool2D:
         """对 x: [N][C][H][W] 做最大池化，返回新 list 并缓存获胜位置。"""
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
-        k = self._kernel_size
-        s = self._stride
-        p = self._padding
-        if k > h_ + 2 * p or k > w_ + 2 * p:
+        kh_, kw_ = self._kernel_size
+        sh_, sw_ = self._stride
+        pt_, pb_, pl_, pr_ = self._padding
+        if kh_ > h_ + pt_ + pb_ or kw_ > w_ + pl_ + pr_:
             raise ValueError("池化窗口在补边后仍越界：kernel_size 大于补边后的输入")
-        oh_ = (h_ + 2 * p - k) // s + 1
-        ow_ = (w_ + 2 * p - k) // s + 1
+        oh_ = (h_ + pt_ + pb_ - kh_) // sh_ + 1
+        ow_ = (w_ + pl_ + pr_ - kw_) // sw_ + 1
 
         out = []
         winners = []
@@ -360,19 +391,19 @@ class MaxPool2D:
                 out_c = []
                 win_c = []
                 for oh in range(oh_):
-                    base_h = oh * s - p
+                    base_h = oh * sh_ - pt_
                     row = []
                     win_row = []
                     for ow in range(ow_):
-                        base_w = ow * s - p
+                        base_w = ow * sw_ - pl_
                         best = None
                         best_pos = None
-                        for kh in range(k):
+                        for kh in range(kh_):
                             ih = base_h + kh
                             if ih < 0 or ih >= h_:
                                 continue
                             x_row = x_c[ih]
-                            for kw in range(k):
+                            for kw in range(kw_):
                                 iw = base_w + kw
                                 if 0 <= iw < w_:
                                     v = x_row[iw]
@@ -1257,31 +1288,31 @@ def _check_pool_window_ties(pool, inp):
     窗口/步长/补边规则与 MaxPool2D.forward 完全一致（补边位置不参与比较）：
     窗口内同一最大值出现两次及以上即视为并列。inp 须为池化层合法四维输入。
     """
-    k = pool._kernel_size
-    s = pool._stride
-    p = pool._padding
+    kh_, kw_ = pool._kernel_size
+    sh_, sw_ = pool._stride
+    pt_, pb_, pl_, pr_ = pool._padding
     n_ = len(inp)
     c_ = len(inp[0])
     h_ = len(inp[0][0])
     w_ = len(inp[0][0][0])
-    oh_ = (h_ + 2 * p - k) // s + 1
-    ow_ = (w_ + 2 * p - k) // s + 1
+    oh_ = (h_ + pt_ + pb_ - kh_) // sh_ + 1
+    ow_ = (w_ + pl_ + pr_ - kw_) // sw_ + 1
     for n in range(n_):
         x_n = inp[n]
         for c in range(c_):
             x_c = x_n[c]
             for oh in range(oh_):
-                base_h = oh * s - p
+                base_h = oh * sh_ - pt_
                 for ow in range(ow_):
-                    base_w = ow * s - p
+                    base_w = ow * sw_ - pl_
                     best = None
                     tied = False
-                    for kh in range(k):
+                    for kh in range(kh_):
                         ih = base_h + kh
                         if ih < 0 or ih >= h_:
                             continue
                         x_row = x_c[ih]
-                        for kw in range(k):
+                        for kw in range(kw_):
                             iw = base_w + kw
                             if 0 <= iw < w_:
                                 v = x_row[iw]
