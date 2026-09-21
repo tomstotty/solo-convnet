@@ -15,6 +15,8 @@
 
 - 公开推理 API（仅标准库）：
 - load_model(path)：严格校验 train 产物后返回键序为 values、bias 的新 dict。
+- load_benchmark(path)：严格校验 benchmark 产物后返回键序为 model、metrics
+  的新 dict（model 为全 float 契约，metrics 含 predictions）。
 - predict_batch(model, x)：对 [N][1][1][4] 输入逐样本计算 logit，返回预测类别。
 
 公开训练 API（仅标准库）：
@@ -50,13 +52,24 @@
   逐字节相同的 data/tiny-val.csv 为验证集（各自独立加载、绝不混用）；
   以 fitnorm 初值、七层配置（Dropout seed=7）调用 train_norm 训练
   20 轮、lr=0.1，要求更新前批均 loss 末项小于首项、六组参数至少一组
-  改变；模型按 fitnorm 同构结构序列化并重载后，以 BN 保存统计、Dropout
-  推理态在验证集预测（最大 logit 平局取小类），预测须为 [0,1]、
-  accuracy 为 1.0。OUTPUT 顶层键依次为 model、metrics；model 沿用
-  fitnorm 逐层键序、类型与形状；metrics 键依次为 epochs、lr、seed、
-  loss、predictions、accuracy。紧凑 UTF-8 原子写盘，float 固定 12 位、
-  负零归零、禁非有限、末尾 LF，相同基线逐字节一致；任一数据、计算、
-  阈值、重载、路径冲突或 I/O 失败退出 1 且不改 OUTPUT。
+  改变；model 在写出前与序列化重载后均须通过严格契约校验——沿用
+  fitnorm 逐层键序与形状，且 conv、batchnorm、linear 的每个叶值都是
+  有限 float（拒绝 int/bool），随后以 BN 保存统计、Dropout 推理态在
+  验证集预测（最大 logit 平局取小类），预测须为 [0,1]、accuracy 为
+  1.0。OUTPUT 顶层键依次为 model、metrics；model 沿用 fitnorm 逐层
+  键序与形状、全叶值有限 float；metrics 键依次为 epochs、lr、seed、
+  loss、predictions、accuracy，取值依次为 int 20、float 0.1、int 7、
+  有限 float[20]、恰为 [0,1] 的 int 列表、float 1.0。紧凑 UTF-8 原子
+  写盘，float 固定 12 位、负零归零、禁非有限、末尾 LF，相同基线逐字节
+  一致；任一数据、计算、阈值、重载、路径冲突或 I/O 失败退出 1 且不改
+  OUTPUT。
+- load_benchmark(path)：读取完整 benchmark 产物，返回键序为 model、
+  metrics 的新 dict（所有嵌套 dict/list 均深拷贝）；model 严格沿用
+  benchmark 修复后的逐层键序、形状与全 float 契约，metrics 严格校验
+  上述键序、类型、形状/长度与取值。path 或 JSON 容器/标量类型错抛
+  TypeError；文件不可读抛 OSError；非法 UTF-8 抛 UnicodeDecodeError；
+  JSON 语法、重复/缺失/额外/错序键、形状、长度、取值或非有限错抛
+  ValueError。
 - `python convnet.py fitdata DATA OUTPUT`：读取本地 UTF-8 JSON DATA
   （键依次为 x、labels，x 为有限数的规则 list[N][1][2][2]、N≥2，
   labels 为等长 list、元素为 int 0/1），以 fitnorm 初值与七层配置
@@ -3081,6 +3094,230 @@ def _cmd_evalnorm(weights_path, output_path):
 _BENCH_TRAIN_PATH = os.path.join("data", "tiny.csv")
 _BENCH_VAL_PATH = os.path.join("data", "tiny-val.csv")
 
+# benchmark 产物的严格契约：顶层键依次为 model、metrics；model 沿用 fitnorm
+# 逐层键序，conv/linear 的 values/bias 与 batchnorm 四个向量的每个叶值都
+# 必须是有限 float（写出前与重载后均拒绝 int/bool）；metrics 依次为
+# epochs=20(int)、lr=0.1(float)、seed=7(int)、loss 有限 float[20]、
+# predictions int 列表恰为 [0,1]、accuracy=1.0(float)。
+_BENCH_TOP_KEYS = ["model", "metrics"]
+_BENCH_METRICS_KEYS = [
+    "epochs", "lr", "seed", "loss", "predictions", "accuracy",
+]
+_BENCH_EXPECTED_EPOCHS = 20
+_BENCH_EXPECTED_LR = 0.1
+_BENCH_EXPECTED_SEED = 7
+_BENCH_EXPECTED_PREDICTIONS = [0, 1]
+_BENCH_EXPECTED_ACCURACY = 1.0
+
+
+def _check_float_shape(node, depth, shape, name):
+    """校验嵌套 list 的形状恰为 shape，且每个叶值为有限 float。
+
+    与 _shape_of 同套规则（各维非空、矩形），但标量位置只接受 float：
+    int 与 bool 一律拒绝（bool 是 int 子类），非有限 float 拒绝。层级不足、
+    空维、形状不规则或不符抛 ValueError；容器或标量类型错抛 TypeError。
+    """
+    if depth == 0:
+        if isinstance(node, list):
+            raise ValueError("%s 的层级过深：标量位置出现了 list" % name)
+        if isinstance(node, bool) or not isinstance(node, float):
+            raise TypeError(
+                "%s 的叶值必须是 float（拒绝 int/bool），得到 %s"
+                % (name, type(node).__name__)
+            )
+        if not math.isfinite(node):
+            raise ValueError("%s 含有非有限值（NaN/inf）" % name)
+        return
+    if not isinstance(node, list):
+        raise TypeError(
+            "%s 必须是嵌套 list，得到 %s" % (name, type(node).__name__)
+        )
+    if len(node) != shape[0]:
+        raise ValueError(
+            "%s 的形状必须为 %s" % (name, "".join("[%d]" % d for d in shape))
+        )
+    for child in node:
+        _check_float_shape(child, depth - 1, shape[1:], name)
+
+
+def _parse_benchmark_model(model_obj):
+    """严格校验 benchmark/fitnorm 同构 model，返回深拷贝的全新 model dict。
+
+    逐层沿用修复后的键序 model(conv,batchnorm,linear)、conv/linear 的
+    (values,bias) 与 batchnorm 的 (gamma,beta,running_mean,running_var)；
+    每个叶值均须为有限 float（拒绝 int/bool），形状固定为 conv values
+    [2][1][1][1]、conv bias [2]、batchnorm 四向量各 [2]、linear values
+    [2][2]、linear bias [2]。容器类型错抛 TypeError；重复/缺失/额外/错序
+    键、形状或取值错抛 ValueError；非有限值抛 ValueError。
+    """
+    if not isinstance(model_obj, dict):
+        raise TypeError(
+            "model 必须是 JSON 对象，得到 %s" % type(model_obj).__name__
+        )
+    if list(model_obj.keys()) != _NORM_MODEL_KEYS:
+        raise ValueError("model 的键必须依次为 conv、batchnorm、linear")
+    conv_obj = model_obj["conv"]
+    bn_obj = model_obj["batchnorm"]
+    linear_obj = model_obj["linear"]
+    if not isinstance(conv_obj, dict):
+        raise TypeError(
+            "conv 必须是 JSON 对象，得到 %s" % type(conv_obj).__name__
+        )
+    if not isinstance(bn_obj, dict):
+        raise TypeError(
+            "batchnorm 必须是 JSON 对象，得到 %s" % type(bn_obj).__name__
+        )
+    if not isinstance(linear_obj, dict):
+        raise TypeError(
+            "linear 必须是 JSON 对象，得到 %s" % type(linear_obj).__name__
+        )
+    if list(conv_obj.keys()) != _NORM_LAYER_KEYS:
+        raise ValueError("conv 的键必须依次为 values、bias")
+    if list(bn_obj.keys()) != _NORM_BN_KEYS:
+        raise ValueError(
+            "batchnorm 的键必须依次为 gamma、beta、running_mean、running_var"
+        )
+    if list(linear_obj.keys()) != _NORM_LAYER_KEYS:
+        raise ValueError("linear 的键必须依次为 values、bias")
+
+    conv_values = conv_obj["values"]
+    conv_bias = conv_obj["bias"]
+    gamma = bn_obj["gamma"]
+    beta = bn_obj["beta"]
+    running_mean = bn_obj["running_mean"]
+    running_var = bn_obj["running_var"]
+    lin_values = linear_obj["values"]
+    lin_bias = linear_obj["bias"]
+
+    _check_float_shape(conv_values, 4, (2, 1, 1, 1), "conv values")
+    _check_float_shape(conv_bias, 1, (2,), "conv bias")
+    _check_float_shape(gamma, 1, (2,), "gamma")
+    _check_float_shape(beta, 1, (2,), "beta")
+    _check_float_shape(running_mean, 1, (2,), "running_mean")
+    _check_float_shape(running_var, 1, (2,), "running_var")
+    _check_float_shape(lin_values, 2, (2, 2), "linear values")
+    _check_float_shape(lin_bias, 1, (2,), "linear bias")
+
+    return {
+        "conv": {
+            "values": _deep_copy(conv_values),
+            "bias": _deep_copy(conv_bias),
+        },
+        "batchnorm": {
+            "gamma": _deep_copy(gamma),
+            "beta": _deep_copy(beta),
+            "running_mean": _deep_copy(running_mean),
+            "running_var": _deep_copy(running_var),
+        },
+        "linear": {
+            "values": _deep_copy(lin_values),
+            "bias": _deep_copy(lin_bias),
+        },
+    }
+
+
+def _parse_benchmark_metrics(metrics_obj):
+    """严格校验 benchmark metrics，返回深拷贝的全新 metrics dict。
+
+    键依次为 epochs、lr、seed、loss、predictions、accuracy；取值依次为
+    int 20（拒绝 bool）、float 0.1、int 7（拒绝 bool）、长度 20 的有限
+    float list、恰为 [0,1] 的 int 列表（元素拒绝 bool）、float 1.0。
+    容器类型错抛 TypeError；错序/缺失/额外键、长度、取值或非有限错抛
+    ValueError。
+    """
+    if not isinstance(metrics_obj, dict):
+        raise TypeError(
+            "metrics 必须是 JSON 对象，得到 %s"
+            % type(metrics_obj).__name__
+        )
+    if list(metrics_obj.keys()) != _BENCH_METRICS_KEYS:
+        raise ValueError(
+            "metrics 的键必须依次为 epochs、lr、seed、loss、"
+            "predictions、accuracy"
+        )
+
+    epochs = metrics_obj["epochs"]
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int，得到 %s" % type(epochs).__name__
+        )
+    if epochs != _BENCH_EXPECTED_EPOCHS:
+        raise ValueError("epochs 必须为 %d" % _BENCH_EXPECTED_EPOCHS)
+
+    lr = metrics_obj["lr"]
+    _check_metrics_float(lr, "lr")
+    if lr != _BENCH_EXPECTED_LR:
+        raise ValueError("lr 必须为 %r" % _BENCH_EXPECTED_LR)
+
+    seed = metrics_obj["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            "seed 必须是 int，得到 %s" % type(seed).__name__
+        )
+    if seed != _BENCH_EXPECTED_SEED:
+        raise ValueError("seed 必须为 %d" % _BENCH_EXPECTED_SEED)
+
+    loss = metrics_obj["loss"]
+    if not isinstance(loss, list):
+        raise TypeError(
+            "loss 必须是 list，得到 %s" % type(loss).__name__
+        )
+    if len(loss) != _BENCH_EXPECTED_EPOCHS:
+        raise ValueError(
+            "loss 长度 %d 与训练轮数 %d 不符"
+            % (len(loss), _BENCH_EXPECTED_EPOCHS)
+        )
+    for entry in loss:
+        _check_metrics_float(entry, "loss")
+
+    predictions = metrics_obj["predictions"]
+    if not isinstance(predictions, list):
+        raise TypeError(
+            "predictions 必须是 list，得到 %s"
+            % type(predictions).__name__
+        )
+    # 先逐个校验标量类型（int 且拒绝 bool；注意 True == 1，不能只靠
+    # 等值比较），类型错归 TypeError；随后校验取值/长度，归 ValueError。
+    for idx, pred in enumerate(predictions):
+        if isinstance(pred, bool) or not isinstance(pred, int):
+            raise TypeError(
+                "predictions[%d] 必须是 int（拒绝 bool），得到 %s"
+                % (idx, type(pred).__name__)
+            )
+    if predictions != _BENCH_EXPECTED_PREDICTIONS:
+        raise ValueError("predictions 必须恰为 [0, 1]")
+
+    accuracy = metrics_obj["accuracy"]
+    _check_metrics_float(accuracy, "accuracy")
+    if accuracy != _BENCH_EXPECTED_ACCURACY:
+        raise ValueError("accuracy 必须为 1.0")
+
+    return {
+        "epochs": epochs,
+        "lr": lr,
+        "seed": seed,
+        "loss": _deep_copy(loss),
+        "predictions": _deep_copy(predictions),
+        "accuracy": accuracy,
+    }
+
+
+def _load_benchmark_doc(path):
+    """读取 benchmark 产物字节并解析为去重保序的 JSON 文档。
+
+    path 必须是 str，否则抛 TypeError；文件不可读抛 OSError；内容不是
+    合法 UTF-8 抛 UnicodeDecodeError；JSON 语法错或含重复键抛 ValueError。
+    """
+    if not isinstance(path, str):
+        raise TypeError(
+            "path 必须是 str，得到 %s" % type(path).__name__
+        )
+    with open(path, "rb") as f:
+        raw = f.read()
+    return json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+
 
 class _BenchDataError(Exception):
     """benchmark 训练/验证数据缺失或字节内容不符。"""
@@ -3133,11 +3370,12 @@ def _bench_run():
     以 fitnorm 初值、七层配置（Dropout seed=7）调用 train_norm 训练
     20 轮、lr=0.1；校验 20 项更新前批均 loss 末项严格小于首项，且
     conv 权重/偏置、BN gamma/beta、linear 权重/偏置六组参数至少一组
-    相对初值改变。随后把模型按 fitnorm 同构结构序列化为文本并重新加载
-    （与落盘/读盘相同的转储与严格校验），用重载得到的权重与 BN 保存
+    相对初值改变。随后把模型经修复后的严格契约（逐层键序、固定形状、
+    每个叶值均为有限 float，拒绝 int/bool）校验并深拷贝，再按同一
+    转储与严格校验序列化为文本并重新加载，用重载得到的权重与 BN 保存
     统计、Dropout 推理态在验证集上预测，逐样本取最大 logit、并列取较小
     类别，accuracy 必须为 1.0 且预测恰为 [0, 1]，任一 logit 非有限即失败。
-    返回与 fitnorm 同构的 model dict、loss 列表、预测与 accuracy。
+    返回严格契约下的 model dict、loss 列表、预测与 accuracy。
     """
     x, labels, train_bytes = _load_bench_samples(_BENCH_TRAIN_PATH)
     x_val, val_labels, val_bytes = _load_bench_samples(_BENCH_VAL_PATH)
@@ -3186,9 +3424,10 @@ def _bench_run():
     running_mean = _deep_copy(bn.running_mean)
     running_var = _deep_copy(bn.running_var)
 
-    # 按 fitnorm 同构结构序列化模型，再以落盘/读盘相同的转储与严格校验
-    # 重载，确保参与验证集推理的是重载后的同构模型（BN 用保存统计）。
-    model = {
+    # 写出前严格校验 model：修复后的逐层键序、形状，且 conv/batchnorm/
+    # linear 的每个叶值都是有限 float（拒绝 int/bool）；返回深拷贝作为
+    # 唯一参与序列化与返回的模型，与层内状态完全脱钩。
+    model = _parse_benchmark_model({
         "conv": {"values": conv_w, "bias": conv_b},
         "batchnorm": {
             "gamma": gamma,
@@ -3197,47 +3436,22 @@ def _bench_run():
             "running_var": running_var,
         },
         "linear": {"values": lin_w, "bias": lin_b},
-    }
+    })
+
+    # 按修复后的同一转储/严格校验路径序列化再重载，确保参与验证集推理的
+    # 是重载后的同构模型：逐键序、形状校验且每个叶值重载后仍为有限 float。
     model_text = _dump_compact(model)
-    reloaded = json.loads(
-        model_text, object_pairs_hook=_reject_duplicate_keys
+    reloaded = _parse_benchmark_model(
+        json.loads(model_text, object_pairs_hook=_reject_duplicate_keys)
     )
-    if not isinstance(reloaded, dict) or list(reloaded.keys()) != _NORM_MODEL_KEYS:
-        raise ValueError("重载模型的键必须依次为 conv、batchnorm、linear")
-    rl_conv = reloaded["conv"]
-    rl_bn = reloaded["batchnorm"]
-    rl_linear = reloaded["linear"]
-    if list(rl_conv.keys()) != _NORM_LAYER_KEYS:
-        raise ValueError("重载 conv 的键必须依次为 values、bias")
-    if list(rl_bn.keys()) != _NORM_BN_KEYS:
-        raise ValueError(
-            "重载 batchnorm 的键必须依次为 gamma、beta、running_mean、running_var"
-        )
-    if list(rl_linear.keys()) != _NORM_LAYER_KEYS:
-        raise ValueError("重载 linear 的键必须依次为 values、bias")
-    (
-        r_conv_w, r_conv_b, r_gamma, r_beta,
-        r_mean, r_var, r_lin_w, r_lin_b,
-    ) = (
-        rl_conv["values"], rl_conv["bias"],
-        rl_bn["gamma"], rl_bn["beta"],
-        rl_bn["running_mean"], rl_bn["running_var"],
-        rl_linear["values"], rl_linear["bias"],
-    )
-    if _shape_of(r_conv_w, 4, "conv values") != (2, 1, 1, 1):
-        raise ValueError("重载 conv values 的形状必须为 [2][1][1][1]")
-    if _shape_of(r_conv_b, 1, "conv bias") != (2,):
-        raise ValueError("重载 conv bias 的形状必须为 [2]")
-    for bn_key in _NORM_BN_KEYS:
-        vector = rl_bn[bn_key]
-        if not isinstance(vector, list) or len(vector) != _CNN_NUM_CLASSES:
-            raise ValueError("重载 %s 必须是长度 2 的 list" % bn_key)
-        for entry in vector:
-            _check_metrics_float(entry, bn_key)
-    if _shape_of(r_lin_w, 2, "linear values") != (2, 2):
-        raise ValueError("重载 linear values 的形状必须为 [2][2]")
-    if _shape_of(r_lin_b, 1, "linear bias") != (2,):
-        raise ValueError("重载 linear bias 的形状必须为 [2]")
+    r_conv_w = reloaded["conv"]["values"]
+    r_conv_b = reloaded["conv"]["bias"]
+    r_gamma = reloaded["batchnorm"]["gamma"]
+    r_beta = reloaded["batchnorm"]["beta"]
+    r_mean = reloaded["batchnorm"]["running_mean"]
+    r_var = reloaded["batchnorm"]["running_var"]
+    r_lin_w = reloaded["linear"]["values"]
+    r_lin_b = reloaded["linear"]["bias"]
 
     # 仅在验证集上以 BN 保存统计、Dropout 推理态预测（不接触训练集）。
     logits, _, _ = _norm_forward(
@@ -3279,22 +3493,54 @@ def _cmd_benchmark(output_path):
         if out_abs == os.path.abspath(_BENCH_VAL_PATH):
             raise ValueError("OUTPUT 与验证集不能是同一路径")
         model, losses, predictions, accuracy = _bench_run()
+        # 写出前对 metrics 做与 load_benchmark 同一的严格校验（键序、类型、
+        # 长度、取值），并以其深拷贝作为载荷；model 已在 _bench_run 内
+        # 经同一严格契约校验。
+        metrics = _parse_benchmark_metrics({
+            "epochs": _NORM_EPOCHS,
+            "lr": float(_NORM_LR),
+            "seed": _NORM_DROPOUT_SEED,
+            "loss": losses,
+            "predictions": predictions,
+            "accuracy": accuracy,
+        })
         artifact = {
             "model": model,
-            "metrics": {
-                "epochs": _NORM_EPOCHS,
-                "lr": float(_NORM_LR),
-                "seed": _NORM_DROPOUT_SEED,
-                "loss": losses,
-                "predictions": predictions,
-                "accuracy": accuracy,
-            },
+            "metrics": metrics,
         }
         payload = (_dump_compact(artifact) + "\n").encode("utf-8")
         _atomic_write_output(output_path, payload)
     except (_BenchDataError, ValueError, TypeError, OSError):
         return 1
     return 0
+
+
+def load_benchmark(path):
+    """读取完整 benchmark 产物，返回键序为 model、metrics 的新 dict。
+
+    顶层键须依次为 model、metrics（重复/缺失/额外/错序一律非法）。model
+    严格沿用修复后的逐层键序、形状与全 float 契约：model 的键依次为
+    conv、batchnorm、linear；conv/linear 的键依次为 values、bias；
+    batchnorm 的键依次为 gamma、beta、running_mean、running_var；
+    conv values 形状 [2][1][1][1]、conv bias [2]，batchnorm 四向量各 [2]，
+    linear values [2][2]、linear bias [2]，每个叶值都必须是有限 float
+    （拒绝 int/bool 与非有限值）。metrics 的键依次为 epochs、lr、seed、
+    loss、predictions、accuracy，取值依次须为 int 20、float 0.1、int 7、
+    长度 20 的有限 float list、恰为 [0,1] 的 int 列表、float 1.0。
+
+    成功返回的 dict 与全部嵌套 dict/list 均为新建深拷贝，不与解析结果
+    共享任何可变结构。path 或 JSON 容器/标量类型错抛 TypeError；文件
+    不可读抛 OSError；非法 UTF-8 抛 UnicodeDecodeError；JSON 语法错、
+    重复/缺失/额外/错序键、形状、长度、取值或非有限值错抛 ValueError。
+    """
+    doc = _load_benchmark_doc(path)
+    if not isinstance(doc, dict):
+        raise TypeError("benchmark 产物顶层必须是 JSON 对象")
+    if list(doc.keys()) != _BENCH_TOP_KEYS:
+        raise ValueError("benchmark 产物顶层键必须依次为 model、metrics")
+    model = _parse_benchmark_model(doc["model"])
+    metrics = _parse_benchmark_metrics(doc["metrics"])
+    return {"model": model, "metrics": metrics}
 
 
 # ---------------------------------------------------------------------------
