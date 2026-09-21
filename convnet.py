@@ -2,7 +2,8 @@
 
 当前提供：
 - Conv2D 层：NCHW 嵌套 list、互相关（不翻转核）、零补边；stride 可为
-  正 int 或 (SH, SW) tuple，padding 可为非负 int 或 (PT,PB,PL,PR) tuple。
+  正 int 或 (SH, SW) tuple，padding 可为非负 int 或 (PT,PB,PL,PR) tuple，
+  dilation 可为正 int 或 (DH, DW) tuple。
 - MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较。
 - Flatten 层：NCHW 嵌套 list 展平为 [N][C*H*W]（按 c→h→w 顺序）。
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
@@ -248,6 +249,34 @@ def _check_padding2d(value):
     return (pt_, pb_, pl_, pr_)
 
 
+def _check_dilation2d(value):
+    """校验 Conv2D 膨胀：正 int 或恰含 (DH, DW) 的正 int tuple（拒绝 bool）。
+
+    int 展开为 (D, D)；整体类型错抛 TypeError，tuple 长度错或成员非正
+    抛 ValueError，成员类型错（含 bool）抛 TypeError。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, tuple)):
+        raise TypeError(
+            "dilation 必须是 int 或 tuple，得到 %s" % type(value).__name__
+        )
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError("dilation 必须为正整数")
+        return (value, value)
+    if len(value) != 2:
+        raise ValueError("dilation tuple 必须恰含 (DH, DW) 两个元素")
+    dh_, dw_ = value
+    for member_name, member in (("DH", dh_), ("DW", dw_)):
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError(
+                "dilation 的 %s 必须是 int，得到 %s"
+                % (member_name, type(member).__name__)
+            )
+        if member <= 0:
+            raise ValueError("dilation 的 %s 必须为正整数" % member_name)
+    return (dh_, dw_)
+
+
 def _zeros(shape):
     if len(shape) == 1:
         return [0] * shape[0]
@@ -261,13 +290,16 @@ class Conv2D:
     stride: 正 int（展开为 (S, S)）或恰含 (SH, SW) 的正 int tuple。
     padding: 非负 int（展开为 (P, P, P, P)）或恰含
     (PT, PB, PL, PR) 的非负 int tuple，分别为上/下/左/右补边。
-    输出: [N][O][floor((H+PT+PB-KH)/SH)+1][floor((W+PL+PR-KW)/SW)+1]；
-    不能整除时舍弃底部或右侧余量。
+    dilation: 正 int（展开为 (D, D)）或恰含 (DH, DW) 的正 int tuple。
+    令有效核高宽 EKH=(KH-1)*DH+1、EKW=(KW-1)*DW+1，输出:
+    [N][O][floor((H+PT+PB-EKH)/SH)+1][floor((W+PL+PR-EKW)/SW)+1]；
+    有效核大于补边后输入抛 ValueError，不能整除时舍弃底部或右侧余量。
     """
 
-    def __init__(self, weights, bias, stride=1, padding=0):
+    def __init__(self, weights, bias, stride=1, padding=0, dilation=1):
         sh_, sw_ = _check_stride2d(stride)
         pt_, pb_, pl_, pr_ = _check_padding2d(padding)
+        dh_, dw_ = _check_dilation2d(dilation)
 
         _require_list(weights, "weights")
         _require_list(bias, "bias")
@@ -283,6 +315,7 @@ class Conv2D:
         self._bias = bias
         self._stride = (sh_, sw_)
         self._padding = (pt_, pb_, pl_, pr_)
+        self._dilation = (dh_, dw_)
         self._w_shape = w_shape  # (O, C, KH, KW)
 
         self._x = None           # 最近一次成功 forward 的输入
@@ -299,10 +332,13 @@ class Conv2D:
             )
         sh_, sw_ = self._stride
         pt_, pb_, pl_, pr_ = self._padding
-        if kh_ > h_ + pt_ + pb_ or kw_ > w_ + pl_ + pr_:
+        dh_, dw_ = self._dilation
+        ekh_ = (kh_ - 1) * dh_ + 1
+        ekw_ = (kw_ - 1) * dw_ + 1
+        if ekh_ > h_ + pt_ + pb_ or ekw_ > w_ + pl_ + pr_:
             raise ValueError("核在补边后仍越界：核尺寸大于补边后的输入")
-        oh_ = (h_ + pt_ + pb_ - kh_) // sh_ + 1
-        ow_ = (w_ + pl_ + pr_ - kw_) // sw_ + 1
+        oh_ = (h_ + pt_ + pb_ - ekh_) // sh_ + 1
+        ow_ = (w_ + pl_ + pr_ - ekw_) // sw_ + 1
 
         weights = self._weights
         bias = self._bias
@@ -321,13 +357,13 @@ class Conv2D:
                             x_c = x[n][c]
                             w_c_o = weights[o][c]
                             for kh in range(kh_):
-                                ih = base_h + kh
+                                ih = base_h + kh * dh_
                                 if ih < 0 or ih >= h_:
                                     continue
                                 x_row = x_c[ih]
                                 w_row = w_c_o[kh]
                                 for kw in range(kw_):
-                                    iw = base_w + kw
+                                    iw = base_w + kw * dw_
                                     if 0 <= iw < w_:
                                         acc += x_row[iw] * w_row[kw]
                         row.append(acc)
@@ -364,6 +400,7 @@ class Conv2D:
         w_ = len(x[0][0][0])
         sh_, sw_ = self._stride
         pt_, pb_, pl_, pr_ = self._padding
+        dh_, dw_ = self._dilation
 
         dx = _zeros((n_, c_, h_, w_))
         dw = _zeros(self._w_shape)
@@ -383,7 +420,7 @@ class Conv2D:
                             w_c_o = weights[o][c]
                             dw_c_o = dw[o][c]
                             for kh in range(kh_):
-                                ih = base_h + kh
+                                ih = base_h + kh * dh_
                                 if ih < 0 or ih >= h_:
                                     continue
                                 x_row = x_c[ih]
@@ -391,7 +428,7 @@ class Conv2D:
                                 w_row = w_c_o[kh]
                                 dw_row = dw_c_o[kh]
                                 for kw in range(kw_):
-                                    iw = base_w + kw
+                                    iw = base_w + kw * dw_
                                     if 0 <= iw < w_:
                                         dw_row[kw] += g * x_row[iw]
                                         dx_row[iw] += g * w_row[kw]
@@ -4519,7 +4556,7 @@ def main(argv):
         return 2
     # 其他入口保持现状（信息打印）。
     print("convnet.py：从零实现的卷积神经网络库（仅标准库）。")
-    print("当前可用组件：Conv2D(weights, bias, stride=1, padding=0)")
+    print("当前可用组件：Conv2D(weights, bias, stride=1, padding=0, dilation=1)")
     print("              MaxPool2D(kernel_size, stride=None, padding=0)")
     print("              Flatten()")
     print("              Linear(weights, bias)")
