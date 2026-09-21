@@ -71,6 +71,20 @@
   训练链并以 SoftmaxCrossEntropy 为损失层调用 check_train_gradients，
   将 ok、max_e、max_r 以紧凑 JSON 原子写入 OUTPUT；ok 真退出 0、
   假退出 1，其余失败退出 1 且不改 OUTPUT。
+- `python convnet.py benchmark OUTPUT`：在 data/tiny.csv 上以 fitnorm
+  初值与七层配置（Conv2D→BatchNorm2D→Dropout(0.25, seed=7)→MaxPool2D
+  →Flatten→Linear→SoftmaxCrossEntropy，seed=7、20 轮、lr=0.1）经
+  train_norm 训练；另以逐字节相同的 data/tiny-val.csv 作验证集
+  （按同一规则独立解析，与训练集不混用）。要求更新前批均 loss 末项
+  严格小于首项、六组参数至少一组改变；将 fitnorm 同构 model 紧凑
+  序列化并以 evalnorm 同规则重载后，以 BN 保存统计、Dropout 推理态
+  对验证集逐样本取最大 logit（并列取小类），预测须恰为 [0,1]、
+  accuracy 为 1.0。OUTPUT 顶层键依次为 model、metrics；model 沿用
+  fitnorm 逐层键序、类型与形状；metrics 键依次为 epochs、lr、seed、
+  loss、predictions、accuracy（int 20、float 0.1、int 7、float[20]、
+  int[2] 且值为 [0,1]、float 1.0）。紧凑 UTF-8 原子写盘、float 固定
+  12 位小数、负零归零、禁非有限值、末尾 LF，相同基线逐字节一致；
+  任一数据、计算、阈值、重载、路径冲突或 I/O 失败退出 1 且不改 OUTPUT。
 """
 
 import json
@@ -2902,23 +2916,13 @@ _NORM_BN_KEYS = ["gamma", "beta", "running_mean", "running_var"]
 _NORM_METRICS_KEYS = ["epochs", "lr", "seed", "loss", "accuracy"]
 
 
-def _load_norm_artifact(weights_path):
-    """读取并严格校验 fitnorm 产物。
+def _parse_norm_artifact(raw):
+    """从 fitnorm 同构产物的原始字节严格校验并返回八组参数。
 
-    返回 (conv_values, conv_bias, gamma, beta, running_mean, running_var,
-    lin_values, lin_bias)。顶层及 model/conv/batchnorm/linear/metrics
-    各层的键名、键序、类型与形状均须与 fitnorm 写出的公开契约一致；
-    拒绝重复键。conv values 须为 [2][1][1][1]、conv bias 为 [2]；
-    batchnorm 的 gamma/beta/running_mean/running_var 均须为长度 2 的
-    有限 float 一维 list（拒绝 bool 与 int）；linear values 为 [2][2]、
-    linear bias 为 [2]；metrics 的 epochs/seed 须为 int、lr/accuracy
-    须为有限 float、loss 须为长度 20 的有限 float list。推理只使用
-    保存的权重与 BN 运行统计，metrics 的具体取值不参与推理，故仅校验
-    类型/形状/有限性而不校验数值（与 evalcnn 一致）。文件不可读、
-    UTF-8/JSON 非法或结构/数值不符时抛 OSError/ValueError/TypeError。
+    校验规则与 _load_norm_artifact 完全一致（键名、键序、类型、形状、
+    有限值与重复键），仅区别于直接吃字节而不读文件，供 benchmark 在
+    序列化后于内存重载同构 model。
     """
-    with open(weights_path, "rb") as f:
-        raw = f.read()
     doc = json.loads(
         raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
     )
@@ -3017,6 +3021,26 @@ def _load_norm_artifact(weights_path):
     )
 
 
+def _load_norm_artifact(weights_path):
+    """读取并严格校验 fitnorm 产物。
+
+    返回 (conv_values, conv_bias, gamma, beta, running_mean, running_var,
+    lin_values, lin_bias)。顶层及 model/conv/batchnorm/linear/metrics
+    各层的键名、键序、类型与形状均须与 fitnorm 写出的公开契约一致；
+    拒绝重复键。conv values 须为 [2][1][1][1]、conv bias 为 [2]；
+    batchnorm 的 gamma/beta/running_mean/running_var 均须为长度 2 的
+    有限 float 一维 list（拒绝 bool 与 int）；linear values 为 [2][2]、
+    linear bias 为 [2]；metrics 的 epochs/seed 须为 int、lr/accuracy
+    须为有限 float、loss 须为长度 20 的有限 float list。推理只使用
+    保存的权重与 BN 运行统计，metrics 的具体取值不参与推理，故仅校验
+    类型/形状/有限性而不校验数值（与 evalcnn 一致）。文件不可读、
+    UTF-8/JSON 非法或结构/数值不符时抛 OSError/ValueError/TypeError。
+    """
+    with open(weights_path, "rb") as f:
+        raw = f.read()
+    return _parse_norm_artifact(raw)
+
+
 def _cmd_evalnorm(weights_path, output_path):
     """evalnorm 子命令主体；权重/数据/计算/写出失败返回 1。"""
     try:
@@ -3057,6 +3081,225 @@ def _cmd_evalnorm(weights_path, output_path):
         payload = (_dump_compact(artifact) + "\n").encode("utf-8")
         _atomic_write_output(output_path, payload)
     except (_TrainDataError, ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 命令行 benchmark：python convnet.py benchmark OUTPUT
+# ---------------------------------------------------------------------------
+
+_BENCH_VAL_DATA_PATH = os.path.join("data", "tiny-val.csv")
+
+
+class _BenchDataError(Exception):
+    """benchmark 数据缺失或字节内容不符。"""
+
+
+def _load_bench_val_samples():
+    """读取 data/tiny-val.csv 验证集，严格校验字节后解析为 [N][1][2][2]。
+
+    解析规则与 fitnorm 训练数据（data/tiny.csv）完全一致：字节须逐字节
+    等于约定内容 b"0,0,0,0,0\\n1,1,1,1,1\\n"，每行恰含 5 个 0/1 字段，
+    前四特征按行优先重排为 [N][1][2][2]，末字段为 0/1 标签。验证集与
+    训练集是两个独立文件、分别读取，绝不混用。文件缺失、不可读或字节、
+    字段、取值不符一律抛 _BenchDataError。
+    """
+    try:
+        with open(_BENCH_VAL_DATA_PATH, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise _BenchDataError(
+            "无法读取 %s：%s" % (_BENCH_VAL_DATA_PATH, exc)
+        )
+    if raw != _TRAIN_EXPECTED_BYTES:
+        raise _BenchDataError(
+            "%s 的字节内容与预期不符" % _BENCH_VAL_DATA_PATH
+        )
+
+    images = []
+    labels = []
+    for line in raw.decode("utf-8").split("\n"):
+        if line == "":
+            continue
+        fields = line.split(",")
+        if len(fields) != _TRAIN_NUM_FEATURES + 1:
+            raise _BenchDataError(
+                "%s 存在字段数不为 5 的行" % _BENCH_VAL_DATA_PATH
+            )
+        values = []
+        for field in fields:
+            if field not in ("0", "1"):
+                raise _BenchDataError(
+                    "%s 含非 0/1 字段：%r" % (_BENCH_VAL_DATA_PATH, field)
+                )
+            values.append(int(field))
+        images.append(
+            [[[values[0], values[1]], [values[2], values[3]]]]
+        )
+        labels.append(values[_TRAIN_NUM_FEATURES])
+    if not images:
+        raise _BenchDataError("%s 不含任何样本" % _BENCH_VAL_DATA_PATH)
+    return images, labels
+
+
+def _benchmark_run():
+    """执行 benchmark：fitnorm 同构训练、序列化重载、验证集推理。
+
+    训练仅使用 data/tiny.csv（fitnorm 解析规则），验证仅使用
+    data/tiny-val.csv（同一解析规则、独立文件，两者不混用）。以
+    fitnorm 初值与七层配置（Dropout seed=7）调用
+    train_norm(epochs=20, lr=0.1)，要求 20 项更新前批均 loss 的末项
+    严格小于首项，且 conv 权重/偏置、BN gamma/beta、linear 权重/偏置
+    六组参数至少一组相对初值改变。随后将 fitnorm 同构 model（含 BN
+    保存统计）紧凑序列化，再以与 evalnorm 完全相同的严格校验重载该
+    model；以重载参数与 BN 保存统计在 BN/Dropout 推理态网络上对
+    验证集逐样本取最大 logit（并列取小类），要求预测恰为 [0, 1]、
+    accuracy 为 1.0 且全部 logit 有限。
+
+    返回 (model, losses, predictions, accuracy)；model 的逐层键序、
+    类型与形状与 fitnorm 产物一致。
+    """
+    # 训练集与验证集分别从两个文件独立读取，互不混用。
+    train_x, train_labels = _load_cnn_samples()
+    val_x, val_labels = _load_bench_val_samples()
+
+    layers = _build_norm_layers()
+    conv, bn, dropout, linear = layers[0], layers[1], layers[2], layers[5]
+
+    init_conv_w = _deep_copy(_CNN_CONV_INIT)
+    init_conv_b = [0.0] * _CNN_NUM_CLASSES
+    init_gamma = _deep_copy(_NORM_GAMMA_INIT)
+    init_beta = _deep_copy(_NORM_BETA_INIT)
+    init_lin_w = _deep_copy(_CNN_LINEAR_INIT)
+    init_lin_b = [0.0] * _CNN_NUM_CLASSES
+
+    losses = train_norm(
+        layers, train_x, train_labels,
+        epochs=_NORM_EPOCHS, lr=_NORM_LR,
+    )
+    losses = [float(v) for v in losses]
+    for v in losses:
+        if not math.isfinite(v):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+    if len(losses) != _NORM_EPOCHS:
+        raise ValueError("loss 项数与训练轮数不符")
+    if not losses[-1] < losses[0]:
+        raise ValueError("末次 loss 未小于首次 loss")
+
+    conv_w = conv._weights
+    conv_b = conv._bias
+    gamma = bn._gamma
+    beta = bn._beta
+    lin_w = linear._weights
+    lin_b = linear._bias
+    changed = (
+        conv_w != init_conv_w or conv_b != init_conv_b
+        or gamma != init_gamma or beta != init_beta
+        or lin_w != init_lin_w or lin_b != init_lin_b
+    )
+    if not changed:
+        raise ValueError("训练后六组参数均未改变")
+
+    running_mean = _deep_copy(bn.running_mean)
+    running_var = _deep_copy(bn.running_var)
+
+    # 序列化 fitnorm 同构 model，并以 evalnorm 的严格校验从序列化字节
+    # 重载；metrics 不参与推理，故仅放占位值（仍须通过类型/形状校验）。
+    model = {
+        "conv": {"values": conv_w, "bias": conv_b},
+        "batchnorm": {
+            "gamma": gamma,
+            "beta": beta,
+            "running_mean": running_mean,
+            "running_var": running_var,
+        },
+        "linear": {"values": lin_w, "bias": lin_b},
+    }
+    placeholder_artifact = _dump_compact(
+        {
+            "model": model,
+            "metrics": {
+                "epochs": _NORM_EPOCHS,
+                "lr": float(_NORM_LR),
+                "seed": _NORM_DROPOUT_SEED,
+                "loss": losses,
+                "accuracy": 1.0,
+            },
+        }
+    ).encode("utf-8")
+    (
+        r_conv_w, r_conv_b, r_gamma, r_beta,
+        r_running_mean, r_running_var, r_lin_w, r_lin_b,
+    ) = _parse_norm_artifact(placeholder_artifact)
+
+    # 以重载参数与 BN 保存统计重建推理态网络：BN 用保存统计、Dropout 关闭。
+    logits, _, _ = _norm_forward(
+        r_conv_w, r_conv_b, r_gamma, r_beta,
+        r_running_mean, r_running_var, r_lin_w, r_lin_b,
+        val_x, False,
+    )
+    predictions = []
+    correct = 0
+    n_ = len(val_x)
+    for n in range(n_):
+        row = logits[n]
+        for o in range(_CNN_NUM_CLASSES):
+            if not math.isfinite(row[o]):
+                raise ValueError("推理计算产生非有限值（NaN/inf）")
+        # 取最大 logit，并列取较小类别。
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        predictions.append(pred)
+        if pred == val_labels[n]:
+            correct += 1
+    accuracy = correct / n_
+    if predictions != [0, 1]:
+        raise ValueError("验证集预测必须恰为 [0, 1]")
+    if accuracy != 1.0:
+        raise ValueError("验证集 accuracy 不为 1.0")
+
+    # 重载后的 model 即为写出内容：逐层键序、类型与形状同 fitnorm。
+    reloaded_model = {
+        "conv": {"values": r_conv_w, "bias": r_conv_b},
+        "batchnorm": {
+            "gamma": r_gamma,
+            "beta": r_beta,
+            "running_mean": r_running_mean,
+            "running_var": r_running_var,
+        },
+        "linear": {"values": r_lin_w, "bias": r_lin_b},
+    }
+    return reloaded_model, losses, predictions, accuracy
+
+
+def _cmd_benchmark(output_path):
+    """benchmark 子命令主体；数据/计算/阈值/重载/写出失败返回 1 且不改 OUTPUT。"""
+    try:
+        # OUTPUT 不得与训练/验证数据同路径：避免原子写出覆盖数据文件。
+        if os.path.abspath(output_path) == os.path.abspath(_TRAIN_DATA_PATH):
+            raise ValueError("OUTPUT 与训练数据不能是同一路径")
+        if os.path.abspath(output_path) == os.path.abspath(
+            _BENCH_VAL_DATA_PATH
+        ):
+            raise ValueError("OUTPUT 与验证数据不能是同一路径")
+        model, losses, predictions, accuracy = _benchmark_run()
+        artifact = {
+            "model": model,
+            "metrics": {
+                "epochs": _NORM_EPOCHS,
+                "lr": float(_NORM_LR),
+                "seed": _NORM_DROPOUT_SEED,
+                "loss": losses,
+                "predictions": predictions,
+                "accuracy": accuracy,
+            },
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (_TrainDataError, _BenchDataError, ValueError, TypeError, OSError):
         return 1
     return 0
 
@@ -3896,7 +4139,7 @@ def train_norm(layers, x, labels, epochs=20, lr=0.1):
 
 
 def main(argv):
-    """命令行入口：接受 train/fitcnn/fitnorm OUTPUT、
+    """命令行入口：接受 train/fitcnn/fitnorm/benchmark OUTPUT、
     evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
     evaldata/predictdata WEIGHTS DATA OUTPUT 与 gradcheck CONFIG OUTPUT。
 
@@ -3922,6 +4165,8 @@ def main(argv):
         return _cmd_predictdata(argv[2], argv[3], argv[4])
     if len(argv) == 4 and argv[1] == "gradcheck":
         return _cmd_gradcheck(argv[2], argv[3])
+    if len(argv) == 3 and argv[1] == "benchmark":
+        return _cmd_benchmark(argv[2])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -3933,6 +4178,7 @@ def main(argv):
         "evaldata",
         "predictdata",
         "gradcheck",
+        "benchmark",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
