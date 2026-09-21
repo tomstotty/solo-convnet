@@ -58,6 +58,13 @@
   以保存参数与 BN 运行统计重建推理态网络（BN/Dropout 切推理态），
   对 fitdata 契约的 DATA 逐样本取最大 logit 预测（并列取小类），
   将样本数、预测与准确率以紧凑 JSON 原子写入 OUTPUT。
+- `python convnet.py predictdata WEIGHTS DATA OUTPUT`：读取 fitnorm 或
+  fitdata 产物 WEIGHTS（校验同 evalnorm，metrics 合法值不参与推理），
+  以保存参数与 BN 运行统计重建推理态网络（BN/Dropout 切推理态），对仅含
+  顺序键 x（有限 int/float、拒绝 bool 的规则 list[N][1][2][2]、N≥1）的
+  DATA 逐样本取最大 logit 预测（并列取小类），将 sample_count、
+  predictions（int[N]）与 logits（float[N][2]）以紧凑 JSON 原子写入
+  OUTPUT；成功退出 0、参数数目错退出 2、其余失败退出 1 且不改 OUTPUT。
 - `python convnet.py gradcheck CONFIG OUTPUT`：读取 UTF-8 JSON CONFIG
   （键依次为 x、labels、eps、atol、rtol，x 为有限数的规则
   list[N][1][2][2]、N≥1），新建与 fitnorm 初始参数、层配置相同的七层
@@ -3299,6 +3306,89 @@ def _cmd_evaldata(weights_path, data_path, output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行数据驱动取 logit 推理：python convnet.py predictdata WEIGHTS DATA OUTPUT
+# ---------------------------------------------------------------------------
+
+_PREDICTDATA_KEYS = ["x"]
+
+
+def _load_predictdata(data_path):
+    """读取并严格校验 predictdata 的 DATA，返回 x。
+
+    DATA 须为 UTF-8 JSON 对象，键仅为 x 且顺序固定，重复、缺失、额外或
+    错序键一律非法；x 须为有限 int/float（拒绝 bool）的规则
+    list[N][1][2][2] 且 N>=1。文件不可读、UTF-8/JSON 非法或结构/类型/
+    取值不符时抛 OSError/ValueError/TypeError。
+    """
+    with open(data_path, "rb") as f:
+        raw = f.read()
+    doc = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("DATA 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _PREDICTDATA_KEYS:
+        raise ValueError("DATA 键必须仅为 x")
+
+    x = doc["x"]
+    _require_list(x, "x")
+    x_shape = _shape_of(x, 4, "x")
+    if x_shape[1:] != (1, 2, 2):
+        raise ValueError("x 的形状必须为 [N][1][2][2]")
+    if x_shape[0] < 1:
+        raise ValueError("x 的样本数 N 必须 >= 1")
+    return x
+
+
+def _cmd_predictdata(weights_path, data_path, output_path):
+    """predictdata 子命令主体；权重/数据/计算/写出失败返回 1 且不改 OUTPUT。"""
+    try:
+        # OUTPUT 不得与任一输入同路径：避免原子写出覆盖权重或数据。
+        if os.path.abspath(output_path) == os.path.abspath(weights_path):
+            raise ValueError("OUTPUT 与 WEIGHTS 不能是同一路径")
+        if os.path.abspath(output_path) == os.path.abspath(data_path):
+            raise ValueError("OUTPUT 与 DATA 不能是同一路径")
+        (
+            conv_values, conv_bias, gamma, beta,
+            running_mean, running_var, lin_values, lin_bias,
+        ) = _load_norm_artifact(weights_path)
+        x = _load_predictdata(data_path)
+        n_ = len(x)
+
+        # 推理态：BN 用保存的运行统计仿射，Dropout 为恒等映射。
+        logits, _, _ = _norm_forward(
+            conv_values, conv_bias, gamma, beta,
+            running_mean, running_var, lin_values, lin_bias,
+            x, False,
+        )
+        predictions = []
+        out_logits = []
+        for n in range(n_):
+            row = logits[n]
+            for o in range(_CNN_NUM_CLASSES):
+                if not math.isfinite(row[o]):
+                    raise ValueError("推理计算产生非有限值（NaN/inf）")
+            # 取最大 logit，并列取较小类别。
+            pred = 0
+            for o in range(1, _CNN_NUM_CLASSES):
+                if row[o] > row[pred]:
+                    pred = o
+            predictions.append(pred)
+            out_logits.append([float(row[0]), float(row[1])])
+
+        artifact = {
+            "sample_count": n_,
+            "predictions": predictions,
+            "logits": out_logits,
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 命令行梯度检查：python convnet.py gradcheck CONFIG OUTPUT
 # ---------------------------------------------------------------------------
 
@@ -3808,7 +3898,7 @@ def train_norm(layers, x, labels, epochs=20, lr=0.1):
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm OUTPUT、
     evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
-    evaldata WEIGHTS DATA OUTPUT 与 gradcheck CONFIG OUTPUT。
+    evaldata/predictdata WEIGHTS DATA OUTPUT 与 gradcheck CONFIG OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -3828,6 +3918,8 @@ def main(argv):
         return _cmd_fitdata(argv[2], argv[3])
     if len(argv) == 5 and argv[1] == "evaldata":
         return _cmd_evaldata(argv[2], argv[3], argv[4])
+    if len(argv) == 5 and argv[1] == "predictdata":
+        return _cmd_predictdata(argv[2], argv[3], argv[4])
     if len(argv) == 4 and argv[1] == "gradcheck":
         return _cmd_gradcheck(argv[2], argv[3])
     if len(argv) >= 2 and argv[1] in (
@@ -3839,6 +3931,7 @@ def main(argv):
         "evalnorm",
         "fitdata",
         "evaldata",
+        "predictdata",
         "gradcheck",
     ):
         return 2
