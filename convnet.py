@@ -28,6 +28,12 @@
   返回各轮更新前批均损失的新 list[float]；末轮更新后仅以更新后的
   Conv2D 输出做一次训练态 BN 前向刷新运行统计；任何异常都把七层
   整体恢复到函数入口状态。
+- train_norm_batches(layers, x, labels, batch_size=1, epochs=1, lr=0.1,
+  seed=0, shuffle=True)：每轮按 [0,…,N-1]（shuffle 为真时以 seed
+  起始、跨轮延续的 32 位 LCG 做 Fisher–Yates 洗牌）切分为大小
+  batch_size 的批（末批可短），逐批调用 train_norm_step，返回按轮、
+  批顺序排列、长度 epochs*ceil(N/batch_size) 的各批更新前批均损失
+  新 list[float]；任何异常都把七层整体恢复到函数入口状态。
 
 命令行子命令（仅标准库）：
 - `python convnet.py train OUTPUT`：在 data/tiny.csv 上训练“展平 + Linear”，
@@ -4115,8 +4121,10 @@ def predict_batch(model, x):
 
 
 # ---------------------------------------------------------------------------
-# 公开训练 API：train_norm_step(layers, x, labels, lr=0.1) 与
-# train_norm(layers, x, labels, epochs=20, lr=0.1)
+# 公开训练 API：train_norm_step(layers, x, labels, lr=0.1)、
+# train_norm(layers, x, labels, epochs=20, lr=0.1) 与
+# train_norm_batches(layers, x, labels, batch_size=1, epochs=1, lr=0.1,
+#                    seed=0, shuffle=True)
 # ---------------------------------------------------------------------------
 
 # 七层每个实例的全部可变状态：缓存（每次成功 forward 覆盖）、模式无关的
@@ -4371,6 +4379,95 @@ def train_norm(layers, x, labels, epochs=20, lr=0.1):
         # 末轮更新后，仅用更新后的 Conv2D 输出做一次训练态 BN 前向，
         # 刷新运行统计；不经过后续层，也不更新参数。
         bn.forward(conv.forward(x))
+        return losses
+    except BaseException:
+        _restore_layers(layers, snapshot)
+        raise
+
+
+def train_norm_batches(
+    layers, x, labels, batch_size=1, epochs=1, lr=0.1, seed=0, shuffle=True
+):
+    """七层网络（Conv2D/BN/Dropout/MaxPool/Flatten/Linear/SoftmaxCE）的
+    分轮分批标准化训练：每轮按顺序 [0,…,N-1]（shuffle 为真时先做
+    Fisher–Yates 洗牌）切分若干批，逐批以批内样本调用 train_norm_step，
+    返回按轮、批顺序排列的各批更新前批均损失组成的新 list[float]，长度
+    为 epochs*ceil(N/batch_size)。
+
+    layers、lr、x、labels 的校验沿用 train_norm_step（各批仅切取 x、
+    labels 的新子 list 传入，不复制样本），另要求 labels 与 x 样本数
+    相等，否则抛 ValueError。batch_size、epochs 必须是正 int，seed
+    必须是 [0, 2^32-1] 内的 int，三者均拒绝 bool：类型错抛 TypeError，
+    范围错抛 ValueError；batch_size 大于 N 时每轮仅一个含全部样本的
+    短批。shuffle 必须是 bool，否则抛 TypeError。
+
+    洗牌使用与 Dropout 相同的 32 位线性同余发生器
+    s=(1664525*s+1013904223) mod 2^32：每轮自 i=N-1 降至 1，先推进 s
+    再令 j=s%(i+1) 并交换 order[i]、order[j]；s 自 seed 起跨轮延续，
+    shuffle 为假时整轮不推进 s（seed 仍须合法）。该发生器独立于七层
+    自身状态。
+
+    任一失败（含参数校验、x/labels 不匹配与各批 train_norm_step 的
+    计算错误）都把七层的参数引用、模式、缓存、BN 运行统计、Dropout
+    随机状态与掩码整体恢复到函数入口状态，且不修改 x、labels 及构造
+    参数所用的原 list；成功时保留全部参数更新与各步带来的 BN 统计、
+    Dropout 随机推进。相同入口状态结果完全确定。
+    """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError(
+            "batch_size 必须是 int（拒绝 bool），得到 %s"
+            % type(batch_size).__name__
+        )
+    if batch_size <= 0:
+        raise ValueError("batch_size 必须为正整数")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int（拒绝 bool），得到 %s"
+            % type(epochs).__name__
+        )
+    if epochs <= 0:
+        raise ValueError("epochs 必须为正整数")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            "seed 必须是 int（拒绝 bool），得到 %s" % type(seed).__name__
+        )
+    if seed < 0 or seed > 0xFFFFFFFF:
+        raise ValueError("seed 必须满足 0 <= seed <= 2^32-1")
+    if not isinstance(shuffle, bool):
+        raise TypeError(
+            "shuffle 必须是 bool，得到 %s" % type(shuffle).__name__
+        )
+    _validate_train_norm_args(layers, lr)
+    _require_list(x, "x")
+    x_shape = _shape_of(x, 4, "x")
+    n_ = x_shape[0]
+    _require_list(labels, "labels")
+    if len(labels) != n_:
+        raise ValueError(
+            "labels 长度 %d 与 x 样本数 %d 不符" % (len(labels), n_)
+        )
+
+    snapshot = _snapshot_layers(layers)
+    try:
+        losses = []
+        s = seed
+        for _ in range(epochs):
+            # 每轮 order 都从 [0,…,N-1] 重新开始；洗牌状态 s 跨轮延续。
+            order = list(range(n_))
+            if shuffle and n_ > 1:
+                # Fisher–Yates 洗牌：自 N-1 降至 1，先推进 LCG，
+                # 再以 j=s%(i+1) 交换；s 跨轮延续。
+                for i in range(n_ - 1, 0, -1):
+                    s = (1664525 * s + 1013904223) % 4294967296
+                    j = s % (i + 1)
+                    order[i], order[j] = order[j], order[i]
+            for start in range(0, n_, batch_size):
+                idx = order[start:start + batch_size]
+                batch_x = [x[k] for k in idx]
+                batch_labels = [labels[k] for k in idx]
+                losses.append(
+                    train_norm_step(layers, batch_x, batch_labels, lr)
+                )
         return losses
     except BaseException:
         _restore_layers(layers, snapshot)
