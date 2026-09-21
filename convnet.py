@@ -1029,28 +1029,208 @@ def _flatten_into(t, out):
             out.append(v)
 
 
+def _layer_loss(layer, x_arg, dy):
+    """前向 layer.forward(x_arg)，按输出嵌套序求标量损失 acc += y*dy。"""
+    y = layer.forward(x_arg)
+    acc = 0.0
+
+    def rec(a, b):
+        nonlocal acc
+        if isinstance(a, list):
+            for i in range(len(a)):
+                rec(a[i], b[i])
+        else:
+            acc += a * b
+
+    rec(y, dy)
+    return acc
+
+
+def _scan_numeric_target(
+    layer, x_arg, dy, work, analytic_flat, eps, atol, rtol, prepare_loss=None
+):
+    """对 work 各叶子标量按嵌套序做中心差分，返回 (ok, max_e, max_r)。
+
+    x_arg 为传入 forward 的张量（x 目标即扰动副本 work，参数目标为原 x）；
+    每次数值前向前调用 prepare_loss()（Dropout 借此重放入口随机状态，
+    使正/负扰动前向重放同一掩码）。
+    """
+    ok = True
+    max_e = 0.0
+    max_r = 0.0
+    idx = 0
+    for container, i in _leaf_slots(work):
+        v = container[i]
+        if prepare_loss is not None:
+            prepare_loss()
+        container[i] = v + eps
+        lp = _layer_loss(layer, x_arg, dy)
+        if prepare_loss is not None:
+            prepare_loss()
+        container[i] = v - eps
+        lm = _layer_loss(layer, x_arg, dy)
+        container[i] = v
+        if not (math.isfinite(lp) and math.isfinite(lm)):
+            raise ValueError("数值梯度计算产生非有限值（NaN/inf）")
+        n = (lp - lm) / (2 * eps)
+        a = analytic_flat[idx]
+        idx += 1
+        if not (math.isfinite(a) and math.isfinite(n)):
+            raise ValueError("梯度计算产生非有限值（NaN/inf）")
+        aa = abs(a)
+        an = abs(n)
+        e = abs(a - n)
+        r = e / max(aa, an, 1e-12)
+        if e > atol + rtol * max(aa, an):
+            ok = False
+        if e > max_e:
+            max_e = e
+        if r > max_r:
+            max_r = r
+    return ok, max_e, max_r
+
+
+def _iterate_targets(
+    layer, x, dy, targets, rebind, eps, atol, rtol, prepare_loss=None
+):
+    """依次对 targets = ((name, 原张量, 解析梯度), ...) 做中心差分检验。
+
+    name 为 "x" 时前向入参用扰动副本；name 出现在 rebind 中时，先把对应
+    layer 属性重绑到扰动副本。汇总全部目标后返回 (bool, float, float)。
+    """
+    ok = True
+    max_e = 0.0
+    max_r = 0.0
+    for name, original, analytic in targets:
+        analytic_flat = []
+        _flatten_into(analytic, analytic_flat)
+        work = _deep_copy(original)  # 只扰动副本，原张量不被修改
+        if name in rebind:
+            setattr(layer, rebind[name], work)
+        x_arg = work if name == "x" else x
+        tok, te, tr = _scan_numeric_target(
+            layer,
+            x_arg,
+            dy,
+            work,
+            analytic_flat,
+            eps,
+            atol,
+            rtol,
+            prepare_loss,
+        )
+        ok = ok and tok
+        if te > max_e:
+            max_e = te
+        if tr > max_r:
+            max_r = tr
+    return bool(ok), float(max_e), float(max_r)
+
+
+def _check_gradients_standard(layer, x, dy, eps, atol, rtol):
+    """Conv2D/MaxPool2D/Flatten/Linear/ReLU 的梯度检验（原五层层行为）。"""
+    layer.forward(x)  # x 的校验沿用该层 forward
+    grad = layer.backward(dy)  # dy 的校验沿用该层 backward
+    if isinstance(layer, (Conv2D, Linear)):
+        dx, dw, db = grad
+        targets = (
+            ("x", x, dx),
+            ("weights", layer._weights, dw),
+            ("bias", layer._bias, db),
+        )
+        rebind = {"weights": "_weights", "bias": "_bias"}
+    else:
+        targets = (("x", x, grad),)
+        rebind = {}
+    return _iterate_targets(
+        layer, x, dy, targets, rebind, eps, atol, rtol
+    )
+
+
+def _check_gradients_batchnorm(layer, x, dy, eps, atol, rtol):
+    """训练态 BatchNorm2D：按 x、gamma、beta 顺序做中心差分。"""
+    layer.forward(x)
+    dx, dgamma, dbeta = layer.backward(dy)
+    targets = (
+        ("x", x, dx),
+        ("gamma", layer._gamma, dgamma),
+        ("beta", layer._beta, dbeta),
+    )
+    rebind = {"gamma": "_gamma", "beta": "_beta"}
+    return _iterate_targets(
+        layer, x, dy, targets, rebind, eps, atol, rtol
+    )
+
+
+def _check_gradients_dropout(layer, x, dy, eps, atol, rtol):
+    """Dropout 仅检验 x：训练态重放同一掩码，推理态按恒等映射。"""
+    if layer._training:
+        # 以入口随机状态为基准：解析前向与每次正/负扰动前向都恢复该状态，
+        # 掩码与随机推进仅依赖状态序列而与 x 取值无关，故掩码逐元素相同。
+        s0 = layer._s
+        layer._s = s0
+        layer.forward(x)
+        analytic = layer.backward(dy)
+
+        def replay_mask():
+            layer._s = s0
+
+        prepare_loss = replay_mask
+    else:
+        # 推理态前向为恒等复制、不推进随机状态，解析梯度即 dy。
+        layer.forward(x)
+        analytic = layer.backward(dy)
+        prepare_loss = None
+    targets = (("x", x, analytic),)
+    return _iterate_targets(
+        layer, x, dy, targets, {}, eps, atol, rtol, prepare_loss
+    )
+
+
 def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验层的前向/反向实现。
 
-    layer 限 Conv2D/MaxPool2D/Flatten/Linear/ReLU 实例，其余抛 TypeError。
-    解析梯度 a 取自原值 forward(x) 后 backward(dy) 的对应返回（有参层
-    还包含 dweights、dbias）。对每个标量 v，定义标量损失 L：acc=0.0，
-    按输出嵌套索引从外到内递增执行 acc += y*dy（y 为前向输出），数值
-    梯度 n = (L(v+eps) - L(v-eps)) / (2*eps)。
+    layer 限 Conv2D/MaxPool2D/Flatten/Linear/ReLU/BatchNorm2D/Dropout
+    实例，其余抛 TypeError。解析梯度 a 取自原值 forward(x) 后
+    backward(dy) 的对应返回：有参层还包含 dweights、dbias；
+    BatchNorm2D 仅训练态可检验（推理态抛 ValueError），按 x、gamma、
+    beta 顺序取 dx、dgamma、dbeta；Dropout 只检验 x——训练态以入口
+    随机状态为基准，解析梯度及每次正/负扰动前均恢复该状态使前向重放
+    同一掩码，推理态按恒等映射检验。
+
+    对每个标量 v，定义标量损失 L：acc=0.0，按输出嵌套索引从外到内
+    递增执行 acc += y*dy（y 为前向输出），数值梯度
+    n = (L(v+eps) - L(v-eps)) / (2*eps)，各目标内部按嵌套序扰动。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
     ok 当且仅当每项 e <= atol + rtol * max(abs(a), abs(n))。
 
-    eps/atol/rtol 须为有限 int/float（拒绝 bool）：类型错抛 TypeError；
-    eps 非正、容差为负或任一非有限抛 ValueError。x、dy 的校验及异常
-    完全沿用对应层的 forward/backward；计算产生非有限值抛 ValueError。
-    x、dy、参数及实例状态在所有成功或异常路径均原样恢复。
+    校验顺序固定为 layer、eps/atol/rtol、BatchNorm2D 模式、
+    forward(x)、backward(dy)：layer 或数值参数类型错抛 TypeError；
+    BatchNorm2D 推理态、eps 非正、容差为负、任一参数非有限、x/dy
+    的形状或非有限错误（沿用对应层 forward/backward）、计算产生非
+    有限值一律抛 ValueError。
+
+    x、dy、参数、训练/推理模式、Dropout 随机状态与掩码、BatchNorm2D
+    运行统计与旧缓存，在所有成功或异常路径均恢复到调用前；同一入口
+    状态下结果确定。
     """
-    if not isinstance(layer, (Conv2D, MaxPool2D, Flatten, Linear, ReLU)):
+    if not isinstance(
+        layer,
+        (
+            Conv2D,
+            MaxPool2D,
+            Flatten,
+            Linear,
+            ReLU,
+            BatchNorm2D,
+            Dropout,
+        ),
+    ):
         raise TypeError(
-            "layer 必须是 Conv2D/MaxPool2D/Flatten/Linear/ReLU 实例，得到 %s"
-            % type(layer).__name__
+            "layer 必须是 Conv2D/MaxPool2D/Flatten/Linear/ReLU/"
+            "BatchNorm2D/Dropout 实例，得到 %s" % type(layer).__name__
         )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
         if isinstance(val, bool) or not isinstance(val, (int, float)):
@@ -1066,77 +1246,27 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
         raise ValueError("atol 必须为非负数")
     if rtol < 0:
         raise ValueError("rtol 必须为非负数")
+    if isinstance(layer, BatchNorm2D) and not layer._training:
+        raise ValueError("BatchNorm2D 仅训练态可做梯度检验，当前为推理态")
 
     saved_state = dict(layer.__dict__)
     try:
-        layer.forward(x)  # x 的校验沿用该层 forward
-        grad = layer.backward(dy)  # dy 的校验沿用该层 backward
-        if isinstance(layer, (Conv2D, Linear)):
-            dx, dw, db = grad
-            targets = (
-                ("x", x, dx),
-                ("weights", layer._weights, dw),
-                ("bias", layer._bias, db),
+        if isinstance(layer, BatchNorm2D):
+            result = _check_gradients_batchnorm(
+                layer, x, dy, eps, atol, rtol
+            )
+        elif isinstance(layer, Dropout):
+            result = _check_gradients_dropout(
+                layer, x, dy, eps, atol, rtol
             )
         else:
-            targets = (("x", x, grad),)
-
-        def loss(x_arg):
-            y = layer.forward(x_arg)
-            acc = 0.0
-
-            def rec(a, b):
-                nonlocal acc
-                if isinstance(a, list):
-                    for i in range(len(a)):
-                        rec(a[i], b[i])
-                else:
-                    acc += a * b
-
-            rec(y, dy)
-            return acc
-
-        ok = True
-        max_e = 0.0
-        max_r = 0.0
-        for name, original, analytic in targets:
-            analytic_flat = []
-            _flatten_into(analytic, analytic_flat)
-            work = _deep_copy(original)  # 只扰动副本，原张量不被修改
-            if name == "weights":
-                layer._weights = work
-            elif name == "bias":
-                layer._bias = work
-            idx = 0
-            for container, i in _leaf_slots(work):
-                v = container[i]
-                container[i] = v + eps
-                lp = loss(work if name == "x" else x)
-                container[i] = v - eps
-                lm = loss(work if name == "x" else x)
-                container[i] = v
-                if not (math.isfinite(lp) and math.isfinite(lm)):
-                    raise ValueError("数值梯度计算产生非有限值（NaN/inf）")
-                n = (lp - lm) / (2 * eps)
-                a = analytic_flat[idx]
-                idx += 1
-                if not (math.isfinite(a) and math.isfinite(n)):
-                    raise ValueError("梯度计算产生非有限值（NaN/inf）")
-                aa = abs(a)
-                an = abs(n)
-                e = abs(a - n)
-                r = e / max(aa, an, 1e-12)
-                if e > atol + rtol * max(aa, an):
-                    ok = False
-                if e > max_e:
-                    max_e = e
-                if r > max_r:
-                    max_r = r
+            result = _check_gradients_standard(
+                layer, x, dy, eps, atol, rtol
+            )
     finally:
         layer.__dict__.clear()
         layer.__dict__.update(saved_state)
-
-    return (bool(ok), float(max_e), float(max_r))
+    return result
 
 
 def _check_pool_window_ties(pool, inp):
