@@ -16,6 +16,10 @@
 公开推理 API（仅标准库）：
 - load_model(path)：严格校验 train 产物后返回键序为 values、bias 的新 dict。
 - predict_batch(model, x)：对 [N][1][1][4] 输入逐样本计算 logit，返回预测类别。
+- train_norm_step(layers, x, labels, lr=0.1)：对
+  Conv2D→BatchNorm2D→Dropout→MaxPool2D→Flatten→Linear→SoftmaxCrossEntropy
+  七层执行一步训练前向 + 逆序反传，返回 float 批均损失，并以新 list
+  同步更新 conv/BN/linear 参数（BN、Dropout 须为训练态）。
 
 命令行子命令（仅标准库）：
 - `python convnet.py train OUTPUT`：在 data/tiny.csv 上训练“展平 + Linear”，
@@ -1235,6 +1239,141 @@ def _flatten_into(t, out):
             _flatten_into(v, out)
         else:
             out.append(v)
+
+
+def train_norm_step(layers, x, labels, lr=0.1):
+    """七层归一化网络的单步训练（仅标准库）。
+
+    layers 须为恰含 7 项的 list，依次为
+    Conv2D / BatchNorm2D / Dropout / MaxPool2D / Flatten / Linear /
+    SoftmaxCrossEntropy 实例：容器非 list 抛 TypeError，长度非 7 抛
+    ValueError，任一层类型不符抛 TypeError；BatchNorm2D、Dropout 必须
+    处于训练态，否则抛 ValueError。lr 须为正的有限 int/float（拒绝
+    bool）：类型错抛 TypeError，非有限或非正抛 ValueError。
+
+    按列表顺序前向（Conv→BN→Dropout→Pool→Flatten→Linear），最后调用
+    损失层 forward(logits, labels) 并返回 float 批均损失；以损失层
+    backward() 起按 Linear→Flatten→Pool→Dropout→BN→Conv 逆序反传。
+    各被调 forward/backward 的输入校验错误原样传播。
+
+    用全新 list 同步更新：conv 的 weights/bias、BN 的 gamma/beta、
+    linear 的 weights/bias 各减去 lr 乘对应梯度；损失梯度已批均，
+    不再除以 N。损失、任一层参数梯度或任一更新后参数含非有限值均抛
+    ValueError。仅当六组新参数全部算出且有限后才一次性提交：成功时
+    层内参数被替换，而前向缓存、BN running 统计与 Dropout 已推进的
+    随机状态全部保留。
+
+    任一路径都不修改 x、labels 与构造参数原 list（层内仅做只读引用或
+    整体替换）；任何异常都会把七层的入口状态（含参数、缓存、running
+    统计与 Dropout 随机状态）完整恢复后再原样抛出。
+    """
+    if not isinstance(layers, list):
+        raise TypeError(
+            "layers 必须是 list，得到 %s" % type(layers).__name__
+        )
+    if len(layers) != 7:
+        raise ValueError("layers 必须恰含 7 层，得到 %d 层" % len(layers))
+
+    conv, bn, dropout, pool, flatten, linear, loss_layer = layers
+    layer_specs = (
+        ("layers[0]", conv, Conv2D, "Conv2D"),
+        ("layers[1]", bn, BatchNorm2D, "BatchNorm2D"),
+        ("layers[2]", dropout, Dropout, "Dropout"),
+        ("layers[3]", pool, MaxPool2D, "MaxPool2D"),
+        ("layers[4]", flatten, Flatten, "Flatten"),
+        ("layers[5]", linear, Linear, "Linear"),
+        ("layers[6]", loss_layer, SoftmaxCrossEntropy, "SoftmaxCrossEntropy"),
+    )
+    for slot, member, expected, expected_name in layer_specs:
+        if not isinstance(member, expected):
+            raise TypeError(
+                "%s 必须是 %s 实例，得到 %s"
+                % (slot, expected_name, type(member).__name__)
+            )
+    if not bn._training:
+        raise ValueError("BatchNorm2D 必须处于训练态")
+    if not dropout._training:
+        raise ValueError("Dropout 必须处于训练态")
+
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+        raise TypeError(
+            "lr 必须是 int/float（拒绝 bool），得到 %s" % type(lr).__name__
+        )
+    if not math.isfinite(lr):
+        raise ValueError("lr 必须是有限值（拒绝 NaN/inf）")
+    if lr <= 0:
+        raise ValueError("lr 必须为正数")
+
+    # 浅快照七层 __dict__：参数 list 身份、running 统计、随机状态与缓存
+    # 全部在内；前向/更新期间层属性只被整体替换，从不原地改写，故异常时
+    # 可凭快照整体还原所有入口状态。
+    snapshots = [dict(layer.__dict__) for layer in layers]
+
+    def restore():
+        for layer, snap in zip(layers, snapshots):
+            layer.__dict__.clear()
+            layer.__dict__.update(snap)
+
+    def sgd_update(params, grads):
+        """逐元素 p - lr*g，结构同 params，返回全新嵌套 list。"""
+        return [
+            sgd_update(p, g) if isinstance(p, list) else p - lr * g
+            for p, g in zip(params, grads)
+        ]
+
+    try:
+        conv_out = conv.forward(x)
+        bn_out = bn.forward(conv_out)
+        drop_out = dropout.forward(bn_out)
+        pool_out = pool.forward(drop_out)
+        flat = flatten.forward(pool_out)
+        logits = linear.forward(flat)
+        loss = loss_layer.forward(logits, labels)
+
+        dlogits = loss_layer.backward()
+        dx_flat, dlw, dlb = linear.backward(dlogits)
+        dx_pool = flatten.backward(dx_flat)
+        dx_drop = pool.backward(dx_pool)
+        dx_bn = dropout.backward(dx_drop)
+        dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+        _, dcw, dcb = conv.backward(dx_conv)
+
+        if not math.isfinite(loss):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+        for grad in (dcw, dcb, dgamma, dbeta, dlw, dlb):
+            grad_vals = []
+            _flatten_into(grad, grad_vals)
+            for v in grad_vals:
+                if not math.isfinite(v):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+        # 先在全新 list 上算出全部新参数，校验有限后再一次性同步提交。
+        new_conv_w = sgd_update(conv._weights, dcw)
+        new_conv_b = sgd_update(conv._bias, dcb)
+        new_gamma = sgd_update(bn._gamma, dgamma)
+        new_beta = sgd_update(bn._beta, dbeta)
+        new_lin_w = sgd_update(linear._weights, dlw)
+        new_lin_b = sgd_update(linear._bias, dlb)
+        for new_tensor in (
+            new_conv_w, new_conv_b, new_gamma, new_beta,
+            new_lin_w, new_lin_b,
+        ):
+            new_vals = []
+            _flatten_into(new_tensor, new_vals)
+            for v in new_vals:
+                if not math.isfinite(v):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+        conv._weights = new_conv_w
+        conv._bias = new_conv_b
+        bn._gamma = new_gamma
+        bn._beta = new_beta
+        linear._weights = new_lin_w
+        linear._bias = new_lin_b
+        return float(loss)
+    except Exception:
+        restore()
+        raise
 
 
 def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
