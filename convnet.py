@@ -6,6 +6,8 @@
   dilation 可为正 int 或 (DH, DW) tuple，groups 为正 int 分组数
   （默认 1，O 与 C 均须被其整除，weights 形状 [O][C/G][KH][KW]）。
 - MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较。
+- AvgPool2D 层：NCHW 嵌套 list、逐通道平均池化、补边位置既不求和
+  也不计入除数。
 - Flatten 层：NCHW 嵌套 list 展平为 [N][C*H*W]（按 c→h→w 顺序）。
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
@@ -600,6 +602,159 @@ class MaxPool2D:
                     for ow in range(ow_):
                         ih, iw = win_row[ow]
                         dx_c[ih][iw] += dy_row[ow]
+        return dx
+
+
+class AvgPool2D:
+    """二维平均池化层（NCHW，嵌套 list，逐通道池化）。
+
+    kernel_size: 正 int（双轴同值，展开为 (K, K)）或恰含 (KH, KW) 的
+    正 int tuple。
+    stride: 正 int（双轴同值）或恰含 (SH, SW) 的正 int tuple；为 None
+    时取 (KH, KW)。
+    padding: 非负 int（四边同值，展开为 (P, P, P, P)）或恰含
+    (PT, PB, PL, PR) 的非负 int tuple，分别为上/下/左/右补边；且
+    PT、PB < KH，PL、PR < KW。补边位置既不求和也不计入除数。
+    输入 x: [N][C][H][W]，输出: [N][C][OH][OW]，
+    OH = (H + PT + PB - KH) // SH + 1，
+    OW = (W + PL + PR - KW) // SW + 1。
+    不能整除时舍弃底部或右侧余量。每个窗口以 0.0 起按 kh→kw 累加
+    真实输入坐标，以窗口内真实坐标数为除数求均值。
+    """
+
+    def __init__(self, kernel_size, stride=None, padding=0):
+        kh_, kw_ = _check_kernel2d(kernel_size, "kernel_size")
+        if stride is None:
+            sh_, sw_ = kh_, kw_
+        else:
+            sh_, sw_ = _check_stride2d(stride)
+        pt_, pb_, pl_, pr_ = _check_padding2d(padding)
+        if pt_ >= kh_ or pb_ >= kh_:
+            raise ValueError("padding 的 PT、PB 必须小于 KH")
+        if pl_ >= kw_ or pr_ >= kw_:
+            raise ValueError("padding 的 PL、PR 必须小于 KW")
+
+        self._kernel_size = (kh_, kw_)
+        self._stride = (sh_, sw_)
+        self._padding = (pt_, pb_, pl_, pr_)
+
+        self._x_shape = None   # 最近一次成功 forward 的输入形状
+        self._out_shape = None  # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 做平均池化，返回新 float list 并缓存形状。"""
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+        kh_, kw_ = self._kernel_size
+        sh_, sw_ = self._stride
+        pt_, pb_, pl_, pr_ = self._padding
+        if kh_ > h_ + pt_ + pb_ or kw_ > w_ + pl_ + pr_:
+            raise ValueError("池化窗口在补边后仍越界：kernel_size 大于补边后的输入")
+        oh_ = (h_ + pt_ + pb_ - kh_) // sh_ + 1
+        ow_ = (w_ + pl_ + pr_ - kw_) // sw_ + 1
+
+        out = []
+        for n in range(n_):
+            out_n = []
+            for c in range(c_):
+                x_c = x[n][c]
+                out_c = []
+                for oh in range(oh_):
+                    base_h = oh * sh_ - pt_
+                    row = []
+                    for ow in range(ow_):
+                        base_w = ow * sw_ - pl_
+                        acc = 0.0
+                        count = 0
+                        for kh in range(kh_):
+                            ih = base_h + kh
+                            if ih < 0 or ih >= h_:
+                                continue
+                            x_row = x_c[ih]
+                            for kw in range(kw_):
+                                iw = base_w + kw
+                                if 0 <= iw < w_:
+                                    acc += x_row[iw]
+                                    count += 1
+                        row.append(acc / count)
+                    out_c.append(row)
+                out_n.append(out_c)
+            out.append(out_n)
+
+        for n in range(n_):
+            for c in range(c_):
+                for oh in range(oh_):
+                    for ow in range(ow_):
+                        if not math.isfinite(out[n][c][oh][ow]):
+                            raise ValueError(
+                                "前向计算产生非有限值（NaN/inf）"
+                            )
+
+        self._x_shape = (n_, c_, h_, w_)
+        self._out_shape = (n_, c_, oh_, ow_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回与输入同形状的 dx。
+
+        dy 的形状必须等于最近一次成功 forward 的输出形状；每个窗口的
+        梯度按 n→c→oh→ow、kh→kw 顺序以 dy/窗口真实坐标数 累加到各
+        真实输入坐标。未成功 forward 前调用一律抛 ValueError。
+        """
+        if self._out_shape is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, h_, w_ = self._x_shape
+        oh_, ow_ = self._out_shape[2], self._out_shape[3]
+        kh_, kw_ = self._kernel_size
+        sh_, sw_ = self._stride
+        pt_, pb_, pl_, pr_ = self._padding
+
+        dx = _zeros(self._x_shape)
+        for n in range(n_):
+            for c in range(c_):
+                dx_c = dx[n][c]
+                dy_c = dy[n][c]
+                for oh in range(oh_):
+                    base_h = oh * sh_ - pt_
+                    dy_row = dy_c[oh]
+                    for ow in range(ow_):
+                        base_w = ow * sw_ - pl_
+                        count = 0
+                        for kh in range(kh_):
+                            ih = base_h + kh
+                            if ih < 0 or ih >= h_:
+                                continue
+                            for kw in range(kw_):
+                                iw = base_w + kw
+                                if 0 <= iw < w_:
+                                    count += 1
+                        g = dy_row[ow] / count
+                        for kh in range(kh_):
+                            ih = base_h + kh
+                            if ih < 0 or ih >= h_:
+                                continue
+                            dx_row = dx_c[ih]
+                            for kw in range(kw_):
+                                iw = base_w + kw
+                                if 0 <= iw < w_:
+                                    dx_row[iw] += g
+
+        for n in range(n_):
+            for c in range(c_):
+                for hh in range(h_):
+                    for ww in range(w_):
+                        if not math.isfinite(dx[n][c][hh][ww]):
+                            raise ValueError(
+                                "反向计算产生非有限值（NaN/inf）"
+                            )
         return dx
 
 
