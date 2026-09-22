@@ -1530,10 +1530,11 @@ def _flatten_into(t, out):
 def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验层的前向/反向实现。
 
-    layer 限 Conv2D/MaxPool2D/Flatten/Linear/ReLU/Dropout/BatchNorm2D
-    实例，其余抛 TypeError。解析梯度 a 取自原值 forward(x) 后 backward(dy)
-    的对应返回：Conv2D/Linear 还包含 dweights、dbias；BatchNorm2D 按
-    x、gamma、beta 顺序检查 dx、dgamma、dbeta；Dropout 只检查 x。
+    layer 限 Conv2D/MaxPool2D/AvgPool2D/Flatten/Linear/ReLU/Dropout/
+    BatchNorm2D 实例，其余抛 TypeError。解析梯度 a 取自原值 forward(x) 后
+    backward(dy) 的对应返回：Conv2D/Linear 还包含 dweights、dbias；
+    BatchNorm2D 按 x、gamma、beta 顺序检查 dx、dgamma、dbeta；
+    MaxPool2D/AvgPool2D/Dropout 只检查 x。
     对每个标量 v，定义标量损失 L：acc=0.0，按输出嵌套索引从外到内递增
     执行 acc += y*dy（y 为前向输出），数值梯度
     n = (L(v+eps) - L(v-eps)) / (2*eps)，各目标内部标量按嵌套序遍历。
@@ -1558,10 +1559,11 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """
     if not isinstance(
         layer,
-        (Conv2D, MaxPool2D, Flatten, Linear, ReLU, Dropout, BatchNorm2D),
+        (Conv2D, MaxPool2D, AvgPool2D, Flatten, Linear, ReLU, Dropout,
+         BatchNorm2D),
     ):
         raise TypeError(
-            "layer 必须是 Conv2D/MaxPool2D/Flatten/Linear/ReLU/"
+            "layer 必须是 Conv2D/MaxPool2D/AvgPool2D/Flatten/Linear/ReLU/"
             "Dropout/BatchNorm2D 实例，得到 %s" % type(layer).__name__
         )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
@@ -1607,7 +1609,8 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
                 ("beta", layer._beta, dbeta),
             )
         else:
-            # MaxPool2D/Flatten/ReLU/Dropout（训练态与推理态）只检查 x。
+            # MaxPool2D/AvgPool2D/Flatten/ReLU/Dropout（训练态与推理态）
+            # 只检查 x。
             targets = (("x", x, grad),)
 
         def loss(x_arg):
@@ -1727,18 +1730,19 @@ def _check_pool_window_ties(pool, inp):
 def check_cnn_gradients(
     conv, pool, flatten, linear, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4
 ):
-    """用中心差分数值梯度检验 Conv2D→MaxPool2D→Flatten→Linear 整链。
+    """用中心差分数值梯度检验 Conv2D→Pool2D→Flatten→Linear 整链。
 
-    conv/pool/flatten/linear 须依次为 Conv2D/MaxPool2D/Flatten/Linear 实例，
-    其余抛 TypeError。前向按 conv→pool→flatten→linear 执行，解析梯度按
-    linear→flatten→pool→conv 逆序取各层 backward 结果。标量损失 L：
-    acc=0.0，按线性层输出的嵌套索引从外到内递增执行 acc += y*dy（y 为
-    整链前向输出）。
+    conv/pool/flatten/linear 须依次为 Conv2D/MaxPool2D 或 AvgPool2D/
+    Flatten/Linear 实例，其余抛 TypeError。前向按 conv→pool→flatten→linear
+    执行，解析梯度按 linear→flatten→pool→conv 逆序取各层 backward 结果。
+    标量损失 L：acc=0.0，按线性层输出的嵌套索引从外到内递增执行
+    acc += y*dy（y 为整链前向输出）。
 
     数值梯度依次扰动 x、conv 的 weights/bias、linear 的 weights/bias
     （各张量内部按嵌套序），n = (L(v+eps) - L(v-eps)) / (2*eps)。
-    任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）一律抛
-    ValueError——max 在并列点梯度无定义。
+    pool 为 MaxPool2D 时，任一次前向中任一池化有效窗口并列最大（补边
+    位置不参与比较）一律抛 ValueError——max 在并列点梯度无定义；pool 为
+    AvgPool2D 时不做并列检测。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -1753,9 +1757,10 @@ def check_cnn_gradients(
         raise TypeError(
             "conv 必须是 Conv2D 实例，得到 %s" % type(conv).__name__
         )
-    if not isinstance(pool, MaxPool2D):
+    if not isinstance(pool, (MaxPool2D, AvgPool2D)):
         raise TypeError(
-            "pool 必须是 MaxPool2D 实例，得到 %s" % type(pool).__name__
+            "pool 必须是 MaxPool2D/AvgPool2D 实例，得到 %s"
+            % type(pool).__name__
         )
     if not isinstance(flatten, Flatten):
         raise TypeError(
@@ -1789,7 +1794,8 @@ def check_cnn_gradients(
     try:
         def chain_forward(x_arg):
             conv_out = conv.forward(x_arg)
-            _check_pool_window_ties(pool, conv_out)
+            if isinstance(pool, MaxPool2D):
+                _check_pool_window_ties(pool, conv_out)
             pool_out = pool.forward(conv_out)
             flat = flatten.forward(pool_out)
             return linear.forward(flat)
@@ -1881,22 +1887,23 @@ def check_norm_gradients(
     conv, bn, dropout, pool, flatten, linear, x, dy,
     eps=1e-6, atol=1e-6, rtol=1e-4,
 ):
-    """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→MaxPool2D→Flatten→Linear 训练链。
+    """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→Pool2D→Flatten→Linear 训练链。
 
     conv/bn/dropout/pool/flatten/linear 须依次为 Conv2D/BatchNorm2D/Dropout/
-    MaxPool2D/Flatten/Linear 实例，其余抛 TypeError；bn 或 dropout 非训练态
-    抛 ValueError。前向按 conv→bn→dropout→pool→flatten→linear 执行，解析
-    梯度按 linear→flatten→pool→dropout→bn→conv 逆序取各层 backward 结果。
-    标量损失 L：acc=0.0，按线性层输出的嵌套索引从外到内递增执行
-    acc += y*dy（y 为整链前向输出）。
+    MaxPool2D 或 AvgPool2D/Flatten/Linear 实例，其余抛 TypeError；bn 或
+    dropout 非训练态抛 ValueError。前向按 conv→bn→dropout→pool→flatten→
+    linear 执行，解析梯度按 linear→flatten→pool→dropout→bn→conv 逆序取
+    各层 backward 结果。标量损失 L：acc=0.0，按线性层输出的嵌套索引从外
+    到内递增执行 acc += y*dy（y 为整链前向输出）。
 
     数值梯度依次扰动 x、conv 的 weights/bias、bn 的 gamma/beta、linear 的
     weights/bias（各张量内部按嵌套序），n = (L(v+eps) - L(v-eps)) / (2*eps)。
     每次前向（含解析梯度前向与每次正、负扰动前向）之前都把 dropout 的随机
     状态 _s 恢复为入口值，使各次前向重放同一掩码，故同一入口状态结果确定。
-    BatchNorm2D 每次数值前向都重新按当前批次统计。任一次前向中任一池化
-    有效窗口并列最大（补边位置不参与比较）一律抛 ValueError——max 在
-    并列点梯度无定义。
+    BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D 时，
+    任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）一律抛
+    ValueError——max 在并列点梯度无定义；pool 为 AvgPool2D 时不做并列
+    检测。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -1920,9 +1927,10 @@ def check_norm_gradients(
         raise TypeError(
             "dropout 必须是 Dropout 实例，得到 %s" % type(dropout).__name__
         )
-    if not isinstance(pool, MaxPool2D):
+    if not isinstance(pool, (MaxPool2D, AvgPool2D)):
         raise TypeError(
-            "pool 必须是 MaxPool2D 实例，得到 %s" % type(pool).__name__
+            "pool 必须是 MaxPool2D/AvgPool2D 实例，得到 %s"
+            % type(pool).__name__
         )
     if not isinstance(flatten, Flatten):
         raise TypeError(
@@ -1967,7 +1975,8 @@ def check_norm_gradients(
             conv_out = conv.forward(x_arg)
             bn_out = bn.forward(conv_out)
             drop_out = dropout.forward(bn_out)
-            _check_pool_window_ties(pool, drop_out)
+            if isinstance(pool, MaxPool2D):
+                _check_pool_window_ties(pool, drop_out)
             pool_out = pool.forward(drop_out)
             flat = flatten.forward(pool_out)
             return linear.forward(flat)
@@ -2068,23 +2077,24 @@ def check_train_gradients(
     conv, bn, dropout, pool, flatten, linear, loss, x, labels,
     eps=1e-6, atol=1e-6, rtol=1e-4,
 ):
-    """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→MaxPool2D→Flatten→Linear→SoftmaxCrossEntropy 训练链。
+    """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→Pool2D→Flatten→Linear→SoftmaxCrossEntropy 训练链。
 
     conv/bn/dropout/pool/flatten/linear 须依次为 Conv2D/BatchNorm2D/Dropout/
-    MaxPool2D/Flatten/Linear 实例，loss 须为 SoftmaxCrossEntropy 实例，
-    其余抛 TypeError；bn 或 dropout 非训练态抛 ValueError。前向按
-    conv→bn→dropout→pool→flatten→linear 执行得 logits，标量损失
-    L = loss.forward(logits, labels) 返回的 float 批均损失；解析梯度自
-    loss.backward() 起按 linear→flatten→pool→dropout→bn→conv 逆序取各层
-    backward 结果。
+    MaxPool2D 或 AvgPool2D/Flatten/Linear 实例，loss 须为
+    SoftmaxCrossEntropy 实例，其余抛 TypeError；bn 或 dropout 非训练态抛
+    ValueError。前向按 conv→bn→dropout→pool→flatten→linear 执行得
+    logits，标量损失 L = loss.forward(logits, labels) 返回的 float 批均
+    损失；解析梯度自 loss.backward() 起按 linear→flatten→pool→dropout→
+    bn→conv 逆序取各层 backward 结果。
 
     数值梯度依次扰动 x、conv 的 weights/bias、bn 的 gamma/beta、linear 的
     weights/bias（各张量内部按嵌套序），n = (L(v+eps) - L(v-eps)) / (2*eps)。
     每次前向（含解析梯度前向与每次正、负扰动前向）之前都把 dropout 的随机
     状态 _s 恢复为入口值，使各次前向重放同一掩码，故同一入口状态结果确定。
-    BatchNorm2D 每次数值前向都重新按当前批次统计。任一次前向中任一池化
-    有效窗口并列最大（补边位置不参与比较）一律抛 ValueError——max 在
-    并列点梯度无定义。
+    BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D 时，
+    任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）一律抛
+    ValueError——max 在并列点梯度无定义；pool 为 AvgPool2D 时不做并列
+    检测。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -2109,9 +2119,10 @@ def check_train_gradients(
         raise TypeError(
             "dropout 必须是 Dropout 实例，得到 %s" % type(dropout).__name__
         )
-    if not isinstance(pool, MaxPool2D):
+    if not isinstance(pool, (MaxPool2D, AvgPool2D)):
         raise TypeError(
-            "pool 必须是 MaxPool2D 实例，得到 %s" % type(pool).__name__
+            "pool 必须是 MaxPool2D/AvgPool2D 实例，得到 %s"
+            % type(pool).__name__
         )
     if not isinstance(flatten, Flatten):
         raise TypeError(
@@ -2162,7 +2173,8 @@ def check_train_gradients(
             conv_out = conv.forward(x_arg)
             bn_out = bn.forward(conv_out)
             drop_out = dropout.forward(bn_out)
-            _check_pool_window_ties(pool, drop_out)
+            if isinstance(pool, MaxPool2D):
+                _check_pool_window_ties(pool, drop_out)
             pool_out = pool.forward(drop_out)
             flat = flatten.forward(pool_out)
             return linear.forward(flat)
