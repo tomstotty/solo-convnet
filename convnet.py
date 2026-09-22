@@ -820,6 +820,151 @@ class AvgPool2D:
         return dx
 
 
+def _check_output_size2d(value, name):
+    """校验自适应池化输出尺寸：正 int 或恰含 (OH, OW) 的正 int tuple。
+
+    int 展开为 (O, O)（双轴同值）；拒绝 bool。整体类型错抛 TypeError，
+    tuple 长度错或成员非正抛 ValueError，成员类型错（含 bool）抛
+    TypeError。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, tuple)):
+        raise TypeError(
+            "%s 必须是 int 或 tuple，得到 %s" % (name, type(value).__name__)
+        )
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError("%s 必须为正整数" % name)
+        return (value, value)
+    if len(value) != 2:
+        raise ValueError("%s tuple 必须恰含 (OH, OW) 两个元素" % name)
+    oh_, ow_ = value
+    for member_name, member in (("OH", oh_), ("OW", ow_)):
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError(
+                "%s 的 %s 必须是 int，得到 %s"
+                % (name, member_name, type(member).__name__)
+            )
+        if member <= 0:
+            raise ValueError("%s 的 %s 必须为正整数" % (name, member_name))
+    return (oh_, ow_)
+
+
+class AdaptiveAvgPool2D:
+    """二维自适应平均池化层（NCHW，嵌套 list，逐通道池化）。
+
+    output_size: 正 int（双轴同值，展开为 (OH, OH)）或恰含 (OH, OW)
+    的正 int tuple（拒绝 bool）；OH 或 OW 可以大于 H 或 W。
+    输入 x: [N][C][H][W]，输出: [N][C][OH][OW]。输出格 (oh, ow) 覆盖
+    的输入区间为高度 [floor(oh*H/OH), ceil((oh+1)*H/OH))、宽度同理，
+    各区间互不重叠且恰好覆盖全部输入坐标（OH> H 时部分区间只含一个
+    坐标并被重复使用）。各输出以 0.0 起按 n→c→oh→ow、ih→iw 顺序累加
+    区间内输入值后除以区间元素数。backward 把 dy 除以同一元素数后按相同
+    分箱顺序分摊到区间覆盖的每个输入。
+    """
+
+    def __init__(self, output_size):
+        oh_, ow_ = _check_output_size2d(output_size, "output_size")
+        self._output_size = (oh_, ow_)
+
+        self._x_shape = None    # 最近一次成功 forward 的输入形状
+        self._out_shape = None  # 最近一次成功 forward 的输出形状
+
+    def _bins(self, length, out_len):
+        """返回每个输出格的 (起点, 终点, 元素数)，区间为 [起点, 终点)。"""
+        bins = []
+        for o in range(out_len):
+            start = (o * length) // out_len
+            end = ((o + 1) * length + out_len - 1) // out_len
+            bins.append((start, end, end - start))
+        return bins
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 做自适应平均池化，返回新 float list 并缓存形状。"""
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+        oh_, ow_ = self._output_size
+        h_bins = self._bins(h_, oh_)
+        w_bins = self._bins(w_, ow_)
+
+        out = []
+        for n in range(n_):
+            out_n = []
+            for c in range(c_):
+                x_c = x[n][c]
+                out_c = []
+                for oh in range(oh_):
+                    h0, h1, h_count = h_bins[oh]
+                    row = []
+                    for ow in range(ow_):
+                        w0, w1, w_count = w_bins[ow]
+                        total = 0.0
+                        for ih in range(h0, h1):
+                            x_row = x_c[ih]
+                            for iw in range(w0, w1):
+                                total += x_row[iw]
+                        avg = total / (h_count * w_count)
+                        if not math.isfinite(avg):
+                            raise ValueError(
+                                "自适应平均池化计算产生非有限值（NaN/inf）"
+                            )
+                        row.append(avg)
+                    out_c.append(row)
+                out_n.append(out_c)
+            out.append(out_n)
+
+        self._x_shape = (n_, c_, h_, w_)
+        self._out_shape = (n_, c_, oh_, ow_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回与输入同形状的 dx。
+
+        dy 的形状必须等于最近一次成功 forward 的输出形状；每个输出格把
+        dy / 区间元素数按 n→c→oh→ow、ih→iw 顺序分摊累加至其覆盖的各
+        输入坐标。未成功 forward 前调用一律抛 ValueError。
+        """
+        if self._out_shape is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, oh_, ow_ = self._out_shape
+        _, _, h_, w_ = self._x_shape
+        h_bins = self._bins(h_, oh_)
+        w_bins = self._bins(w_, ow_)
+
+        dx = _zeros(self._x_shape)
+        for n in range(n_):
+            dy_n = dy[n]
+            for c in range(c_):
+                dx_c = dx[n][c]
+                dy_c = dy_n[c]
+                for oh in range(oh_):
+                    h0, h1, h_count = h_bins[oh]
+                    dy_row = dy_c[oh]
+                    for ow in range(ow_):
+                        w0, w1, w_count = w_bins[ow]
+                        share = dy_row[ow] / (h_count * w_count)
+                        if not math.isfinite(share):
+                            raise ValueError(
+                                "自适应平均池化反向计算产生非有限值（NaN/inf）"
+                            )
+                        for ih in range(h0, h1):
+                            dx_row = dx_c[ih]
+                            for iw in range(w0, w1):
+                                dx_row[iw] += share
+                                if not math.isfinite(dx_row[iw]):
+                                    raise ValueError(
+                                        "自适应平均池化反向累加产生非有限值（NaN/inf）"
+                                    )
+        return dx
+
+
 class Flatten:
     """展平层：将 [N][C][H][W] 按 c→h→w 顺序展平为 [N][C*H*W]。
 
@@ -1601,11 +1746,11 @@ def _flatten_into(t, out):
 def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验层的前向/反向实现。
 
-    layer 限 Conv2D/MaxPool2D/AvgPool2D/Flatten/Linear/ReLU/Dropout/
-    BatchNorm2D 实例，其余抛 TypeError。解析梯度 a 取自原值 forward(x) 后
-    backward(dy) 的对应返回：Conv2D/Linear 还包含 dweights、dbias；
-    BatchNorm2D 按 x、gamma、beta 顺序检查 dx、dgamma、dbeta；
-    MaxPool2D/AvgPool2D/Flatten/ReLU/Dropout 只检查 x。
+    layer 限 Conv2D/MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/Flatten/Linear/
+    ReLU/Dropout/BatchNorm2D 实例，其余抛 TypeError。解析梯度 a 取自原值
+    forward(x) 后 backward(dy) 的对应返回：Conv2D/Linear 还包含 dweights、
+    dbias；BatchNorm2D 按 x、gamma、beta 顺序检查 dx、dgamma、dbeta；
+    MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/Flatten/ReLU/Dropout 只检查 x。
     对每个标量 v，定义标量损失 L：acc=0.0，按输出嵌套索引从外到内递增
     执行 acc += y*dy（y 为前向输出），数值梯度
     n = (L(v+eps) - L(v-eps)) / (2*eps)，各目标内部标量按嵌套序遍历。
@@ -1630,12 +1775,13 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """
     if not isinstance(
         layer,
-        (Conv2D, MaxPool2D, AvgPool2D, Flatten, Linear, ReLU, Dropout,
-         BatchNorm2D),
+        (Conv2D, MaxPool2D, AvgPool2D, AdaptiveAvgPool2D, Flatten, Linear,
+         ReLU, Dropout, BatchNorm2D),
     ):
         raise TypeError(
-            "layer 必须是 Conv2D/MaxPool2D/AvgPool2D/Flatten/Linear/ReLU/"
-            "Dropout/BatchNorm2D 实例，得到 %s" % type(layer).__name__
+            "layer 必须是 Conv2D/MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/"
+            "Flatten/Linear/ReLU/Dropout/BatchNorm2D 实例，得到 %s"
+            % type(layer).__name__
         )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
         if isinstance(val, bool) or not isinstance(val, (int, float)):
@@ -1680,8 +1826,8 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
                 ("beta", layer._beta, dbeta),
             )
         else:
-            # MaxPool2D/AvgPool2D/Flatten/ReLU/Dropout（训练态与推理态）
-            # 只检查 x。
+            # MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/Flatten/ReLU/Dropout
+            # （训练态与推理态）只检查 x。
             targets = (("x", x, grad),)
 
         def loss(x_arg):
