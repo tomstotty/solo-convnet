@@ -136,6 +136,17 @@
   训练链并以 SoftmaxCrossEntropy 为损失层调用 check_train_gradients，
   将 ok、max_e、max_r 以紧凑 JSON 原子写入 OUTPUT；ok 真退出 0、
   假退出 1，其余失败退出 1 且不改 OUTPUT。
+- `python convnet.py convcheck CONFIG OUTPUT`：读取 UTF-8 JSON CONFIG
+  （无重复键，键依次为 weights、bias、stride、padding、x、dy、eps、
+  atol、rtol；stride 为恰含两项正 int 且至少一项大于 1 的 list，
+  padding 为恰含四项非负 int 且至少一项大于 0 的 list，成员拒绝
+  bool；四张量与三容差沿用 Conv2D、check_gradients 契约），stride、
+  padding 转 tuple 后构造零补边、dilation=groups=1 的 Conv2D，取
+  forward(x) 与以同形 dy 的 backward(dy)，再以同参新层执行
+  check_gradients(layer, x, dy, eps, atol, rtol)；将 forward、
+  backward{dx,dweights,dbias}、check{ok,max_e,max_r}（张量叶值均为
+  有限 float）以紧凑 JSON 原子写入 OUTPUT；ok 真退出 0、假退出 1
+  （仍写盘），CONFIG/OUTPUT 同路径或其余失败退出 1 且不改 OUTPUT。
 """
 
 import json
@@ -4987,6 +4998,156 @@ def _cmd_gradcheck(config_path, output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行卷积梯度检查：python convnet.py convcheck CONFIG OUTPUT
+# ---------------------------------------------------------------------------
+
+_CONVCHECK_CONFIG_KEYS = [
+    "weights", "bias", "stride", "padding", "x", "dy", "eps", "atol", "rtol",
+]
+
+
+def _check_convcheck_stride(value):
+    """校验 convcheck 的 stride：恰含两项正 int 的 list（拒绝 bool），且至少一项 > 1。
+
+    整体非 list 或成员类型错（含 bool）抛 TypeError；长度不为 2、成员
+    非正或两项均不大于 1 抛 ValueError。返回 (SH, SW) tuple。
+    """
+    if not isinstance(value, list):
+        raise TypeError(
+            "stride 必须是 list，得到 %s" % type(value).__name__
+        )
+    if len(value) != 2:
+        raise ValueError("stride 必须恰含 (SH, SW) 两个元素")
+    sh_, sw_ = value
+    for member_name, member in (("SH", sh_), ("SW", sw_)):
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError(
+                "stride 的 %s 必须是 int，得到 %s"
+                % (member_name, type(member).__name__)
+            )
+        if member <= 0:
+            raise ValueError("stride 的 %s 必须为正整数" % member_name)
+    if sh_ <= 1 and sw_ <= 1:
+        raise ValueError("stride 至少一项必须大于 1")
+    return (sh_, sw_)
+
+
+def _check_convcheck_padding(value):
+    """校验 convcheck 的 padding：恰含四项非负 int 的 list（拒绝 bool），且至少一项 > 0。
+
+    整体非 list 或成员类型错（含 bool）抛 TypeError；长度不为 4、成员
+    为负或四项均为 0 抛 ValueError。返回 (PT, PB, PL, PR) tuple。
+    """
+    if not isinstance(value, list):
+        raise TypeError(
+            "padding 必须是 list，得到 %s" % type(value).__name__
+        )
+    if len(value) != 4:
+        raise ValueError("padding 必须恰含 (PT, PB, PL, PR) 四个元素")
+    pt_, pb_, pl_, pr_ = value
+    for member_name, member in (
+        ("PT", pt_), ("PB", pb_), ("PL", pl_), ("PR", pr_),
+    ):
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError(
+                "padding 的 %s 必须是 int，得到 %s"
+                % (member_name, type(member).__name__)
+            )
+        if member < 0:
+            raise ValueError("padding 的 %s 必须为非负整数" % member_name)
+    if pt_ == 0 and pb_ == 0 and pl_ == 0 and pr_ == 0:
+        raise ValueError("padding 至少一项必须大于 0")
+    return (pt_, pb_, pl_, pr_)
+
+
+def _load_convcheck_config(config_path):
+    """读取并严格校验 convcheck 的 CONFIG。
+
+    返回 (weights, bias, stride, padding, x, dy, eps, atol, rtol)，其中
+    stride、padding 已转为 tuple。CONFIG 须为无重复键的 UTF-8 JSON 对象，
+    键仅依次为 weights、bias、stride、padding、x、dy、eps、atol、rtol，
+    重复、缺失、额外或错序键一律非法；weights、bias、x、dy 与 eps、atol、
+    rtol 的校验分别交给 Conv2D 构造、forward/backward 与 check_gradients
+    完成。文件不可读、UTF-8/JSON 非法或结构/数值不符时抛
+    OSError/ValueError/TypeError。
+    """
+    with open(config_path, "rb") as f:
+        raw = f.read()
+    doc = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("CONFIG 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _CONVCHECK_CONFIG_KEYS:
+        raise ValueError(
+            "CONFIG 键必须依次为 weights、bias、stride、padding、x、dy、"
+            "eps、atol、rtol"
+        )
+    stride = _check_convcheck_stride(doc["stride"])
+    padding = _check_convcheck_padding(doc["padding"])
+    return (
+        doc["weights"], doc["bias"], stride, padding,
+        doc["x"], doc["dy"], doc["eps"], doc["atol"], doc["rtol"],
+    )
+
+
+def _float_tensor(t):
+    """把嵌套 list 的叶值逐个转为 float，返回同形新 list；非有限叶抛 ValueError。"""
+    if isinstance(t, list):
+        return [_float_tensor(v) for v in t]
+    try:
+        v = float(t)
+    except OverflowError:
+        raise ValueError("计算结果含非有限值（NaN/inf）")
+    if not math.isfinite(v):
+        raise ValueError("计算结果含非有限值（NaN/inf）")
+    return v
+
+
+def _cmd_convcheck(config_path, output_path):
+    """convcheck 子命令主体；配置/计算/写出失败返回 1，ok 假也返回 1。"""
+    try:
+        if os.path.abspath(config_path) == os.path.abspath(output_path):
+            raise ValueError("CONFIG 与 OUTPUT 不能是同一路径")
+        (weights, bias, stride, padding,
+         x, dy, eps, atol, rtol) = _load_convcheck_config(config_path)
+
+        # 零补边、dilation=groups=1 的 Conv2D：先取前向与同形 dy 的反向。
+        layer = Conv2D(weights, bias, stride=stride, padding=padding)
+        forward = layer.forward(x)
+        dx, dweights, dbias = layer.backward(dy)
+
+        # 再以同参新层做中心差分梯度检查。
+        check_layer = Conv2D(weights, bias, stride=stride, padding=padding)
+        ok, max_e, max_r = check_gradients(
+            check_layer, x, dy, eps=eps, atol=atol, rtol=rtol
+        )
+        if not (
+            isinstance(ok, bool)
+            and isinstance(max_e, float)
+            and isinstance(max_r, float)
+            and math.isfinite(max_e)
+            and math.isfinite(max_r)
+        ):
+            raise ValueError("梯度检查结果非法或含非有限值（NaN/inf）")
+
+        artifact = {
+            "forward": _float_tensor(forward),
+            "backward": {
+                "dx": _float_tensor(dx),
+                "dweights": _float_tensor(dweights),
+                "dbias": _float_tensor(dbias),
+            },
+            "check": {"ok": ok, "max_e": max_e, "max_r": max_r},
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
 # 公开推理 API：load_model(path)、predict_batch(model, x)
 # ---------------------------------------------------------------------------
 
@@ -5587,7 +5748,7 @@ def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
     evaldata/predictdata WEIGHTS DATA OUTPUT、benchmark_data TRAIN VAL
-    OUTPUT 与 gradcheck CONFIG OUTPUT。
+    OUTPUT、gradcheck CONFIG OUTPUT 与 convcheck CONFIG OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -5617,6 +5778,8 @@ def main(argv):
         return _cmd_predictdata(argv[2], argv[3], argv[4])
     if len(argv) == 4 and argv[1] == "gradcheck":
         return _cmd_gradcheck(argv[2], argv[3])
+    if len(argv) == 4 and argv[1] == "convcheck":
+        return _cmd_convcheck(argv[2], argv[3])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -5631,6 +5794,7 @@ def main(argv):
         "benchmark_data",
         "predictdata",
         "gradcheck",
+        "convcheck",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
