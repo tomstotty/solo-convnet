@@ -4760,6 +4760,126 @@ def _cmd_predictdata(weights_path, data_path, output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行数据驱动训练+验证：python convnet.py benchmark_data TRAIN VAL OUTPUT
+# ---------------------------------------------------------------------------
+
+
+def _cmd_benchmark_data(train_path, val_path, output_path):
+    """benchmark_data 子命令主体。
+
+    TRAIN、VAL 独立加载（同一契约，见 _load_fitdata），不得混用：以
+    fitnorm 初值七层链（Dropout seed=7）仅在 TRAIN 上调用
+    train_norm(epochs=20, lr=0.1)，记录 20 项更新前批均 loss，要求末项
+    严格小于首项且六组参数至少一组改变；末轮已用训练集 Conv 输出刷新
+    BN 统计，再以该统计、关闭 Dropout 在 VAL 上推理，最大 logit 并列取
+    较小类别，accuracy 必须为 1.0。数据/训练/验收/写出失败返回 1 且不改
+    OUTPUT。
+    """
+    try:
+        # OUTPUT 不得与任一输入同路径，避免原子写出覆盖输入。
+        out_abs = os.path.abspath(output_path)
+        if out_abs == os.path.abspath(train_path):
+            raise ValueError("OUTPUT 与 TRAIN 不能是同一路径")
+        if out_abs == os.path.abspath(val_path):
+            raise ValueError("OUTPUT 与 VAL 不能是同一路径")
+        # 两集独立加载，结果为互不共享可变结构的新列表。
+        x_train, labels_train = _load_fitdata(train_path)
+        x_val, labels_val = _load_fitdata(val_path)
+
+        layers = _build_norm_layers()
+        conv, bn = layers[0], layers[1]
+
+        init_conv_w = _deep_copy(_CNN_CONV_INIT)
+        init_conv_b = [0.0] * _CNN_NUM_CLASSES
+        init_gamma = _deep_copy(_NORM_GAMMA_INIT)
+        init_beta = _deep_copy(_NORM_BETA_INIT)
+        init_lin_w = _deep_copy(_CNN_LINEAR_INIT)
+        init_lin_b = [0.0] * _CNN_NUM_CLASSES
+
+        # 训练仅使用 TRAIN；train_norm 末轮用训练集 Conv 输出刷新 BN 统计。
+        losses = train_norm(
+            layers, x_train, labels_train,
+            epochs=_NORM_EPOCHS, lr=_NORM_LR,
+        )
+        losses = [float(v) for v in losses]
+        for v in losses:
+            if not math.isfinite(v):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+        if not losses[-1] < losses[0]:
+            raise ValueError("末次 loss 未小于首次 loss")
+
+        conv_w = conv._weights
+        conv_b = conv._bias
+        gamma = bn._gamma
+        beta = bn._beta
+        lin_w = layers[5]._weights
+        lin_b = layers[5]._bias
+        changed = (
+            conv_w != init_conv_w or conv_b != init_conv_b
+            or gamma != init_gamma or beta != init_beta
+            or lin_w != init_lin_w or lin_b != init_lin_b
+        )
+        if not changed:
+            raise ValueError("训练后六组参数均未改变")
+
+        # momentum=1：running_mean/running_var 即末轮训练集批统计。
+        running_mean = _deep_copy(bn.running_mean)
+        running_var = _deep_copy(bn.running_var)
+
+        # 以训练集统计、关闭 Dropout，在独立的 VAL 上推理。
+        logits, _, _ = _norm_forward(
+            conv_w, conv_b, gamma, beta,
+            running_mean, running_var, lin_w, lin_b,
+            x_val, False,
+        )
+        n_val = len(x_val)
+        predictions = []
+        correct = 0
+        for n in range(n_val):
+            row = logits[n]
+            for o in range(_CNN_NUM_CLASSES):
+                if not math.isfinite(row[o]):
+                    raise ValueError("评估计算产生非有限值（NaN/inf）")
+            # 取最大 logit，并列取较小类别。
+            pred = 0
+            for o in range(1, _CNN_NUM_CLASSES):
+                if row[o] > row[pred]:
+                    pred = o
+            predictions.append(pred)
+            if pred == labels_val[n]:
+                correct += 1
+        accuracy = correct / n_val
+        if accuracy != 1.0:
+            raise ValueError("VAL accuracy 不为 1.0")
+
+        artifact = {
+            "model": {
+                "conv": {"values": conv_w, "bias": conv_b},
+                "batchnorm": {
+                    "gamma": gamma,
+                    "beta": beta,
+                    "running_mean": running_mean,
+                    "running_var": running_var,
+                },
+                "linear": {"values": lin_w, "bias": lin_b},
+            },
+            "metrics": {
+                "epochs": _NORM_EPOCHS,
+                "lr": float(_NORM_LR),
+                "seed": _NORM_DROPOUT_SEED,
+                "loss": losses,
+                "predictions": predictions,
+                "accuracy": accuracy,
+            },
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 命令行梯度检查：python convnet.py gradcheck CONFIG OUTPUT
 # ---------------------------------------------------------------------------
 
@@ -5446,7 +5566,8 @@ def train_norm_batches(
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
-    evaldata/predictdata WEIGHTS DATA OUTPUT 与 gradcheck CONFIG OUTPUT。
+    evaldata/predictdata WEIGHTS DATA OUTPUT、gradcheck CONFIG OUTPUT 与
+    benchmark_data TRAIN VAL OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -5474,6 +5595,8 @@ def main(argv):
         return _cmd_predictdata(argv[2], argv[3], argv[4])
     if len(argv) == 4 and argv[1] == "gradcheck":
         return _cmd_gradcheck(argv[2], argv[3])
+    if len(argv) == 5 and argv[1] == "benchmark_data":
+        return _cmd_benchmark_data(argv[2], argv[3], argv[4])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -5487,6 +5610,7 @@ def main(argv):
         "evaldata",
         "predictdata",
         "gradcheck",
+        "benchmark_data",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
