@@ -160,14 +160,36 @@
   与总轮数连续训练逐项、逐字节相同。输入不可读、契约或轮数非法、非有限
   计算、INPUT/OUTPUT 路径冲突或 I/O 失败均退出 1，标准输出为空且不改
   OUTPUT；参数数目错退出 2。
+- `python convnet.py resumedata DATA INPUT EPOCHS OUTPUT`：DATA 沿用
+  fitdata 契约，其身份为文件原始字节的 SHA-256 小写 hex。INPUT 为 "-"
+  时以 fitnorm 初值新建训练态网络、start_epoch=0；否则加载 resumedata
+  检查点（顶层键依次为 version、data_sha256、epoch、model、
+  dropout_state；version 为 int 1；data_sha256 须与 DATA 摘要逐字符
+  相同；model/dropout_state 沿用 dump_norm_checkpoint 契约），
+  start_epoch 取检查点 epoch。EPOCHS 须为 "0" 或无前导零 ASCII 正整数；
+  以 lr=0.1 在该 DATA 上调用 train_norm 追加 EPOCHS 轮（0 轮不训练、不
+  刷新统计，状态原样保持）。OUTPUT 写出 dump_data_checkpoint(layers,
+  start_epoch+EPOCHS, data_sha256) 的字节，原子替换；成功时标准输出为
+  紧凑 JSON 加 LF，键依次为 start_epoch、added_epochs、loss，前两者为
+  int，loss 为本段逐轮更新前批均损失的 float 列表（固定 12 位小数、负零
+  归零）。同一 DATA 分段续训拼接的 loss 与连续训练逐项相同，最终检查点
+  逐字节相同；检查点摘要不符（含 DATA 换用其他数据）一律拒绝。DATA/
+  INPUT 不可读、契约/轮数/摘要非法、非有限计算、DATA/INPUT/OUTPUT 路径
+  冲突或 I/O 失败均退出 1，标准输出为空且不改 OUTPUT；参数数目错退出 2。
 - dump_norm_checkpoint(layers, epoch)：序列化 fitnorm 训练态七层网络与
   epoch 为紧凑 JSON bytes（末尾 LF）；load_norm_checkpoint(data) 从其
   bytes 重建无缓存训练态七层网络与 epoch，拒绝 JSON 常量
   NaN/Infinity/-Infinity，hex 叶值仅接受 dump_norm_checkpoint 的规范
   小写串（负零仅 "0x0.0p+0"），其余契约/类型/形状错误分别抛
   ValueError/TypeError/UnicodeDecodeError。
+- dump_data_checkpoint(layers, epoch, data_sha256) 与
+  load_data_checkpoint(data, data_sha256)：resumedata 使用的数据绑定
+  检查点，model/dropout_state 契约同 norm 检查点，顶层键依次为
+  version（int 1）、data_sha256（64 位小写 hex）、epoch、model、
+  dropout_state；加载时摘要须逐字符相符，否则抛 ValueError。
 """
 
+import hashlib
 import json
 import math
 import os
@@ -4525,18 +4547,16 @@ def _cmd_benchmark_batches(output_path):
 _FITDATA_KEYS = ["x", "labels"]
 
 
-def _load_fitdata(data_path):
-    """读取并严格校验 fitdata 的 DATA，返回 (x, labels)。
+def _parse_fitdata(raw):
+    """按 fitdata 契约从 DATA 原始字节解析并严格校验，返回 (x, labels)。
 
-    DATA 须为 UTF-8 JSON 对象，键仅依次为 x、labels，重复、缺失、额外或
-    错序键一律非法；x 须为有限 int/float（拒绝 bool）的规则
-    list[N][1][2][2] 且 N>=2；labels 须为与 x 等长的 list，元素为 int
-    0 或 1（拒绝 bool）。文件不可读、UTF-8/JSON 非法或结构/类型/取值
-    不符时抛 OSError/ValueError/TypeError，返回的列表不与原文共享标量
-    之外的可变结构（json 解析结果本身即为新建）。
+    raw 须为 UTF-8 JSON bytes：非法 UTF-8 抛 UnicodeDecodeError；JSON
+    语法错抛 ValueError（json 接受的 NaN/Infinity 常量会在后续有限性/
+    类型校验中被拒绝）。结构契约同 _load_fitdata：顶层键仅依次为 x、
+    labels，重复、缺失、额外或错序键一律非法；x 须为有限 int/float
+    （拒绝 bool）的规则 list[N][1][2][2] 且 N>=2；labels 须为与 x 等长
+    的 list，元素为 int 0 或 1（拒绝 bool）。
     """
-    with open(data_path, "rb") as f:
-        raw = f.read()
     doc = json.loads(
         raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
     )
@@ -4571,6 +4591,17 @@ def _load_fitdata(data_path):
         if label not in (0, 1):
             raise ValueError("labels 的元素必须为 0 或 1")
     return x, labels
+
+
+def _load_fitdata(data_path):
+    """读取并严格校验 fitdata 的 DATA，返回 (x, labels)。
+
+    文件不可读抛 OSError；字节内容的 UTF-8/JSON 与结构/类型/取值契约见
+    _parse_fitdata。返回的列表不与原文共享标量之外的可变结构。
+    """
+    with open(data_path, "rb") as f:
+        raw = f.read()
+    return _parse_fitdata(raw)
 
 
 def _build_norm_layers():
@@ -5834,6 +5865,14 @@ def train_norm_batches(
 # ---------------------------------------------------------------------------
 
 _CKPT_TOP_KEYS = ["epoch", "model", "dropout_state"]
+# resumedata 检查点的顶层键序：在 epoch 前增加 version、data_sha256。
+_CKPT_DATA_TOP_KEYS = [
+    "version", "data_sha256", "epoch", "model", "dropout_state",
+]
+# resumedata 检查点版本：当前固定为 1。
+_CKPT_DATA_VERSION = 1
+# 原始字节 SHA-256 小写 hex：恰好 64 个十六进制小写字符。
+_SHA256_HEX_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 # model 完整沿用 fitnorm 产物的逐层键序（见 _cmd_fitnorm）。
 _CKPT_MODEL_KEYS = ["conv", "batchnorm", "linear"]
 _CKPT_LAYER_KEYS = ["values", "bias"]
@@ -6016,7 +6055,14 @@ def dump_norm_checkpoint(layers, epoch):
 
     parts = []
     parts.append('"epoch":' + str(int(epoch)))
+    parts.append(_dump_checkpoint_model_text(conv, bn, linear))
+    parts.append('"dropout_state":' + str(int(dropout._s)))
+    text = "{" + ",".join(parts) + "}\n"
+    return text.encode("utf-8")
 
+
+def _dump_checkpoint_model_text(conv, bn, linear):
+    """序列化检查点 model 字段（完整沿用 fitnorm 逐层键序与形状）。"""
     conv_values = _dump_hex_tensor(conv._weights, 4, "conv values")
     conv_bias = _dump_hex_tensor(conv._bias, 1, "conv bias")
     gamma = _dump_hex_tensor(bn._gamma, 1, "gamma")
@@ -6025,17 +6071,13 @@ def dump_norm_checkpoint(layers, epoch):
     running_var = _dump_hex_tensor(bn.running_var, 1, "running_var")
     linear_values = _dump_hex_tensor(linear._weights, 2, "linear values")
     linear_bias = _dump_hex_tensor(linear._bias, 1, "linear bias")
-    model_text = (
+    return (
         '"model":{"conv":{"values":' + conv_values
         + ',"bias":' + conv_bias + '},"batchnorm":{"gamma":' + gamma
         + ',"beta":' + beta + ',"running_mean":' + running_mean
         + ',"running_var":' + running_var + '},"linear":{"values":'
         + linear_values + ',"bias":' + linear_bias + "}}"
     )
-    parts.append(model_text)
-    parts.append('"dropout_state":' + str(int(dropout._s)))
-    text = "{" + ",".join(parts) + "}\n"
-    return text.encode("utf-8")
 
 
 def _parse_hex_tensor(node, depth, shape, name):
@@ -6128,6 +6170,19 @@ def load_norm_checkpoint(data):
             "检查点顶层键必须依次为 epoch、model、dropout_state"
         )
 
+    state = _parse_norm_checkpoint_state(doc)
+    return _layers_from_checkpoint_state(state)
+
+
+def _parse_norm_checkpoint_state(doc):
+    """校验并取出检查点文档中 norm 检查点共有的字段。
+
+    顶层须含（依次）epoch、model、dropout_state（resumedata 检查点在其前
+    另有 version、data_sha256，键序由调用方先行校验）。返回一个状态 dict：
+    epoch（非负 int）、model 解析出的八组张量与 dropout_state
+    （[0,2^32-1] 内 int）。重复/缺失/额外/错序键、类型/形状/取值或非规范
+    hex 错误分别抛 ValueError/TypeError。
+    """
     epoch = doc["epoch"]
     if isinstance(epoch, bool) or not isinstance(epoch, int):
         raise TypeError(
@@ -6192,23 +6247,136 @@ def load_norm_checkpoint(data):
     lin_b = _parse_hex_tensor(
         linear_obj["bias"], 1, _CKPT_BIAS_SHAPE, "linear bias"
     )
+    return {
+        "epoch": int(epoch),
+        "conv_w": conv_w,
+        "conv_b": conv_b,
+        "gamma": gamma,
+        "beta": beta,
+        "running_mean": running_mean,
+        "running_var": running_var,
+        "lin_w": lin_w,
+        "lin_b": lin_b,
+        "dropout_state": dropout_state,
+    }
 
-    # 以 fitnorm 配置新建无缓存七层；构造参数均为新 list，外部无法触及。
-    conv = Conv2D(conv_w, conv_b)
-    bn = BatchNorm2D(gamma, beta, _NORM_EPS, _NORM_MOMENTUM)
+
+def _layers_from_checkpoint_state(state):
+    """以解析出的检查点状态新建无缓存训练态七层网络并返回 (layers, epoch)。"""
+    conv = Conv2D(state["conv_w"], state["conv_b"])
+    bn = BatchNorm2D(
+        state["gamma"], state["beta"], _NORM_EPS, _NORM_MOMENTUM
+    )
     dropout = Dropout(_NORM_DROPOUT_P, _NORM_DROPOUT_SEED)
     pool = MaxPool2D(2, 2, 0)
     flatten = Flatten()
-    linear = Linear(lin_w, lin_b)
+    linear = Linear(state["lin_w"], state["lin_b"])
     loss = SoftmaxCrossEntropy()
 
     # 构造后 running_mean/var 为默认 0/1：以检查点统计覆盖；
     # Dropout 的 LCG 状态恢复为 dropout_state（默认即训练态）。
-    bn.running_mean = running_mean
-    bn.running_var = running_var
-    dropout._s = dropout_state
+    bn.running_mean = state["running_mean"]
+    bn.running_var = state["running_var"]
+    dropout._s = state["dropout_state"]
 
-    return [conv, bn, dropout, pool, flatten, linear, loss], int(epoch)
+    return [conv, bn, dropout, pool, flatten, linear, loss], state["epoch"]
+
+
+def dump_data_checkpoint(layers, epoch, data_sha256):
+    """序列化 resumedata 检查点：绑定 DATA 身份（原始字节 SHA-256）。
+
+    与 dump_norm_checkpoint 的 model/dropout_state 契约完全一致，顶层键
+    依次为 version、data_sha256、epoch、model、dropout_state；version
+    固定为 int 1，data_sha256 须为 64 位小写十六进制 str（DATA 原始字节
+    的 SHA-256 摘要）。layers/epoch 的校验与异常同 dump_norm_checkpoint；
+    data_sha256 类型错抛 TypeError，摘要格式非法抛 ValueError。返回紧凑
+    UTF-8 JSON bytes（末尾 LF）；同一状态重复调用逐字节相同。
+    """
+    _validate_norm_checkpoint_layers(layers)
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        raise TypeError(
+            "epoch 必须是 int（拒绝 bool），得到 %s" % type(epoch).__name__
+        )
+    if epoch < 0:
+        raise ValueError("epoch 必须为非负整数")
+    if not isinstance(data_sha256, str):
+        raise TypeError(
+            "data_sha256 必须是 str，得到 %s" % type(data_sha256).__name__
+        )
+    if _SHA256_HEX_RE.match(data_sha256) is None:
+        raise ValueError(
+            "data_sha256 必须是 64 位小写十六进制 SHA-256 摘要：%r"
+            % data_sha256
+        )
+    conv, bn, dropout, _pool, _flatten, linear, _loss = layers
+
+    parts = []
+    parts.append('"version":' + str(int(_CKPT_DATA_VERSION)))
+    parts.append('"data_sha256":' + json.dumps(data_sha256))
+    parts.append('"epoch":' + str(int(epoch)))
+    parts.append(_dump_checkpoint_model_text(conv, bn, linear))
+    parts.append('"dropout_state":' + str(int(dropout._s)))
+    text = "{" + ",".join(parts) + "}\n"
+    return text.encode("utf-8")
+
+
+def load_data_checkpoint(data, data_sha256):
+    """从 dump_data_checkpoint 的 bytes 重建无缓存训练态七层网络。
+
+    校验与 load_norm_checkpoint 相同（UTF-8、JSON 常量、重复/错序键、
+    规范 hex、形状与范围），另要求顶层键依次为 version、data_sha256、
+    epoch、model、dropout_state：version 恰为 int 1（拒绝 bool），
+    data_sha256 为 64 位小写十六进制 str 且与实参 data_sha256 逐字符
+    相同，否则抛 ValueError（摘要不符）。实参 data_sha256 非 str 抛
+    TypeError。返回 (layers, epoch)，结构与 load_norm_checkpoint 一致。
+    """
+    if not isinstance(data, bytes):
+        raise TypeError(
+            "data 必须是 bytes，得到 %s" % type(data).__name__
+        )
+    if not isinstance(data_sha256, str):
+        raise TypeError(
+            "data_sha256 必须是 str，得到 %s" % type(data_sha256).__name__
+        )
+    text = data.decode("utf-8")
+    _reject_json_constants(data)
+    doc = json.loads(
+        text, object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("检查点顶层必须是 JSON 对象")
+    if list(doc.keys()) != _CKPT_DATA_TOP_KEYS:
+        raise ValueError(
+            "检查点顶层键必须依次为 version、data_sha256、epoch、"
+            "model、dropout_state"
+        )
+
+    version = doc["version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(
+            "version 必须是 int，得到 %s" % type(version).__name__
+        )
+    if version != _CKPT_DATA_VERSION:
+        raise ValueError(
+            "version 必须为 %d，得到 %r" % (_CKPT_DATA_VERSION, version)
+        )
+
+    digest = doc["data_sha256"]
+    if not isinstance(digest, str):
+        raise TypeError(
+            "data_sha256 必须是 JSON 字符串，得到 %s"
+            % type(digest).__name__
+        )
+    if _SHA256_HEX_RE.match(digest) is None:
+        raise ValueError(
+            "data_sha256 必须是 64 位小写十六进制 SHA-256 摘要：%r"
+            % digest
+        )
+    if digest != data_sha256:
+        raise ValueError("检查点 data_sha256 与 DATA 摘要不符")
+
+    state = _parse_norm_checkpoint_state(doc)
+    return _layers_from_checkpoint_state(state)
 
 
 def _parse_resume_epochs(text):
@@ -6277,12 +6445,77 @@ def _cmd_resumenorm(input_path, epochs_text, output_path):
     return 0
 
 
+def _cmd_resumedata(data_path, input_path, epochs_text, output_path):
+    """resumedata 子命令主体；成功 0、契约/轮数/摘要非法等失败返回 1。
+
+    DATA 沿用 fitdata 契约，其身份为文件原始字节的 SHA-256 小写 hex。
+    INPUT 为 "-" 时以 fitnorm 初值新建训练态七层、start=0；否则读取其
+    全部字节交 load_data_checkpoint 加载（检查点 data_sha256 须与 DATA
+    摘要逐字符相同），以检查点 epoch 为 start。以 lr=0.1 在该 DATA 上
+    追加 EPOCHS 轮 train_norm；EPOCHS=0 时不训练、不刷新统计，状态原样
+    保持。OUTPUT 写出 dump_data_checkpoint(layers, start+EPOCHS, digest)
+    的字节，原子替换；成功后标准输出为紧凑 JSON 加 LF，键序
+    start_epoch、added_epochs、loss（int、int、本段逐轮更新前批均损失
+    float 列表，固定 12 位小数、负零归零）。任一失败标准输出为空且不改
+    OUTPUT。
+    """
+    try:
+        if os.path.abspath(data_path) == os.path.abspath(output_path):
+            raise ValueError("DATA 与 OUTPUT 不能是同一路径")
+        if input_path != "-" and os.path.abspath(input_path) == os.path.abspath(
+            output_path
+        ):
+            raise ValueError("INPUT 与 OUTPUT 不能是同一路径")
+        epochs = _parse_resume_epochs(epochs_text)
+
+        with open(data_path, "rb") as f:
+            data_raw = f.read()
+        digest = hashlib.sha256(data_raw).hexdigest()
+        x, labels = _parse_fitdata(data_raw)
+
+        if input_path == "-":
+            layers = _build_norm_layers()
+            start = 0
+        else:
+            with open(input_path, "rb") as f:
+                checkpoint_raw = f.read()
+            layers, start = load_data_checkpoint(checkpoint_raw, digest)
+
+        if epochs == 0:
+            # 0 轮：不训练、不做末次 BN 刷新，状态与检查点/初值逐位一致。
+            losses = []
+        else:
+            losses = train_norm(
+                layers, x, labels, epochs=epochs, lr=_NORM_LR
+            )
+        losses = [float(v) for v in losses]
+        for v in losses:
+            if not math.isfinite(v):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+        payload = dump_data_checkpoint(layers, start + epochs, digest)
+        report = {
+            "start_epoch": start,
+            "added_epochs": epochs,
+            "loss": losses,
+        }
+        report_text = (_dump_compact(report) + "\n").encode("utf-8")
+
+        # 原子替换成功后才向标准输出写报告，保证失败时 stdout 为空。
+        _atomic_write_output(output_path, payload)
+        sys.stdout.buffer.write(report_text)
+        sys.stdout.buffer.flush()
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
     evaldata/predictdata WEIGHTS DATA OUTPUT、benchmark_data TRAIN VAL
-    OUTPUT、gradcheck CONFIG OUTPUT、convcheck CONFIG OUTPUT 与
-    resumenorm INPUT EPOCHS OUTPUT。
+    OUTPUT、gradcheck CONFIG OUTPUT、convcheck CONFIG OUTPUT、
+    resumenorm INPUT EPOCHS OUTPUT 与 resumedata DATA INPUT EPOCHS OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -6316,6 +6549,8 @@ def main(argv):
         return _cmd_convcheck(argv[2], argv[3])
     if len(argv) == 5 and argv[1] == "resumenorm":
         return _cmd_resumenorm(argv[2], argv[3], argv[4])
+    if len(argv) == 6 and argv[1] == "resumedata":
+        return _cmd_resumedata(argv[2], argv[3], argv[4], argv[5])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -6332,6 +6567,7 @@ def main(argv):
         "gradcheck",
         "convcheck",
         "resumenorm",
+        "resumedata",
     ):
         return 2
     # 其他入口保持现状（信息打印）。

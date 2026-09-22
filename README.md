@@ -4,6 +4,7 @@
 
 - 入口：`python convnet.py <子命令>`
 - 检查点续训：`python convnet.py resumenorm INPUT EPOCHS OUTPUT`（INPUT 为 `-` 时从 fitnorm 初值开始）。
+- 数据绑定检查点续训：`python convnet.py resumedata DATA INPUT EPOCHS OUTPUT`（DATA 沿用 fitdata 契约，身份为原始字节 SHA-256；INPUT 为 `-` 时从 fitnorm 初值开始）。
 - 训练必须完全确定：相同种子、相同数据与超参数产生逐字节相同的权重与指标。
 - 数据集与权重全部来自仓库内的本地文件，不下载任何外部资源。
 
