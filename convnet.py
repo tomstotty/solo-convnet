@@ -1,9 +1,10 @@
 """convnet.py — 从零实现的卷积神经网络组件（仅 Python 标准库）。
 
 当前提供：
-- Conv2D 层：NCHW 嵌套 list、互相关（不翻转核）、零补边；stride 可为
-  正 int 或 (SH, SW) tuple，padding 可为非负 int 或 (PT,PB,PL,PR) tuple，
-  dilation 可为正 int 或 (DH, DW) tuple。
+- Conv2D 层：NCHW 嵌套 list、互相关（不翻转核）、零补边、分组卷积
+  （groups 为正 int，输出通道 o 只连接其所在组的 C/G 个输入通道）；
+  stride 可为正 int 或 (SH, SW) tuple，padding 可为非负 int 或
+  (PT,PB,PL,PR) tuple，dilation 可为正 int 或 (DH, DW) tuple。
 - MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较。
 - Flatten 层：NCHW 嵌套 list 展平为 [N][C*H*W]（按 c→h→w 顺序）。
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
@@ -283,10 +284,28 @@ def _zeros(shape):
     return [_zeros(shape[1:]) for _ in range(shape[0])]
 
 
-class Conv2D:
-    """二维互相关层（NCHW，嵌套 list，零补边）。
+def _check_groups(value):
+    """校验 Conv2D 分组数：正 int（拒绝 bool），类型错抛 TypeError。
 
-    weights: [O][C][KH][KW]，bias: [O]，输入 x: [N][C][H][W]。
+    非正 int 抛 ValueError。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            "groups 必须是 int，得到 %s" % type(value).__name__
+        )
+    if value <= 0:
+        raise ValueError("groups 必须为正整数")
+    return value
+
+
+class Conv2D:
+    """二维分组互相关层（NCHW，嵌套 list，零补边）。
+
+    groups: 正 int（拒绝 bool），把通道分为 G 组。weights:
+    [O][C/G][KH][KW]，bias: [O]，输入 x: [N][C][H][W]；C、O 均须被 G
+    整除（O 在构造时校验，C 在 forward 时校验）。输出通道 o 归组
+    g = o // (O/G)，只连接输入通道 [g*C/G, (g+1)*C/G)；weights[o][ci]
+    对应组内第 ci 个输入通道（全局第 g*C/G+ci 个），组间无连接。
     stride: 正 int（展开为 (S, S)）或恰含 (SH, SW) 的正 int tuple。
     padding: 非负 int（展开为 (P, P, P, P)）或恰含
     (PT, PB, PL, PR) 的非负 int tuple，分别为上/下/左/右补边。
@@ -296,10 +315,12 @@ class Conv2D:
     有效核大于补边后输入抛 ValueError，不能整除时舍弃底部或右侧余量。
     """
 
-    def __init__(self, weights, bias, stride=1, padding=0, dilation=1):
+    def __init__(self, weights, bias, stride=1, padding=0, dilation=1,
+                 groups=1):
         sh_, sw_ = _check_stride2d(stride)
         pt_, pb_, pl_, pr_ = _check_padding2d(padding)
         dh_, dw_ = _check_dilation2d(dilation)
+        groups_ = _check_groups(groups)
 
         _require_list(weights, "weights")
         _require_list(bias, "bias")
@@ -310,25 +331,37 @@ class Conv2D:
                 "bias 长度 %d 与 weights 输出通道数 %d 不符"
                 % (b_shape[0], w_shape[0])
             )
+        if w_shape[0] % groups_ != 0:
+            raise ValueError(
+                "输出通道数 %d 不能被 groups %d 整除"
+                % (w_shape[0], groups_)
+            )
 
         self._weights = weights
         self._bias = bias
         self._stride = (sh_, sw_)
         self._padding = (pt_, pb_, pl_, pr_)
         self._dilation = (dh_, dw_)
-        self._w_shape = w_shape  # (O, C, KH, KW)
+        self._groups = groups_
+        self._w_shape = w_shape  # (O, C/G, KH, KW)
 
         self._x = None           # 最近一次成功 forward 的输入
         self._out_shape = None   # 最近一次成功 forward 的输出形状
 
     def forward(self, x):
-        """对 x: [N][C][H][W] 做零补边互相关，返回嵌套 list 并缓存输入。"""
+        """对 x: [N][C][H][W] 做零补边分组互相关，返回嵌套 list 并缓存输入。"""
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
         o_ch, w_c, kh_, kw_ = self._w_shape
-        if c_ != w_c:
+        groups_ = self._groups
+        if c_ % groups_ != 0:
             raise ValueError(
-                "输入通道数 %d 与 weights 通道数 %d 不符" % (c_, w_c)
+                "输入通道数 %d 不能被 groups %d 整除" % (c_, groups_)
+            )
+        if c_ // groups_ != w_c:
+            raise ValueError(
+                "每组输入通道数 %d 与 weights 通道数 %d 不符"
+                % (c_ // groups_, w_c)
             )
         sh_, sw_ = self._stride
         pt_, pb_, pl_, pr_ = self._padding
@@ -347,15 +380,16 @@ class Conv2D:
             out_n = []
             for o in range(o_ch):
                 out_o = []
+                c_start = (o // (o_ch // groups_)) * w_c
                 for oh in range(oh_):
                     row = []
                     base_h = oh * sh_ - pt_
                     for ow in range(ow_):
                         base_w = ow * sw_ - pl_
                         acc = bias[o]
-                        for c in range(c_):
-                            x_c = x[n][c]
-                            w_c_o = weights[o][c]
+                        for ci in range(w_c):
+                            x_c = x[n][c_start + ci]
+                            w_c_o = weights[o][ci]
                             for kh in range(kh_):
                                 ih = base_h + kh * dh_
                                 if ih < 0 or ih >= h_:
@@ -395,7 +429,9 @@ class Conv2D:
         x = self._x
         weights = self._weights
         n_, o_ch, oh_, ow_ = self._out_shape
-        _, c_, kh_, kw_ = self._w_shape
+        _, w_c, kh_, kw_ = self._w_shape
+        groups_ = self._groups
+        c_ = w_c * groups_
         h_ = len(x[0][0])
         w_ = len(x[0][0][0])
         sh_, sw_ = self._stride
@@ -408,17 +444,19 @@ class Conv2D:
 
         for n in range(n_):
             for o in range(o_ch):
+                c_start = (o // (o_ch // groups_)) * w_c
                 for oh in range(oh_):
                     base_h = oh * sh_ - pt_
                     for ow in range(ow_):
                         g = dy[n][o][oh][ow]
                         db[o] += g
                         base_w = ow * sw_ - pl_
-                        for c in range(c_):
+                        for ci in range(w_c):
+                            c = c_start + ci
                             x_c = x[n][c]
                             dx_c = dx[n][c]
-                            w_c_o = weights[o][c]
-                            dw_c_o = dw[o][c]
+                            w_c_o = weights[o][ci]
+                            dw_c_o = dw[o][ci]
                             for kh in range(kh_):
                                 ih = base_h + kh * dh_
                                 if ih < 0 or ih >= h_:
