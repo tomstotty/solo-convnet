@@ -1,4 +1,4 @@
-"""fitnorm/evalnorm 子命令的可发现测试（仅标准库）。
+"""fitnorm/evalnorm/resumenorm 子命令的可发现测试（仅标准库）。
 
 覆盖：
 - fitnorm 训练→evalnorm 评估的完整成功路径与产物键序/类型/形状契约；
@@ -6,12 +6,16 @@
 - 重复运行逐字节相同；
 - evalnorm 拒绝重复/缺失/额外/错序键、类型/形状错误与非有限值，
   失败退出 1 且不改动 OUTPUT；
+- resumenorm 分段续训与总轮数连续训练的 loss 逐项、检查点逐字节相同，
+  0 轮保持状态，JSON/轮数/路径等失败退出 1、空 stdout、不改 OUTPUT，
+  参数数目错退出 2；load_norm_checkpoint 拒绝 JSON 常量与非规范 hex；
 - 参数数目错误退出 2；
 - 其余既有入口 train/evaluate/fitcnn/evalcnn 仍可成功运行。
 """
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -319,6 +323,268 @@ class FitNormTests(unittest.TestCase):
         self.assertEqual(_run("fitnorm", "a", "b")[0], 2)
         self.assertEqual(_run("evalnorm", "w")[0], 2)
         self.assertEqual(_run("evalnorm")[0], 2)
+
+
+class ResumeNormTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        sys.path.insert(0, _HERE)
+        import convnet
+        self.convnet = convnet
+
+    def tearDown(self):
+        sys.path.pop(0)
+        self._tmp.cleanup()
+
+    def _path(self, name):
+        return os.path.join(self.tmp, name)
+
+    def _resume(self, inp, epochs, out_name="out.json"):
+        return _run("resumenorm", inp, str(epochs), self._path(out_name))
+
+    def test_fresh_run_contract(self):
+        rc, out, err = self._resume("-", 5, "c5.json")
+        self.assertEqual(rc, 0, err.decode())
+        self.assertTrue(out.endswith(b"\n"))
+        doc = json.loads(out.decode("utf-8"))
+        self.assertEqual(
+            list(doc.keys()), ["start_epoch", "added_epochs", "loss"]
+        )
+        self.assertIs(doc["start_epoch"], 0)
+        self.assertIs(doc["added_epochs"], 5)
+        self.assertEqual(len(doc["loss"]), 5)
+        for v in doc["loss"]:
+            self.assertIsInstance(v, float)
+            self.assertNotIsInstance(v, bool)
+        # 固定 12 位小数：loss 数组中的每个数恰含 12 位小数、紧凑无空格。
+        text = out.decode("utf-8")
+        self.assertNotIn(" ", text)
+        m = re.search(r'"loss":\[(.*?)\]}\n$', text)
+        self.assertIsNotNone(m)
+        tokens = m.group(1).split(",") if m.group(1) else []
+        self.assertEqual(len(tokens), 5)
+        for token in tokens:
+            self.assertRegex(token, r"^-?[0-9]+\.[0-9]{12}$")
+        # 负零归零：文本中不得出现 -0.000000000000。
+        self.assertNotIn("-0.000000000000", text)
+        # OUTPUT 为合法检查点，epoch=5。
+        with open(self._path("c5.json"), "rb") as f:
+            layers, epoch = self.convnet.load_norm_checkpoint(f.read())
+        self.assertEqual(epoch, 5)
+        self.assertEqual(len(layers), 7)
+
+    def test_segmented_matches_continuous(self):
+        rc1, out1, err1 = self._resume("-", 3, "c3.json")
+        rc2, out2, err2 = _run(
+            "resumenorm", self._path("c3.json"), "2", self._path("c5.json")
+        )
+        rc3, out3, err3 = self._resume("-", 5, "c5cont.json")
+        self.assertEqual((rc1, rc2, rc3), (0, 0, 0),
+                         err1 + err2 + err3)
+        # 检查点逐字节相同。
+        with open(self._path("c5.json"), "rb") as f:
+            seg = f.read()
+        with open(self._path("c5cont.json"), "rb") as f:
+            cont = f.read()
+        self.assertEqual(seg, cont)
+        # 分段 loss 拼接后逐项相同。
+        l1 = json.loads(out1.decode())["loss"]
+        l2 = json.loads(out2.decode())["loss"]
+        l3 = json.loads(out3.decode())["loss"]
+        self.assertEqual(json.loads(out2.decode())["start_epoch"], 3)
+        self.assertEqual(l1 + l2, l3)
+
+    def test_long_chain_matches_continuous(self):
+        self.assertEqual(self._resume("-", 3, "a.json")[0], 0)
+        rc, _, err = _run(
+            "resumenorm", self._path("a.json"), "2", self._path("b.json")
+        )
+        self.assertEqual(rc, 0, err.decode())
+        rc, _, err = _run(
+            "resumenorm", self._path("b.json"), "15", self._path("c20.json")
+        )
+        self.assertEqual(rc, 0, err.decode())
+        rc, _, err = self._resume("-", 20, "r20.json")
+        self.assertEqual(rc, 0, err.decode())
+        with open(self._path("c20.json"), "rb") as f:
+            a = f.read()
+        with open(self._path("r20.json"), "rb") as f:
+            b = f.read()
+        self.assertEqual(a, b)
+
+    def test_zero_epochs_preserves_state(self):
+        self.assertEqual(self._resume("-", 3, "c3.json")[0], 0)
+        with open(self._path("c3.json"), "rb") as f:
+            before = f.read()
+        rc, out, err = _run(
+            "resumenorm", self._path("c3.json"), "0", self._path("c3z.json")
+        )
+        self.assertEqual(rc, 0, err.decode())
+        doc = json.loads(out.decode())
+        self.assertEqual(doc["start_epoch"], 3)
+        self.assertIs(doc["added_epochs"], 0)
+        self.assertEqual(doc["loss"], [])
+        with open(self._path("c3z.json"), "rb") as f:
+            self.assertEqual(f.read(), before)
+
+        # 从初值 0 轮：检查点等于初值网络的直接 dump。
+        rc, _, err = self._resume("-", 0, "init.json")
+        self.assertEqual(rc, 0, err.decode())
+        ref = self.convnet.dump_norm_checkpoint(
+            self.convnet._build_norm_layers(), 0
+        )
+        with open(self._path("init.json"), "rb") as f:
+            self.assertEqual(f.read(), ref)
+
+    def test_bad_epochs_fail_without_touching_output(self):
+        sentinel = b"UNCHANGED-SENTINEL"
+        bad_epochs = ("01", "00", "-1", "+1", "1.0", "abc", "",
+                      " 1", "1 ", "0x1", "1_00", "1e0")
+        for idx, epochs in enumerate(bad_epochs):
+            out_path = self._path("e%d.out" % idx)
+            with open(out_path, "wb") as f:
+                f.write(sentinel)
+            rc, stdout, _ = _run("resumenorm", "-", epochs, out_path)
+            self.assertEqual(rc, 1, "应拒绝 EPOCHS=%r" % epochs)
+            self.assertEqual(stdout, b"")
+            with open(out_path, "rb") as f:
+                self.assertEqual(f.read(), sentinel)
+
+    def test_bad_or_missing_input(self):
+        sentinel = b"UNCHANGED-SENTINEL"
+        good_rc, _, _ = self._resume("-", 1, "c1.json")
+        self.assertEqual(good_rc, 0)
+        with open(self._path("c1.json"), "rb") as f:
+            good = f.read()
+
+        variants = {
+            "missing": None,
+            "bad_json": b"{not json",
+            "nan": good.replace(b'"epoch":1', b'"epoch":NaN'),
+            "infinity": good.replace(b'"epoch":1', b'"epoch":Infinity'),
+            "minus_infinity":
+                good.replace(b'"epoch":1', b'"epoch":-Infinity'),
+        }
+        # 非规范 hex 叶值。
+        doc = json.loads(good.decode())
+        doc["model"]["conv"]["values"][0][0][0][0] = "0X1.0P+0"
+        variants["uppercase_hex"] = json.dumps(
+            doc, separators=(",", ":")
+        ).encode()
+        doc = json.loads(good.decode())
+        doc["model"]["conv"]["values"][0][0][0][0] = "-0x0.0p+0"
+        variants["neg_zero_hex"] = json.dumps(
+            doc, separators=(",", ":")
+        ).encode()
+
+        for name, payload in variants.items():
+            in_path = self._path("in_%s.json" % name)
+            if payload is not None:
+                with open(in_path, "wb") as f:
+                    f.write(payload)
+            out_path = self._path("out_%s.bin" % name)
+            with open(out_path, "wb") as f:
+                f.write(sentinel)
+            rc, stdout, _ = _run("resumenorm", in_path, "1", out_path)
+            self.assertEqual(rc, 1, "应拒绝输入：%s" % name)
+            self.assertEqual(stdout, b"")
+            with open(out_path, "rb") as f:
+                self.assertEqual(
+                    f.read(), sentinel, "不得改写 OUTPUT：%s" % name
+                )
+
+    def test_path_conflict_and_argc(self):
+        self.assertEqual(self._resume("-", 1, "same.json")[0], 0)
+        rc, stdout, _ = _run(
+            "resumenorm", self._path("same.json"), "1", self._path("same.json")
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout, b"")
+
+        self.assertEqual(_run("resumenorm")[0], 2)
+        self.assertEqual(_run("resumenorm", "-")[0], 2)
+        self.assertEqual(_run("resumenorm", "-", "3")[0], 2)
+        self.assertEqual(
+            _run("resumenorm", "-", "3", "o", "extra")[0], 2
+        )
+
+
+class NormCheckpointStrictTests(unittest.TestCase):
+    """load_norm_checkpoint：JSON 常量与规范 hex 的直接 API 测试。"""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, _HERE)
+        import convnet
+        cls.convnet = convnet
+        x, labels = convnet._load_cnn_samples()
+        layers = convnet._build_norm_layers()
+        convnet.train_norm_step(layers, x, labels, 0.1)
+        cls.good = convnet.dump_norm_checkpoint(layers, 1)
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.path.pop(0)
+
+    def _load(self, data):
+        return self.convnet.load_norm_checkpoint(data)
+
+    def test_roundtrip(self):
+        layers, epoch = self._load(self.good)
+        self.assertEqual(epoch, 1)
+        self.assertEqual(len(layers), 7)
+        # 重复 dump 逐字节一致。
+        self.assertEqual(
+            self.convnet.dump_norm_checkpoint(layers, epoch), self.good
+        )
+
+    def test_rejects_non_bytes(self):
+        with self.assertRaises(TypeError):
+            self._load(self.good.decode("utf-8"))
+
+    def test_rejects_json_constants(self):
+        for token in (b"NaN", b"Infinity", b"-Infinity"):
+            bad = self.good.replace(b'"epoch":1', b'"epoch":' + token)
+            with self.assertRaises(ValueError, msg=token):
+                self._load(bad)
+            # 常量出现在 dropout_state 标量位置同样先于解析被拒绝。
+            bad2 = re.sub(
+                rb'"dropout_state":\d+',
+                b'"dropout_state":' + token,
+                self.good,
+            )
+            with self.assertRaises(ValueError, msg=token):
+                self._load(bad2)
+
+    def test_constant_inside_string_is_not_scalar(self):
+        # 字符串字面量内的 NaN/Infinity 不得被误判为 JSON 常量；
+        # 但作为 hex 叶值仍因非规范而 ValueError。
+        doc = json.loads(self.good.decode())
+        doc["model"]["conv"]["values"][0][0][0][0] = "NaN"
+        payload = json.dumps(doc, separators=(",", ":")).encode()
+        with self.assertRaises(ValueError):
+            self._load(payload)
+
+    def test_rejects_noncanonical_hex(self):
+        for spelling in (
+            "0X1.0P+0", "0x1.0000p+0", "0x2.0p-1", "0x.8p+0",
+            "1.0", "-0x0.0p+0", "0x0.0p-0", "0x1p+0", "0x1.0P+0",
+            "+0x1.0p+0", "0x1.0p0", "0xa.0p+0", " 0x1.0p+0",
+            "0x1.0p+0 ", "0x1.0p+00",
+        ):
+            doc = json.loads(self.good.decode())
+            doc["model"]["conv"]["values"][0][0][0][0] = spelling
+            payload = json.dumps(doc, separators=(",", ":")).encode()
+            with self.assertRaises(ValueError, msg=spelling):
+                self._load(payload)
+
+    def test_canonical_zero_accepted(self):
+        doc = json.loads(self.good.decode())
+        doc["model"]["conv"]["values"][0][0][0][0] = "0x0.0p+0"
+        payload = json.dumps(doc, separators=(",", ":")).encode()
+        layers, _ = self._load(payload)
+        self.assertEqual(layers[0]._weights[0][0][0][0], 0.0)
 
 
 class ExistingEntryTests(unittest.TestCase):

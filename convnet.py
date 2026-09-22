@@ -147,6 +147,25 @@
   backward{dx,dweights,dbias}、check{ok,max_e,max_r}（张量叶值均为
   有限 float）以紧凑 JSON 原子写入 OUTPUT；ok 真退出 0、假退出 1
   （仍写盘），CONFIG/OUTPUT 同路径或其余失败退出 1 且不改 OUTPUT。
+- `python convnet.py resumenorm INPUT EPOCHS OUTPUT`：从检查点续训
+  fitnorm 同构的七层网络。INPUT 为 "-" 时以 fitnorm 初值新建训练态
+  网络、start_epoch=0；否则读取其全部字节交 load_norm_checkpoint 加载，
+  start_epoch 取检查点 epoch。EPOCHS 须为 "0" 或无前导零 ASCII 正整数；
+  沿用 fitnorm 对 data/tiny.csv 的严格校验，以 lr=0.1 调用 train_norm
+  追加 EPOCHS 轮（0 轮不训练、不刷新统计，状态原样保持）。OUTPUT 写出
+  dump_norm_checkpoint(layers, start_epoch+EPOCHS) 的字节，原子替换；
+  成功时标准输出为紧凑 JSON 加 LF，键依次为 start_epoch、added_epochs、
+  loss，前两者为 int，loss 为本段逐轮更新前批均损失的 float 列表
+  （固定 12 位小数、负零归零）。分段续训拼接的 loss 与最终检查点分别
+  与总轮数连续训练逐项、逐字节相同。输入不可读、契约或轮数非法、非有限
+  计算、INPUT/OUTPUT 路径冲突或 I/O 失败均退出 1，标准输出为空且不改
+  OUTPUT；参数数目错退出 2。
+- dump_norm_checkpoint(layers, epoch)：序列化 fitnorm 训练态七层网络与
+  epoch 为紧凑 JSON bytes（末尾 LF）；load_norm_checkpoint(data) 从其
+  bytes 重建无缓存训练态七层网络与 epoch，拒绝 JSON 常量
+  NaN/Infinity/-Infinity，hex 叶值仅接受 dump_norm_checkpoint 的规范
+  小写串（负零仅 "0x0.0p+0"），其余契约/类型/形状错误分别抛
+  ValueError/TypeError/UnicodeDecodeError。
 """
 
 import json
@@ -5827,6 +5846,22 @@ _CKPT_LINEAR_W_SHAPE = (2, 2)
 # 十进制写法（"1.0"）、inf/nan 或下划线。float.fromhex 比该语法更宽松，
 # 故先以此正则把关再交 fromhex 取值。
 _HEX_FLOAT_RE = re.compile(r"\A-?0x[0-9a-f]\.[0-9a-f]+p[+-][0-9]+\Z")
+# resumenorm 的 EPOCHS：仅 "0" 或无前导零 ASCII 正整数（拒绝 +1、01、
+# 负数、空白、全角数字等任何其他拼写）。
+_RESUME_EPOCHS_RE = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
+# 标准 json 以 NaN/Infinity/-Infinity 为合法标量（非标准扩展），检查点
+# 一律拒绝；逐字节扫描时跳过字符串字面量，避免键名/取值中的字符误判。
+_JSON_TOKEN_RE = re.compile(
+    rb'"(?:[^"\\]|\\.)*"|(-?Infinity|NaN)|.',
+    re.DOTALL,
+)
+
+
+def _reject_json_constants(data):
+    """拒绝 JSON 文本中的 NaN/Infinity/-Infinity 常量，跳过字符串字面量。"""
+    for match in _JSON_TOKEN_RE.finditer(data):
+        if match.group(1) is not None:
+            raise ValueError("JSON 不允许 NaN/Infinity/-Infinity 常量")
 
 
 def _validate_norm_checkpoint_layers(layers):
@@ -6007,8 +6042,9 @@ def _parse_hex_tensor(node, depth, shape, name):
     """解析并校验 depth 层嵌套 list，叶为 hex 字符串，返回新 float 张量。
 
     容器类型错抛 TypeError；形状不符（空维/不规则/尺寸不符）抛
-    ValueError；叶非 str、非 float.hex() 严格语法、非法 hex 或非有限值
-    （含指数越界）抛 ValueError。
+    ValueError；叶非 str、非 float.hex() 严格语法、非 dump_norm_checkpoint
+    规范小写串（负零仅 "0x0.0p+0"）、非法 hex 或非有限值（含指数越界）
+    抛 ValueError。
     """
     if depth == 0:
         if isinstance(node, list):
@@ -6029,6 +6065,17 @@ def _parse_hex_tensor(node, depth, shape, name):
             raise ValueError("%s 的十六进制浮点越界：%r" % (name, node))
         if not math.isfinite(value):
             raise ValueError("%s 含有非有限值（NaN/inf）" % name)
+        # 仅接受 dump_norm_checkpoint 产出的规范串：与 float.hex() 逐字符
+        # 相同（唯一小写、指数符号齐全、去前导零），负零唯一写法为
+        # 0x0.0p+0（float.hex() 的 -0x0.0p+0 同样被规范化）。
+        canonical = value.hex()
+        if canonical == "-0x0.0p+0":
+            canonical = "0x0.0p+0"
+        if canonical != node:
+            raise ValueError(
+                "%s 含非规范十六进制浮点（只接受 dump_norm_checkpoint 的"
+                " 规范小写串）：%r" % (name, node)
+            )
         return value
     if not isinstance(node, list):
         raise TypeError(
@@ -6049,8 +6096,10 @@ def load_norm_checkpoint(data):
 
     data 必须是 bytes（bytearray 等其他类型一律 TypeError）。其内容须为
     UTF-8 编码的检查点 JSON：非法 UTF-8 抛 UnicodeDecodeError；JSON
-    语法错、重复/缺失/额外/错序键、非法 hex、形状/范围错或非有限值抛
-    ValueError，容器或字段类型错抛 TypeError。
+    语法错、JSON 常量 NaN/Infinity/-Infinity、重复/缺失/额外/错序键、
+    非法或非规范 hex（仅接受 dump_norm_checkpoint 的规范小写串，负零仅
+    "0x0.0p+0"）、形状/范围错或非有限值抛 ValueError，容器或字段类型
+    错抛 TypeError。
 
     返回 (layers, epoch)：layers 为七层新 list
     （Conv2D/BatchNorm2D/Dropout/MaxPool2D/Flatten/Linear/
@@ -6066,8 +6115,11 @@ def load_norm_checkpoint(data):
             "data 必须是 bytes，得到 %s" % type(data).__name__
         )
     # 非法 UTF-8 原样抛 UnicodeDecodeError（strict 为默认行为）。
+    text = data.decode("utf-8")
+    # json 接受非标准的 NaN/Infinity 常量，先逐字节拒绝（跳过字符串）。
+    _reject_json_constants(data)
     doc = json.loads(
-        data.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+        text, object_pairs_hook=_reject_duplicate_keys
     )
     if not isinstance(doc, dict):
         raise TypeError("检查点顶层必须是 JSON 对象")
@@ -6159,11 +6211,78 @@ def load_norm_checkpoint(data):
     return [conv, bn, dropout, pool, flatten, linear, loss], int(epoch)
 
 
+def _parse_resume_epochs(text):
+    """解析 resumenorm 的 EPOCHS：仅接受 "0" 或无前导零 ASCII 正整数。"""
+    if _RESUME_EPOCHS_RE.match(text) is None:
+        raise ValueError("EPOCHS 必须为 0 或无前导零的正整数：%r" % text)
+    return int(text)
+
+
+def _cmd_resumenorm(input_path, epochs_text, output_path):
+    """resumenorm 子命令主体；成功 0、契约/轮数非法等失败返回 1。
+
+    INPUT 为 "-" 时以 fitnorm 初值新建训练态七层、start=0；否则读取其
+    全部字节交 load_norm_checkpoint 加载并以检查点 epoch 为 start。数据
+    沿用 fitnorm 对 data/tiny.csv 的严格校验，以 lr=0.1 追加 EPOCHS 轮
+    train_norm；EPOCHS=0 时不训练、不刷新统计，状态原样保持。OUTPUT
+    写出 dump_norm_checkpoint(layers, start+EPOCHS) 的字节，原子替换；
+    成功后标准输出为紧凑 JSON 加 LF，键序 start_epoch、added_epochs、
+    loss（前两者 int，loss 为本段逐轮更新前批均损失，固定 12 位小数、
+    负零归零）。任一失败标准输出为空且不改 OUTPUT。
+    """
+    try:
+        if input_path != "-" and os.path.abspath(input_path) == os.path.abspath(
+            output_path
+        ):
+            raise ValueError("INPUT 与 OUTPUT 不能是同一路径")
+        epochs = _parse_resume_epochs(epochs_text)
+
+        if input_path == "-":
+            layers = _build_norm_layers()
+            start = 0
+        else:
+            with open(input_path, "rb") as f:
+                data = f.read()
+            layers, start = load_norm_checkpoint(data)
+
+        # 数据契约与 fitnorm 完全一致（逐字节校验 data/tiny.csv）。
+        x, labels = _load_cnn_samples()
+
+        if epochs == 0:
+            # 0 轮：不训练、不做末次 BN 刷新，状态与检查点/初值逐位一致。
+            losses = []
+        else:
+            losses = train_norm(
+                layers, x, labels, epochs=epochs, lr=_NORM_LR
+            )
+        losses = [float(v) for v in losses]
+        for v in losses:
+            if not math.isfinite(v):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+        payload = dump_norm_checkpoint(layers, start + epochs)
+        report = {
+            "start_epoch": start,
+            "added_epochs": epochs,
+            "loss": losses,
+        }
+        report_text = (_dump_compact(report) + "\n").encode("utf-8")
+
+        # 原子替换成功后才向标准输出写报告，保证失败时 stdout 为空。
+        _atomic_write_output(output_path, payload)
+        sys.stdout.buffer.write(report_text)
+        sys.stdout.buffer.flush()
+    except (_TrainDataError, ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
     evaldata/predictdata WEIGHTS DATA OUTPUT、benchmark_data TRAIN VAL
-    OUTPUT、gradcheck CONFIG OUTPUT 与 convcheck CONFIG OUTPUT。
+    OUTPUT、gradcheck CONFIG OUTPUT、convcheck CONFIG OUTPUT 与
+    resumenorm INPUT EPOCHS OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -6195,6 +6314,8 @@ def main(argv):
         return _cmd_gradcheck(argv[2], argv[3])
     if len(argv) == 4 and argv[1] == "convcheck":
         return _cmd_convcheck(argv[2], argv[3])
+    if len(argv) == 5 and argv[1] == "resumenorm":
+        return _cmd_resumenorm(argv[2], argv[3], argv[4])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -6210,6 +6331,7 @@ def main(argv):
         "predictdata",
         "gradcheck",
         "convcheck",
+        "resumenorm",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
