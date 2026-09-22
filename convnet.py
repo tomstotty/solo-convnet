@@ -77,6 +77,24 @@
   写盘，float 固定 12 位、负零归零、禁非有限、末尾 LF，相同基线逐字节
   一致；任一数据、计算、阈值、重载、路径冲突或 I/O 失败退出 1 且不改
   OUTPUT。
+- `python convnet.py benchmark_batches OUTPUT`：训练沿用 data/tiny.csv，
+  另以与其逐字节相同的 data/tiny-val.csv 为验证集（各自独立加载、绝不
+  混用）；以 fitnorm 初值、七层配置（Dropout seed=7）沿七层分批训练 API
+  原样调用 train_norm_batches(layers, x, labels, batch_size=1,
+  epochs=20, lr=0.1, seed=7, shuffle=True)，共 20 轮 × 2 批 = 40 项
+  更新前监控 loss（每批任何前向/更新前，以当前参数与 BN 运行统计在完整
+  训练集上做推理态批均 softmax 交叉熵；batch_size=1 时批内 BN 方差恒 0，
+  逐批训练损失不可用于衡量收敛）。要求 40 项 loss 末项严格小于首项、六组
+  参数至少一组改变；末批更新后按 fitnorm 同法以完整训练集训练态 BN 前向
+  刷新最终运行统计。model 写出前与序列化重载后均须通过严格契约校验，随后
+  以重载权重、BN 保存统计、Dropout 推理态在验证集预测（最大 logit 平局取
+  小类），预测须为 [0,1]、accuracy 为 1.0。OUTPUT 顶层键依次为 model、
+  metrics；model 沿用 fitnorm 逐层键序与形状、全叶值有限 float；metrics
+  键依次为 epochs、lr、seed、batch_size、shuffle、loss、predictions、
+  accuracy，取值依次为 int 20、float 0.1、int 7、int 1、bool 真、有限
+  float[40]、恰为 [0,1] 的 int 列表、float 1.0。紧凑 UTF-8 原子写盘，
+  float 固定 12 位、负零归零、禁非有限、末尾 LF，相同基线逐字节一致；任一
+  数据、计算、阈值、重载、路径冲突或 I/O 失败退出 1 且不改 OUTPUT。
 - load_benchmark(path)：读取完整 benchmark 产物，返回键序为 model、
   metrics 的新 dict（所有嵌套 dict/list 均深拷贝）；model 严格沿用
   benchmark 修复后的逐层键序、形状与全 float 契约，metrics 严格校验
@@ -84,6 +102,11 @@
   TypeError；文件不可读抛 OSError；非法 UTF-8 抛 UnicodeDecodeError；
   JSON 语法、重复/缺失/额外/错序键、形状、长度、取值或非有限错抛
   ValueError。
+- load_benchmark_batches(path)：读取完整 benchmark_batches 产物，返回
+  键序为 model、metrics 的新 dict（所有嵌套 dict/list 均深拷贝）；model
+  严格沿用 benchmark 的逐层键序、形状与全 float 契约，metrics 严格校验
+  键序、类型、形状/长度与取值（epochs、lr、seed、batch_size、shuffle、
+  loss[40]、predictions、accuracy）。异常类型同 load_benchmark。
 - `python convnet.py fitdata DATA OUTPUT`：读取本地 UTF-8 JSON DATA
   （键依次为 x、labels，x 为有限数的规则 list[N][1][2][2]、N≥2，
   labels 为等长 list、元素为 int 0/1），以 fitnorm 初值与七层配置
@@ -4009,6 +4032,403 @@ def load_benchmark(path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行分批训练：python convnet.py benchmark_batches OUTPUT
+# ---------------------------------------------------------------------------
+
+# benchmark_batches 产物的严格契约：顶层键依次为 model、metrics；model 严格
+# 沿用 benchmark/fitnorm 逐层键序、形状与全 float 契约；metrics 依次为
+# epochs=20(int)、lr=0.1(float)、seed=7(int)、batch_size=1(int)、
+# shuffle=true(bool)、loss 有限 float[40]、predictions 恰为 [0,1] 的 int
+# 列表、accuracy=1.0(float)。
+_BB_TOP_KEYS = ["model", "metrics"]
+_BB_METRICS_KEYS = [
+    "epochs", "lr", "seed", "batch_size", "shuffle",
+    "loss", "predictions", "accuracy",
+]
+_BB_BATCH_SIZE = 1
+_BB_LOSS_COUNT = _NORM_EPOCHS * 2   # 20 轮 × 每轮 2 批（N=2、batch_size=1）
+
+
+class _BatchMonitorConv2D(Conv2D):
+    """在每批前向前记录全集更新前监控 loss 的 Conv2D 子类。
+
+    batch_size=1 时批内 BatchNorm 方差恒为 0，train_norm_step 返回的逐批
+    损失不含可比较的收敛信息；故在七层链的第一层（Conv2D）前向入口、即
+    每批任何前向/更新发生之前，以当前参数与当前 BN 运行统计重建推理态网络
+    （BN 用 running_mean/running_var、Dropout 推理态），在【完整训练集】上
+    计算一次批均 softmax 交叉熵作为该批的更新前监控损失。该探测只读取当前
+    参数、另建临时层，绝不推进七层自身的任何缓存、BN 统计或 Dropout 随机
+    状态；训练本身完全由未经改动的 train_norm_batches 驱动。本类是真正的
+    Conv2D 子类，isinstance 校验与逐层 forward/backward 行为均不变。
+    """
+
+    def __init__(self, weights, bias, context):
+        super().__init__(weights, bias)
+        self._monitor_context = context
+
+    def forward(self, x):
+        self._monitor_context.record_full_loss()
+        return super().forward(x)
+
+
+class _BatchMonitorContext:
+    """持有七层链与完整训练集，供 _BatchMonitorConv2D 逐批记录监控 loss。"""
+
+    def __init__(self, layers, images, labels):
+        self._layers = layers
+        self._images = images
+        self._labels = labels
+        self.records = []
+
+    def record_full_loss(self):
+        layers = self._layers
+        conv, bn = layers[0], layers[1]
+        linear = layers[5]
+        # 仅读取当前参数与 running 统计，经推理态网络（BN 保存统计、Dropout
+        # 关闭）在完整训练集上前向；_norm_forward 内部自建全部临时层，与七
+        # 层链状态完全隔离，不留下任何缓存或随机推进。
+        logits, _, _ = _norm_forward(
+            conv._weights, conv._bias, bn._gamma, bn._beta,
+            bn.running_mean, bn.running_var,
+            linear._weights, linear._bias, self._images, False,
+        )
+        total = 0.0
+        n_ = len(self._images)
+        for n in range(n_):
+            row = logits[n]
+            m = row[0]
+            for o in range(1, _CNN_NUM_CLASSES):
+                if row[o] > m:
+                    m = row[o]
+            exps = []
+            denom = 0.0
+            for o in range(_CNN_NUM_CLASSES):
+                e = math.exp(row[o] - m)
+                exps.append(e)
+                denom += e
+            total += -math.log(exps[self._labels[n]] / denom)
+        self.records.append(total / n_)
+
+
+def _bench_batches_run():
+    """执行分批确定性训练并经序列化/重载后在验证集推理。
+
+    训练集与验证集分别经独立路径加载（先各自校验，再确认逐字节相同）。
+    七层链以 fitnorm 初值构建（Conv2D 换为逐批记录全集更新前监控 loss 的
+    _BatchMonitorConv2D 子类，Dropout seed=7），随后原样调用
+    train_norm_batches(layers, x, labels, batch_size=1, epochs=20, lr=0.1,
+    seed=7, shuffle=True)：20 轮、每轮 2 个大小 1 的批，共 40 项监控 loss。
+    训练后校验 40 项均有限且末项严格小于首项、六组参数至少一组相对初值
+    改变。batch_size=1 训练态 BN 每批方差为 0，running 统计退化为常数，故
+    末批更新后以全新 Conv2D 与训练态 BN 对完整训练集仅做一次前向，按
+    fitnorm 同法刷新最终 running_mean/running_var（momentum=1 即当批统计，
+    不经过 Dropout、不更新参数、不触发监控钩子）。随后 model 经严格契约
+    校验并深拷贝，再按同一转储/严格校验序列化为文本并重新加载，用重载得到
+    的权重与 BN 保存统计、Dropout 推理态在验证集上预测，逐样本取最大
+    logit、并列取较小类别，accuracy 必须为 1.0 且预测恰为 [0, 1]。
+    返回严格契约下的 model dict、40 项监控 loss、预测与 accuracy。
+    """
+    x, labels, train_bytes = _load_bench_samples(_BENCH_TRAIN_PATH)
+    x_val, val_labels, val_bytes = _load_bench_samples(_BENCH_VAL_PATH)
+    if val_bytes != train_bytes:
+        raise _BenchDataError("训练集与验证集字节内容不一致")
+
+    layers = _build_norm_layers()
+    conv, bn = layers[0], layers[1]
+
+    init_conv_w = _deep_copy(_CNN_CONV_INIT)
+    init_conv_b = [0.0] * _CNN_NUM_CLASSES
+    init_gamma = _deep_copy(_NORM_GAMMA_INIT)
+    init_beta = _deep_copy(_NORM_BETA_INIT)
+    init_lin_w = _deep_copy(_CNN_LINEAR_INIT)
+    init_lin_b = [0.0] * _CNN_NUM_CLASSES
+
+    # 第一层换为监控子类：真正的 Conv2D（七层 isinstance 校验不变），仅在
+    # 每批前向入口多读一次全集推理态监控 loss，不改变训练计算。
+    context = _BatchMonitorContext(layers, x, labels)
+    layers[0] = _BatchMonitorConv2D(conv._weights, conv._bias, context)
+    conv = layers[0]
+
+    # 沿七层分批训练 API 原样驱动全部更新（参数按题面逐字给出）。
+    train_norm_batches(
+        layers, x, labels,
+        batch_size=_BB_BATCH_SIZE, epochs=_NORM_EPOCHS, lr=_NORM_LR,
+        seed=_NORM_DROPOUT_SEED, shuffle=True,
+    )
+
+    losses = [float(v) for v in context.records]
+    for v in losses:
+        if not math.isfinite(v):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+    if len(losses) != _BB_LOSS_COUNT:
+        raise ValueError(
+            "监控 loss 项数 %d 与预期 %d 不符"
+            % (len(losses), _BB_LOSS_COUNT)
+        )
+    if not losses[-1] < losses[0]:
+        raise ValueError("末次 loss 未小于首次 loss")
+
+    conv_w = conv._weights
+    conv_b = conv._bias
+    gamma = bn._gamma
+    beta = bn._beta
+    lin_w = layers[5]._weights
+    lin_b = layers[5]._bias
+    changed = (
+        conv_w != init_conv_w or conv_b != init_conv_b
+        or gamma != init_gamma or beta != init_beta
+        or lin_w != init_lin_w or lin_b != init_lin_b
+    )
+    if not changed:
+        raise ValueError("训练后六组参数均未改变")
+
+    # 末批更新后以全新 Conv2D（非监控子类，不会再记录）与训练态 BN 对完整
+    # 训练集仅做一次前向，按 fitnorm 同法刷新最终 running 统计；不经过
+    # Dropout、不更新任何参数。batch_size=1 期间 running 方差恒为 0，必须
+    # 以全集统计替换，推理才有意义。
+    final_conv = Conv2D(conv_w, conv_b)
+    final_bn = BatchNorm2D(gamma, beta, _NORM_EPS, _NORM_MOMENTUM)
+    final_bn.forward(final_conv.forward(x))
+    running_mean = _deep_copy(final_bn.running_mean)
+    running_var = _deep_copy(final_bn.running_var)
+
+    # 写出前严格校验 model：逐层键序、形状，且每个叶值都是有限 float（拒绝
+    # int/bool）；返回深拷贝作为唯一参与序列化与返回的模型。
+    model = _parse_benchmark_model({
+        "conv": {"values": conv_w, "bias": conv_b},
+        "batchnorm": {
+            "gamma": gamma,
+            "beta": beta,
+            "running_mean": running_mean,
+            "running_var": running_var,
+        },
+        "linear": {"values": lin_w, "bias": lin_b},
+    })
+
+    # 按同一转储/严格校验路径序列化再重载，确保参与验证集推理的是重载后的
+    # 同构模型：逐键序、形状校验且每个叶值重载后仍为有限 float。
+    model_text = _dump_compact(model)
+    reloaded = _parse_benchmark_model(
+        json.loads(model_text, object_pairs_hook=_reject_duplicate_keys)
+    )
+    r_conv_w = reloaded["conv"]["values"]
+    r_conv_b = reloaded["conv"]["bias"]
+    r_gamma = reloaded["batchnorm"]["gamma"]
+    r_beta = reloaded["batchnorm"]["beta"]
+    r_mean = reloaded["batchnorm"]["running_mean"]
+    r_var = reloaded["batchnorm"]["running_var"]
+    r_lin_w = reloaded["linear"]["values"]
+    r_lin_b = reloaded["linear"]["bias"]
+
+    # 仅在验证集上以 BN 保存统计、Dropout 推理态预测（不接触训练集）。
+    logits, _, _ = _norm_forward(
+        r_conv_w, r_conv_b, r_gamma, r_beta,
+        r_mean, r_var, r_lin_w, r_lin_b,
+        x_val, False,
+    )
+    n_ = len(x_val)
+    predictions = []
+    correct = 0
+    for n in range(n_):
+        row = logits[n]
+        for o in range(_CNN_NUM_CLASSES):
+            if not math.isfinite(row[o]):
+                raise ValueError("验证计算产生非有限值（NaN/inf）")
+        # 并列取较小类别：自小类向大类扫描，仅严格更大才更换。
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        predictions.append(pred)
+        if pred == val_labels[n]:
+            correct += 1
+    accuracy = correct / n_
+    if predictions != [0, 1]:
+        raise ValueError("验证集预测必须为 [0, 1]")
+    if accuracy != 1.0:
+        raise ValueError("验证集 accuracy 不为 1.0")
+
+    return model, losses, predictions, accuracy
+
+
+def _parse_bb_metrics(metrics_obj):
+    """严格校验 benchmark_batches metrics，返回深拷贝的全新 metrics dict。
+
+    键依次为 epochs、lr、seed、batch_size、shuffle、loss、predictions、
+    accuracy；取值依次为 int 20、float 0.1、int 7、int 1、bool 真、长度
+    40 的有限 float list、恰为 [0,1] 的 int 列表（元素拒绝 bool）、
+    float 1.0。容器类型错抛 TypeError；错序/缺失/额外键、长度、取值或
+    非有限错抛 ValueError。
+    """
+    if not isinstance(metrics_obj, dict):
+        raise TypeError(
+            "metrics 必须是 JSON 对象，得到 %s"
+            % type(metrics_obj).__name__
+        )
+    if list(metrics_obj.keys()) != _BB_METRICS_KEYS:
+        raise ValueError(
+            "metrics 的键必须依次为 epochs、lr、seed、batch_size、"
+            "shuffle、loss、predictions、accuracy"
+        )
+
+    epochs = metrics_obj["epochs"]
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int，得到 %s" % type(epochs).__name__
+        )
+    if epochs != _BENCH_EXPECTED_EPOCHS:
+        raise ValueError("epochs 必须为 %d" % _BENCH_EXPECTED_EPOCHS)
+
+    lr = metrics_obj["lr"]
+    _check_metrics_float(lr, "lr")
+    if lr != _BENCH_EXPECTED_LR:
+        raise ValueError("lr 必须为 %r" % _BENCH_EXPECTED_LR)
+
+    seed = metrics_obj["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            "seed 必须是 int，得到 %s" % type(seed).__name__
+        )
+    if seed != _BENCH_EXPECTED_SEED:
+        raise ValueError("seed 必须为 %d" % _BENCH_EXPECTED_SEED)
+
+    batch_size = metrics_obj["batch_size"]
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError(
+            "batch_size 必须是 int，得到 %s" % type(batch_size).__name__
+        )
+    if batch_size != _BB_BATCH_SIZE:
+        raise ValueError("batch_size 必须为 %d" % _BB_BATCH_SIZE)
+
+    shuffle = metrics_obj["shuffle"]
+    if not isinstance(shuffle, bool):
+        raise TypeError(
+            "shuffle 必须是 bool，得到 %s" % type(shuffle).__name__
+        )
+    if shuffle is not True:
+        raise ValueError("shuffle 必须为 true")
+
+    loss = metrics_obj["loss"]
+    if not isinstance(loss, list):
+        raise TypeError(
+            "loss 必须是 list，得到 %s" % type(loss).__name__
+        )
+    if len(loss) != _BB_LOSS_COUNT:
+        raise ValueError(
+            "loss 长度 %d 与预期 %d 不符" % (len(loss), _BB_LOSS_COUNT)
+        )
+    for entry in loss:
+        _check_metrics_float(entry, "loss")
+
+    predictions = metrics_obj["predictions"]
+    if not isinstance(predictions, list):
+        raise TypeError(
+            "predictions 必须是 list，得到 %s"
+            % type(predictions).__name__
+        )
+    for idx, pred in enumerate(predictions):
+        if isinstance(pred, bool) or not isinstance(pred, int):
+            raise TypeError(
+                "predictions[%d] 必须是 int（拒绝 bool），得到 %s"
+                % (idx, type(pred).__name__)
+            )
+    if predictions != _BENCH_EXPECTED_PREDICTIONS:
+        raise ValueError("predictions 必须恰为 [0, 1]")
+
+    accuracy = metrics_obj["accuracy"]
+    _check_metrics_float(accuracy, "accuracy")
+    if accuracy != _BENCH_EXPECTED_ACCURACY:
+        raise ValueError("accuracy 必须为 1.0")
+
+    return {
+        "epochs": epochs,
+        "lr": lr,
+        "seed": seed,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "loss": _deep_copy(loss),
+        "predictions": _deep_copy(predictions),
+        "accuracy": accuracy,
+    }
+
+
+def _load_bb_doc(path):
+    """读取 benchmark_batches 产物字节并解析为去重保序的 JSON 文档。
+
+    规则同 _load_benchmark_doc：path 非 str 抛 TypeError；文件不可读抛
+    OSError；非法 UTF-8 抛 UnicodeDecodeError；JSON 语法错或含重复键抛
+    ValueError。
+    """
+    if not isinstance(path, str):
+        raise TypeError(
+            "path 必须是 str，得到 %s" % type(path).__name__
+        )
+    with open(path, "rb") as f:
+        raw = f.read()
+    return json.loads(
+        raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+
+
+def load_benchmark_batches(path):
+    """读取完整 benchmark_batches 产物，返回键序为 model、metrics 的新 dict。
+
+    顶层键须依次为 model、metrics（重复/缺失/额外/错序一律非法）。model
+    严格沿用 benchmark/fitnorm 的逐层键序、形状与全 float 契约。metrics
+    的键依次为 epochs、lr、seed、batch_size、shuffle、loss、predictions、
+    accuracy，取值依次须为 int 20、float 0.1、int 7、int 1、bool 真、
+    长度 40 的有限 float list、恰为 [0,1] 的 int 列表、float 1.0。
+
+    成功返回的 dict 与全部嵌套 dict/list 均为新建深拷贝。path 或 JSON
+    容器/标量类型错抛 TypeError；文件不可读抛 OSError；非法 UTF-8 抛
+    UnicodeDecodeError；JSON 语法错、重复/缺失/额外/错序键、形状、长度、
+    取值或非有限值错抛 ValueError。
+    """
+    doc = _load_bb_doc(path)
+    if not isinstance(doc, dict):
+        raise TypeError("benchmark_batches 产物顶层必须是 JSON 对象")
+    if list(doc.keys()) != _BB_TOP_KEYS:
+        raise ValueError(
+            "benchmark_batches 产物顶层键必须依次为 model、metrics"
+        )
+    model = _parse_benchmark_model(doc["model"])
+    metrics = _parse_bb_metrics(doc["metrics"])
+    return {"model": model, "metrics": metrics}
+
+
+def _cmd_benchmark_batches(output_path):
+    """benchmark_batches 子命令主体；失败返回 1 且不改 OUTPUT。"""
+    try:
+        # OUTPUT 不得与任一数据文件同路径：避免原子写出破坏训练/验证数据。
+        out_abs = os.path.abspath(output_path)
+        if out_abs == os.path.abspath(_BENCH_TRAIN_PATH):
+            raise ValueError("OUTPUT 与训练集不能是同一路径")
+        if out_abs == os.path.abspath(_BENCH_VAL_PATH):
+            raise ValueError("OUTPUT 与验证集不能是同一路径")
+        model, losses, predictions, accuracy = _bench_batches_run()
+        # 写出前对 metrics 做与 load_benchmark_batches 同一的严格校验。
+        metrics = _parse_bb_metrics({
+            "epochs": _NORM_EPOCHS,
+            "lr": float(_NORM_LR),
+            "seed": _NORM_DROPOUT_SEED,
+            "batch_size": _BB_BATCH_SIZE,
+            "shuffle": True,
+            "loss": losses,
+            "predictions": predictions,
+            "accuracy": accuracy,
+        })
+        artifact = {
+            "model": model,
+            "metrics": metrics,
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (_BenchDataError, ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 命令行数据驱动训练：python convnet.py fitdata DATA OUTPUT
 # ---------------------------------------------------------------------------
 
@@ -4948,8 +5368,8 @@ def train_norm_batches(
 
 
 def main(argv):
-    """命令行入口：接受 train/fitcnn/fitnorm/benchmark OUTPUT、
-    evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
+    """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
+    OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
     evaldata/predictdata WEIGHTS DATA OUTPUT 与 gradcheck CONFIG OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
@@ -4966,6 +5386,8 @@ def main(argv):
         return _cmd_fitnorm(argv[2])
     if len(argv) == 3 and argv[1] == "benchmark":
         return _cmd_benchmark(argv[2])
+    if len(argv) == 3 and argv[1] == "benchmark_batches":
+        return _cmd_benchmark_batches(argv[2])
     if len(argv) == 4 and argv[1] == "evalnorm":
         return _cmd_evalnorm(argv[2], argv[3])
     if len(argv) == 4 and argv[1] == "fitdata":
@@ -4983,6 +5405,7 @@ def main(argv):
         "evalcnn",
         "fitnorm",
         "benchmark",
+        "benchmark_batches",
         "evalnorm",
         "fitdata",
         "evaldata",
