@@ -25,6 +25,11 @@
 - load_benchmark(path)：严格校验 benchmark 产物后返回键序为 model、metrics
   的新 dict（model 为全 float 契约，metrics 含 predictions）。
 - predict_batch(model, x)：对 [N][1][1][4] 输入逐样本计算 logit，返回预测类别。
+- predict_norm_batch(model, x)：对 [N][1][2][2] 输入按
+  Conv2D→BatchNorm2D(保存 running 统计)→Dropout(推理恒等)→
+  MaxPool2D(2,2,0)→Flatten→Linear 逐样本前向，返回新元组
+  (predictions, logits)，model 须为 load_benchmark 或
+  load_benchmark_batches 返回的 model 新 dict。
 
 公开训练 API（仅标准库）：
 - train_norm_step(layers, x, labels, lr=0.1)：对
@@ -4997,6 +5002,76 @@ def predict_batch(model, x):
                 pred = o
         predictions.append(pred)
     return predictions
+
+
+def predict_norm_batch(model, x):
+    """对批量 [N][1][2][2] 输入做七层推理态前向，返回 (predictions, logits)。
+
+    model 必须严格为 load_benchmark 或 load_benchmark_batches 返回的 model
+    新 dict：键依次为 conv、batchnorm、linear；conv/linear 的键依次为
+    values、bias；batchnorm 的键依次为 gamma、beta、running_mean、
+    running_var；conv values 形状 [2][1][1][1]、conv bias [2]，batchnorm
+    四向量各 [2]，linear values [2][2]、linear bias [2]，每个叶值都必须是
+    有限 float（拒绝 int/bool）。x 必须为非空规则 list[N][1][2][2]，元素为
+    有限 int/float（拒绝 bool）。
+
+    逐样本按 Conv2D → BatchNorm2D（使用保存的 running 统计，推理态）→
+    Dropout（推理态恒等）→ MaxPool2D(2,2,0) → Flatten → Linear 前向；取最大
+    logit，并列时取较小类别。返回新元组 (predictions, logits)：predictions
+    为 int[N]，logits 为 float[N][2]。运算产生非有限值抛 ValueError。
+
+    不修改任何实参（含 model 内的 running 统计），重复调用结果相同。model 或
+    x 的容器/标量类型错抛 TypeError；键序、嵌套层级、空维、不规则、形状不符
+    或非有限值抛 ValueError。
+    """
+    # 严格复用 benchmark model 契约校验（键序、层级、形状、全有限 float），
+    # 并取得深拷贝，确保后续计算绝不触及调用方的 model。
+    model = _parse_benchmark_model(model)
+
+    if not isinstance(x, list):
+        raise TypeError("x 必须是嵌套 list，得到 %s" % type(x).__name__)
+    if _shape_of(x, 4, "x") != (len(x), 1, 2, 2):
+        raise ValueError("x 的形状必须为 [N][1][2][2]（N >= 1）")
+
+    conv_obj = model["conv"]
+    bn_obj = model["batchnorm"]
+    linear_obj = model["linear"]
+    conv = Conv2D(conv_obj["values"], conv_obj["bias"])
+    bn = BatchNorm2D(
+        bn_obj["gamma"], bn_obj["beta"], _NORM_EPS, _NORM_MOMENTUM
+    )
+    bn.running_mean = bn_obj["running_mean"]
+    bn.running_var = bn_obj["running_var"]
+    bn.train(False)
+    dropout = Dropout(_NORM_DROPOUT_P, _NORM_DROPOUT_SEED)
+    dropout.train(False)
+    pool = MaxPool2D(2, 2, 0)
+    flatten = Flatten()
+    linear = Linear(linear_obj["values"], linear_obj["bias"])
+
+    n_ = len(x)
+    predictions = []
+    all_logits = []
+    for n in range(n_):
+        one = [x[n]]
+        conv_out = conv.forward(one)
+        bn_out = bn.forward(conv_out)
+        drop_out = dropout.forward(bn_out)
+        pool_out = pool.forward(drop_out)
+        flat = flatten.forward(pool_out)
+        logits = linear.forward(flat)[0]
+        row = [float(v) for v in logits]
+        for o in range(_CNN_NUM_CLASSES):
+            if not math.isfinite(row[o]):
+                raise ValueError("预测计算产生非有限值（NaN/inf）")
+        # 取最大 logit，并列取较小类别。
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        predictions.append(pred)
+        all_logits.append(row)
+    return (predictions, all_logits)
 
 
 # ---------------------------------------------------------------------------
