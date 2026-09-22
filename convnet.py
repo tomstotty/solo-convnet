@@ -1,10 +1,12 @@
 """convnet.py — 从零实现的卷积神经网络组件（仅 Python 标准库）。
 
 当前提供：
-- Conv2D 层：NCHW 嵌套 list、互相关（不翻转核）、零补边；stride 可为
+- Conv2D 层：NCHW 嵌套 list、互相关（不翻转核）；stride 可为
   正 int 或 (SH, SW) tuple，padding 可为非负 int 或 (PT,PB,PL,PR) tuple，
   dilation 可为正 int 或 (DH, DW) tuple，groups 为正 int 分组数
-  （默认 1，O 与 C 均须被其整除，weights 形状 [O][C/G][KH][KW]）。
+  （默认 1，O 与 C 均须被其整除，weights 形状 [O][C/G][KH][KW]），
+  padding_mode 为 "zeros"/"replicate"/"circular"/"reflect" 之一
+  （默认 "zeros"，越界采样坐标的映射规则见 Conv2D 文档）。
 - MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较。
 - Flatten 层：NCHW 嵌套 list 展平为 [N][C*H*W]（按 c→h→w 顺序）。
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
@@ -292,6 +294,48 @@ def _check_groups(value):
     return value
 
 
+_PADDING_MODES = ("zeros", "replicate", "circular", "reflect")
+
+
+def _check_padding_mode(value):
+    """校验 Conv2D 补边模式：取值为 _PADDING_MODES 之一的 str。
+
+    非 str（含 bool）抛 TypeError，str 但取值非法抛 ValueError。
+    """
+    if not isinstance(value, str):
+        raise TypeError(
+            "padding_mode 必须是 str，得到 %s" % type(value).__name__
+        )
+    if value not in _PADDING_MODES:
+        raise ValueError(
+            "padding_mode 必须是 'zeros'、'replicate'、'circular' 或 "
+            "'reflect'，得到 %r" % value
+        )
+    return value
+
+
+def _map_pad_index(mode, q, length):
+    """按补边模式把采样坐标 q 映射为 [0, length) 内的下标。
+
+    zeros：越界坐标返回 None（不累加）；replicate：夹取到
+    min(max(q, 0), length-1)；circular：取 q % length；
+    reflect：令 T = 2*length-2、r = q % T，r < length 时取 r，否则取
+    T - r。界内坐标在四种模式下都映射为其自身。
+    """
+    if 0 <= q < length:
+        return q
+    if mode == "zeros":
+        return None
+    if mode == "replicate":
+        return 0 if q < 0 else length - 1
+    if mode == "circular":
+        return q % length
+    # reflect：调用方保证有补边的轴 length >= 2（否则 forward 已抛错）。
+    t = 2 * length - 2
+    r = q % t
+    return r if r < length else t - r
+
+
 def _zeros(shape):
     if len(shape) == 1:
         return [0] * shape[0]
@@ -299,7 +343,7 @@ def _zeros(shape):
 
 
 class Conv2D:
-    """二维互相关层（NCHW，嵌套 list，零补边）。
+    """二维互相关层（NCHW，嵌套 list，可配置补边模式）。
 
     weights: [O][C/G][KH][KW]，bias: [O]，输入 x: [N][C][H][W]。
     stride: 正 int（展开为 (S, S)）或恰含 (SH, SW) 的正 int tuple。
@@ -311,17 +355,24 @@ class Conv2D:
     [g*C/G, (g+1)*C/G) 做互相关，weights[o][ci] 对应组内第 ci 通道，
     组间无连接。构造时 O 不能整除 G 抛 ValueError；forward 时 C 不能
     整除 G 或 C/G 不等于 weights 第二维抛 ValueError。
+    padding_mode: str，默认 "zeros"，取值 "zeros"/"replicate"/
+    "circular"/"reflect"，决定越界采样坐标 q（轴长 L）的映射：
+    zeros 越界不累加；replicate 映射到 min(max(q,0),L-1)；circular
+    映射到 q%L；reflect 令 T=2L-2、r=q%T，r<L 时取 r 否则取 T-r。
+    非 str（含 bool）抛 TypeError，str 但取值非法抛 ValueError。
+    reflect 模式下某轴有补边且该轴长度 L<2 时 forward 抛 ValueError。
     令有效核高宽 EKH=(KH-1)*DH+1、EKW=(KW-1)*DW+1，输出:
     [N][O][floor((H+PT+PB-EKH)/SH)+1][floor((W+PL+PR-EKW)/SW)+1]；
     有效核大于补边后输入抛 ValueError，不能整除时舍弃底部或右侧余量。
     """
 
     def __init__(self, weights, bias, stride=1, padding=0, dilation=1,
-                 groups=1):
+                 groups=1, padding_mode="zeros"):
         sh_, sw_ = _check_stride2d(stride)
         pt_, pb_, pl_, pr_ = _check_padding2d(padding)
         dh_, dw_ = _check_dilation2d(dilation)
         g_ = _check_groups(groups)
+        mode_ = _check_padding_mode(padding_mode)
 
         _require_list(weights, "weights")
         _require_list(bias, "bias")
@@ -344,13 +395,19 @@ class Conv2D:
         self._padding = (pt_, pb_, pl_, pr_)
         self._dilation = (dh_, dw_)
         self._groups = g_
+        self._padding_mode = mode_
         self._w_shape = w_shape  # (O, C/G, KH, KW)
 
         self._x = None           # 最近一次成功 forward 的输入
         self._out_shape = None   # 最近一次成功 forward 的输出形状
 
     def forward(self, x):
-        """对 x: [N][C][H][W] 做零补边互相关，返回嵌套 list 并缓存输入。"""
+        """对 x: [N][C][H][W] 按补边模式做互相关，返回嵌套 list 并缓存输入。
+
+        越界采样坐标按 padding_mode 映射（见类文档）；reflect 模式下
+        有补边的轴长度小于 2 时抛 ValueError。校验或计算失败不改变
+        实参与旧缓存。
+        """
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
         o_ch, w_c, kh_, kw_ = self._w_shape
@@ -366,6 +423,12 @@ class Conv2D:
         sh_, sw_ = self._stride
         pt_, pb_, pl_, pr_ = self._padding
         dh_, dw_ = self._dilation
+        mode = self._padding_mode
+        if mode == "reflect":
+            if (pt_ + pb_ > 0 and h_ < 2) or (pl_ + pr_ > 0 and w_ < 2):
+                raise ValueError(
+                    "reflect 补边模式下，有补边的轴长度必须至少为 2"
+                )
         ekh_ = (kh_ - 1) * dh_ + 1
         ekw_ = (kw_ - 1) * dw_ + 1
         if ekh_ > h_ + pt_ + pb_ or ekw_ > w_ + pl_ + pr_:
@@ -392,14 +455,16 @@ class Conv2D:
                             x_c = x[n][c_base + ci]
                             w_c_o = weights[o][ci]
                             for kh in range(kh_):
-                                ih = base_h + kh * dh_
-                                if ih < 0 or ih >= h_:
+                                ih = _map_pad_index(mode, base_h + kh * dh_, h_)
+                                if ih is None:
                                     continue
                                 x_row = x_c[ih]
                                 w_row = w_c_o[kh]
                                 for kw in range(kw_):
-                                    iw = base_w + kw * dw_
-                                    if 0 <= iw < w_:
+                                    iw = _map_pad_index(
+                                        mode, base_w + kw * dw_, w_
+                                    )
+                                    if iw is not None:
                                         acc += x_row[iw] * w_row[kw]
                         row.append(acc)
                     out_o.append(row)
@@ -414,8 +479,11 @@ class Conv2D:
         """根据上游梯度 dy 返回 (dx, dweights, dbias)。
 
         dy 的形状必须等于最近一次成功 forward 的输出形状。
-        未成功 forward 前调用一律抛 ValueError。补边位置不产生 dx，
-        多个输出位置对同一输入坐标的梯度在此累加。
+        未成功 forward 前调用一律抛 ValueError。越界采样坐标按
+        padding_mode 映射：dweights 按映射坐标取 x 累加，dx 累加至
+        映射坐标（多个核位置映射到同一输入坐标时梯度在此累加）；
+        zeros 补边位置不产生 dx，多个输出位置对同一输入坐标的
+        梯度在此累加。
         """
         if self._x is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -441,6 +509,7 @@ class Conv2D:
         sh_, sw_ = self._stride
         pt_, pb_, pl_, pr_ = self._padding
         dh_, dw_ = self._dilation
+        mode = self._padding_mode
 
         dx = _zeros((n_, c_, h_, w_))
         dw = _zeros(self._w_shape)
@@ -462,16 +531,18 @@ class Conv2D:
                             w_c_o = weights[o][ci]
                             dw_c_o = dw[o][ci]
                             for kh in range(kh_):
-                                ih = base_h + kh * dh_
-                                if ih < 0 or ih >= h_:
+                                ih = _map_pad_index(mode, base_h + kh * dh_, h_)
+                                if ih is None:
                                     continue
                                 x_row = x_c[ih]
                                 dx_row = dx_c[ih]
                                 w_row = w_c_o[kh]
                                 dw_row = dw_c_o[kh]
                                 for kw in range(kw_):
-                                    iw = base_w + kw * dw_
-                                    if 0 <= iw < w_:
+                                    iw = _map_pad_index(
+                                        mode, base_w + kw * dw_, w_
+                                    )
+                                    if iw is not None:
                                         dw_row[kw] += g * x_row[iw]
                                         dx_row[iw] += g * w_row[kw]
         return dx, dw, db
