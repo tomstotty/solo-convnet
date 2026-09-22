@@ -754,15 +754,25 @@ class AvgPool2D:
     时取 (KH, KW)。
     padding: 非负 int（四边同值，展开为 (P, P, P, P)）或恰含
     (PT, PB, PL, PR) 的非负 int tuple，分别为上/下/左/右补边；且
-    PT、PB < KH，PL、PR < KW。补边位置既不求和也不计入除数。
-    输入 x: [N][C][H][W]，输出: [N][C][OH][OW]，
-    OH = (H + PT + PB - KH) // SH + 1，
-    OW = (W + PL + PR - KW) // SW + 1。
-    不能整除时舍弃底部或右侧余量。各窗口以 0.0 起按 kh→kw 累加真实
-    输入坐标，均值 = 真实坐标之和 / 真实坐标数。
+    PT、PB < KH，PL、PR < KW。
+    count_include_pad / ceil_mode 仅接受 bool，否则抛 TypeError。
+    输入 x: [N][C][H][W]。记 A = H + PT + PB - KH、
+    B = W + PL + PR - KW。ceil_mode 为假时
+    OH = A // SH + 1、OW = B // SW + 1；为真时
+    OH = (A + SH - 1) // SH + 1、OW = (B + SW - 1) // SW + 1，但若
+    最后窗口起点 (OH-1)*SH >= H + PT（宽轴为 (OW-1)*SW >= W + PL），
+    则该轴长度减 1。floor 模式下不能整除时舍弃底部或右侧余量。
+    窗口超出声明补边矩形（行区间 [-PT, H+PB)、列区间 [-PL, W+PR)）的
+    部分一律忽略；求和只累加真实输入坐标（0 <= ih < H 且
+    0 <= iw < W）。count_include_pad 为假时除数为窗口内真实坐标数；
+    为真时除数还计入声明补边矩形内的零值位置（真实坐标数 +
+    矩形内越界坐标数），但不计入因 ceil 落在声明矩形之外的位置。
     """
 
-    def __init__(self, kernel_size, stride=None, padding=0):
+    def __init__(
+        self, kernel_size, stride=None, padding=0,
+        count_include_pad=False, ceil_mode=False,
+    ):
         kh_, kw_ = _check_kernel2d(kernel_size, "kernel_size")
         if stride is None:
             sh_, sw_ = kh_, kw_
@@ -773,13 +783,75 @@ class AvgPool2D:
             raise ValueError("padding 的 PT、PB 必须小于 KH")
         if pl_ >= kw_ or pr_ >= kw_:
             raise ValueError("padding 的 PL、PR 必须小于 KW")
+        if not isinstance(count_include_pad, bool):
+            raise TypeError(
+                "count_include_pad 必须是 bool，得到 %s"
+                % type(count_include_pad).__name__
+            )
+        if not isinstance(ceil_mode, bool):
+            raise TypeError(
+                "ceil_mode 必须是 bool，得到 %s"
+                % type(ceil_mode).__name__
+            )
 
         self._kernel_size = (kh_, kw_)
         self._stride = (sh_, sw_)
         self._padding = (pt_, pb_, pl_, pr_)
+        self._count_include_pad = count_include_pad
+        self._ceil_mode = ceil_mode
 
         self._x_shape = None    # 最近一次成功 forward 的输入形状
         self._out_shape = None  # 最近一次成功 forward 的输出形状
+
+    def _output_shape(self, h_, w_):
+        """按 floor/ceil 规则计算输出高宽，并裁掉起点越过声明矩形的窗。"""
+        kh_, kw_ = self._kernel_size
+        sh_, sw_ = self._stride
+        pt_, pb_, pl_, pr_ = self._padding
+        a_ = h_ + pt_ + pb_ - kh_
+        b_ = w_ + pl_ + pr_ - kw_
+        if self._ceil_mode:
+            oh_ = (a_ + sh_ - 1) // sh_ + 1
+            ow_ = (b_ + sw_ - 1) // sw_ + 1
+        else:
+            oh_ = a_ // sh_ + 1
+            ow_ = b_ // sw_ + 1
+        # 末窗起点已越过声明补边矩形（行 [-PT,H+PB)、列 [-PL,W+PR)）
+        # 的合法起点范围，则该轴少一个窗口。
+        if (oh_ - 1) * sh_ >= h_ + pt_:
+            oh_ -= 1
+        if (ow_ - 1) * sw_ >= w_ + pl_:
+            ow_ -= 1
+        return oh_, ow_
+
+    def _window_counts(self, base_h, base_w, h_, w_):
+        """返回 (real, divisor)：真实坐标数与该窗口均值所用除数。
+
+        真实坐标数为行、列两轴真实位置数之积；count_include_pad 为真时
+        除数改用声明补边矩形内的位置数（同样为两轴之积），矩形之外的
+        位置（ceil 末窗超出部分）不计入。
+        """
+        kh_, kw_ = self._kernel_size
+        real_rows = 0
+        rect_rows = 0
+        for kh in range(kh_):
+            ih = base_h + kh
+            if -self._padding[0] <= ih < h_ + self._padding[1]:
+                rect_rows += 1
+                if 0 <= ih < h_:
+                    real_rows += 1
+        real_cols = 0
+        rect_cols = 0
+        for kw in range(kw_):
+            iw = base_w + kw
+            if -self._padding[2] <= iw < w_ + self._padding[3]:
+                rect_cols += 1
+                if 0 <= iw < w_:
+                    real_cols += 1
+        real = real_rows * real_cols
+        if self._count_include_pad:
+            return real, rect_rows * rect_cols
+        return real, real
 
     def forward(self, x):
         """对 x: [N][C][H][W] 做平均池化，返回新 float list 并缓存形状。"""
@@ -790,8 +862,7 @@ class AvgPool2D:
         pt_, pb_, pl_, pr_ = self._padding
         if kh_ > h_ + pt_ + pb_ or kw_ > w_ + pl_ + pr_:
             raise ValueError("池化窗口在补边后仍越界：kernel_size 大于补边后的输入")
-        oh_ = (h_ + pt_ + pb_ - kh_) // sh_ + 1
-        ow_ = (w_ + pl_ + pr_ - kw_) // sw_ + 1
+        oh_, ow_ = self._output_shape(h_, w_)
 
         out = []
         for n in range(n_):
@@ -805,7 +876,6 @@ class AvgPool2D:
                     for ow in range(ow_):
                         base_w = ow * sw_ - pl_
                         total = 0.0
-                        count = 0
                         for kh in range(kh_):
                             ih = base_h + kh
                             if ih < 0 or ih >= h_:
@@ -815,8 +885,8 @@ class AvgPool2D:
                                 iw = base_w + kw
                                 if 0 <= iw < w_:
                                     total += x_row[iw]
-                                    count += 1
-                        avg = total / count
+                        _, divisor = self._window_counts(base_h, base_w, h_, w_)
+                        avg = total / divisor
                         if not math.isfinite(avg):
                             raise ValueError("平均池化计算产生非有限值（NaN/inf）")
                         row.append(avg)
@@ -832,8 +902,10 @@ class AvgPool2D:
         """根据上游梯度 dy 返回与输入同形状的 dx。
 
         dy 的形状必须等于最近一次成功 forward 的输出形状；每个窗口把
-        dy / 该窗口真实坐标数按 n→c→oh→ow、kh→kw 累加至各真实输入
-        坐标（补边位置不分摊）。未成功 forward 前调用一律抛 ValueError。
+        dy / 该窗口除数（与 forward 完全一致：count_include_pad 为真时
+        计入声明补边矩形内的零值位置，ceil 矩形外位置不计）按
+        n→c→oh→ow、kh→kw 仅累加至各真实输入坐标（补边位置不分摊）。
+        未成功 forward 前调用一律抛 ValueError。
         """
         if self._out_shape is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -863,15 +935,8 @@ class AvgPool2D:
                     dy_row = dy_c[oh]
                     for ow in range(ow_):
                         base_w = ow * sw_ - pl_
-                        count = 0
-                        for kh in range(kh_):
-                            ih = base_h + kh
-                            if 0 <= ih < h_:
-                                for kw in range(kw_):
-                                    iw = base_w + kw
-                                    if 0 <= iw < w_:
-                                        count += 1
-                        share = dy_row[ow] / count
+                        _, divisor = self._window_counts(base_h, base_w, h_, w_)
+                        share = dy_row[ow] / divisor
                         if not math.isfinite(share):
                             raise ValueError("平均池化反向计算产生非有限值（NaN/inf）")
                         for kh in range(kh_):
