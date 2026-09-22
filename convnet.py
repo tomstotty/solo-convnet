@@ -46,6 +46,20 @@
   batch_size 的批（末批可短），逐批调用 train_norm_step，返回按轮、
   批顺序排列、长度 epochs*ceil(N/batch_size) 的各批更新前批均损失
   新 list[float]；任何异常都把七层整体恢复到函数入口状态。
+- dump_norm_checkpoint(layers, epoch)：把配置同 fitnorm、BN/Dropout
+  处于训练态的七层训练状态（六组参数、BN running 统计、Dropout 随机
+  状态）与非负 int epoch（拒绝 bool）序列化为 UTF-8 紧凑 JSON 加 LF
+  的 bytes；顶层键依次为 epoch、model、dropout_state，model 沿用
+  fitnorm 逐层键序与形状，数值叶均为小写 float.hex() 字符串（负零
+  写 "0x0.0p+0"），dropout_state 为 [0,2^32-1] 内 int。容器/字段类型
+  错抛 TypeError，长度/模式/配置/形状/非有限/epoch 取值错抛 ValueError；
+  不改实参，同一状态逐字节相同。
+- load_norm_checkpoint(data)：仅收 bytes，严格校验后返回全新的
+  (layers, epoch)；layers 为无缓存训练态七层新 list（配置同 fitnorm，
+  Dropout 随机状态恢复为 dropout_state），续训与不中断训练的参数、BN
+  统计及 Dropout 状态相同。非 bytes 抛 TypeError，非法 UTF-8 抛
+  UnicodeDecodeError，JSON 语法、重复/缺失/额外/错序键、非法 hex、
+  形状、范围或非有限错抛 ValueError，容器或字段类型错抛 TypeError。
 
 命令行子命令（仅标准库）：
 - `python convnet.py train OUTPUT`：在 data/tiny.csv 上训练“展平 + Linear”，
@@ -5797,6 +5811,358 @@ def train_norm_batches(
     except BaseException:
         _restore_layers(layers, snapshot)
         raise
+
+
+# ---------------------------------------------------------------------------
+# fitnorm 训练状态检查点（仅标准库）：
+# dump_norm_checkpoint(layers, epoch) / load_norm_checkpoint(data)
+# ---------------------------------------------------------------------------
+
+_CKPT_TOP_KEYS = ["epoch", "model", "dropout_state"]
+
+
+def _hex_float(v):
+    """有限 float 的小写 float.hex()；负零规范化为 "0x0.0p+0"。"""
+    s = v.hex()
+    if s == "-0x0.0p+0":
+        return "0x0.0p+0"
+    return s
+
+
+def _dump_hex_compact(value):
+    """手工生成紧凑 JSON：dict/list 结构保持，float 叶写小写 hex 字符串，
+    int 原样、bool 写 true/false；键序由 dict 保序保证。"""
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            json.dumps(k, ensure_ascii=False) + ":" + _dump_hex_compact(v)
+            for k, v in value.items()
+        ) + "}"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return json.dumps(_hex_float(value))
+    if isinstance(value, list):
+        return "[" + ",".join(_dump_hex_compact(v) for v in value) + "]"
+    raise TypeError("检查点含不支持的类型：%s" % type(value).__name__)
+
+
+def _validate_checkpoint_layers(layers):
+    """检查点转储专用的七层校验（无 lr）。
+
+    沿用 train_norm_step 的七层契约：layers 必须是恰含
+    Conv2D/BatchNorm2D/Dropout/(MaxPool2D 或 AdaptiveAvgPool2D)/Flatten/
+    Linear/SoftmaxCrossEntropy 七层实例的 list（容器或成员类型错抛
+    TypeError，长度错抛 ValueError），BatchNorm2D 与 Dropout 必须处于
+    训练态（否则 ValueError）。另要求配置同 fitnorm（_build_norm_layers）：
+    Conv2D 为默认 stride=1/padding=0/dilation=1/groups=1/
+    padding_mode="zeros"，BatchNorm2D eps=1e-5/momentum=1，Dropout
+    p=0.25（seed 任意，随机状态另存），池化为 MaxPool2D(2,2,0)；model
+    数组形状固定为 conv values [2][1][1][1]、conv bias [2]、batchnorm
+    四向量各 [2]、linear values [2][2]、linear bias [2]，每个叶值为有限
+    float（拒绝 int/bool），配置/形状/非有限错抛 ValueError。
+    Dropout 当前随机状态 _s 须为 [0, 2^32-1] 内 int。
+    """
+    if not isinstance(layers, list):
+        raise TypeError(
+            "layers 必须是 list，得到 %s" % type(layers).__name__
+        )
+    if len(layers) != 7:
+        raise ValueError(
+            "layers 必须恰含 7 层，得到 %d 层" % len(layers)
+        )
+    expected = (
+        Conv2D, BatchNorm2D, Dropout, (MaxPool2D, AdaptiveAvgPool2D),
+        Flatten, Linear, SoftmaxCrossEntropy,
+    )
+    names = (
+        "Conv2D", "BatchNorm2D", "Dropout",
+        "MaxPool2D 或 AdaptiveAvgPool2D",
+        "Flatten", "Linear", "SoftmaxCrossEntropy",
+    )
+    for idx, (layer, cls, name) in enumerate(zip(layers, expected, names)):
+        if not isinstance(layer, cls):
+            raise TypeError(
+                "layers[%d] 必须是 %s 实例，得到 %s"
+                % (idx, name, type(layer).__name__)
+            )
+
+    conv, bn, dropout, pool, _flatten, linear, _loss = layers
+    if not bn._training:
+        raise ValueError("BatchNorm2D 必须处于训练态")
+    if not dropout._training:
+        raise ValueError("Dropout 必须处于训练态")
+
+    # 配置须同 fitnorm（_build_norm_layers）。
+    if conv._stride != (1, 1):
+        raise ValueError("Conv2D 的 stride 必须为 1（fitnorm 配置）")
+    if conv._padding != (0, 0, 0, 0):
+        raise ValueError("Conv2D 的 padding 必须为 0（fitnorm 配置）")
+    if conv._dilation != (1, 1):
+        raise ValueError("Conv2D 的 dilation 必须为 1（fitnorm 配置）")
+    if conv._groups != 1:
+        raise ValueError("Conv2D 的 groups 必须为 1（fitnorm 配置）")
+    if conv._padding_mode != "zeros":
+        raise ValueError(
+            'Conv2D 的 padding_mode 必须为 "zeros"（fitnorm 配置）'
+        )
+    if bn._eps != _NORM_EPS:
+        raise ValueError(
+            "BatchNorm2D 的 eps 必须为 %r（fitnorm 配置）" % _NORM_EPS
+        )
+    if bn._momentum != _NORM_MOMENTUM:
+        raise ValueError(
+            "BatchNorm2D 的 momentum 必须为 %r（fitnorm 配置）"
+            % _NORM_MOMENTUM
+        )
+    if dropout._p != _NORM_DROPOUT_P:
+        raise ValueError(
+            "Dropout 的 p 必须为 %r（fitnorm 配置）" % _NORM_DROPOUT_P
+        )
+    # 第 4 层满足七层类型契约可为两种池化，但 fitnorm 配置固定为
+    # MaxPool2D(2, 2, 0)。
+    if not isinstance(pool, MaxPool2D):
+        raise ValueError("第 4 层必须是 MaxPool2D（fitnorm 配置）")
+    if pool._kernel_size != (2, 2) or pool._stride != (2, 2) or (
+        pool._padding != (0, 0, 0, 0)
+    ):
+        raise ValueError("MaxPool2D 必须为 (2, 2, 0)（fitnorm 配置）")
+
+    # 形状与叶值契约（同 benchmark model：固定形状、叶值限有限 float）。
+    tensors = (
+        (conv._weights, 4, (2, 1, 1, 1), "conv values"),
+        (conv._bias, 1, (2,), "conv bias"),
+        (bn._gamma, 1, (2,), "gamma"),
+        (bn._beta, 1, (2,), "beta"),
+        (bn.running_mean, 1, (2,), "running_mean"),
+        (bn.running_var, 1, (2,), "running_var"),
+        (linear._weights, 2, (2, 2), "linear values"),
+        (linear._bias, 1, (2,), "linear bias"),
+    )
+    for tensor, depth, shape, name in tensors:
+        _check_float_shape(tensor, depth, shape, name)
+
+    # dropout_state：Dropout 当前随机状态 s，[0, 2^32-1] 内 int。
+    state = dropout._s
+    if isinstance(state, bool) or not isinstance(state, int):
+        raise TypeError(
+            "dropout_state 必须是 int，得到 %s" % type(state).__name__
+        )
+    if state < 0 or state > 0xFFFFFFFF:
+        raise ValueError("dropout_state 必须满足 0 <= s <= 2^32-1")
+
+
+def dump_norm_checkpoint(layers, epoch):
+    r"""序列化 fitnorm 训练态七层的训练检查点，返回 bytes。
+
+    layers 须满足 train_norm_step 的七层契约（list 恰含
+    Conv2D/BatchNorm2D/Dropout/(MaxPool2D 或 AdaptiveAvgPool2D)/Flatten/
+    Linear/SoftmaxCrossEntropy 七层实例，BN 与 Dropout 为训练态）且配置
+    同 fitnorm（Conv2D 默认 stride/padding/dilation/groups/padding_mode、
+    BatchNorm2D eps=1e-5/momentum=1、Dropout p=0.25、池化为
+    MaxPool2D(2,2,0)），model 数组形状沿用 fitnorm 产物且每个数值叶为
+    有限 float（拒绝 int/bool）；校验细则见 _validate_checkpoint_layers。
+    epoch 须为非负 int（拒绝 bool）。
+
+    返回 UTF-8 紧凑 JSON 加单个 LF 的 bytes；顶层键依次为 epoch、model、
+    dropout_state。model 完整沿用 fitnorm 产物的逐层键序
+    （conv(values,bias)、batchnorm(gamma,beta,running_mean,
+    running_var)、linear(values,bias)）与数组形状，每个数值叶写为 Python
+    float.hex() 的小写字符串，负零写 "0x0.0p+0"；dropout_state 为
+    Dropout 当前随机状态，是 [0, 2^32-1] 内的 int。
+
+    容器或字段类型错抛 TypeError；layers 长度、层模式、配置、数组形状或
+    非有限值、epoch 取值错抛 ValueError。不修改实参；同一状态逐字节相同。
+    """
+    _validate_checkpoint_layers(layers)
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        raise TypeError(
+            "epoch 必须是 int（拒绝 bool），得到 %s" % type(epoch).__name__
+        )
+    if epoch < 0:
+        raise ValueError("epoch 必须为非负整数")
+
+    conv, bn, dropout, _pool, _flatten, linear, _loss = layers
+    doc = {
+        "epoch": epoch,
+        "model": {
+            "conv": {"values": conv._weights, "bias": conv._bias},
+            "batchnorm": {
+                "gamma": bn._gamma,
+                "beta": bn._beta,
+                "running_mean": bn.running_mean,
+                "running_var": bn.running_var,
+            },
+            "linear": {"values": linear._weights, "bias": linear._bias},
+        },
+        "dropout_state": dropout._s,
+    }
+    return (_dump_hex_compact(doc) + "\n").encode("utf-8")
+
+
+def _expect_hex_leaf(node, name):
+    """校验并解析一个规范小写 hex float 字符串，返回 float。
+
+    必须是 str，float.fromhex 可解析、结果有限，且恰好等于结果值的
+    float.hex() 规范化小写形式（负零仅接受 "0x0.0p+0"）。类型错抛
+    TypeError；非法/非规范 hex、非有限抛 ValueError。
+    """
+    if not isinstance(node, str):
+        if isinstance(node, list):
+            raise ValueError(
+                "%s 的层级过深：标量位置出现了 list" % name
+            )
+        raise TypeError(
+            "%s 必须是 hex 字符串，得到 %s" % (name, type(node).__name__)
+        )
+    try:
+        value = float.fromhex(node)
+    except ValueError:
+        raise ValueError("%s 是非法的 hex 浮点串：%r" % (name, node))
+    if not math.isfinite(value):
+        raise ValueError("%s 必须为有限值（拒绝 NaN/inf）" % name)
+    canon = value.hex()
+    if canon == "-0x0.0p+0":
+        canon = "0x0.0p+0"
+    if node != canon:
+        raise ValueError(
+            "%s 的 hex 串 %r 不是规范的小写 float.hex() 形式"
+            % (name, node)
+        )
+    return value
+
+
+def _parse_hex_tensor(node, depth, shape, name):
+    """递归校验 hex 字符串张量，返回同形的全新 float 嵌套 list。"""
+    if depth == 0:
+        return _expect_hex_leaf(node, name)
+    if not isinstance(node, list):
+        raise TypeError(
+            "%s 必须是嵌套 list，得到 %s" % (name, type(node).__name__)
+        )
+    if len(node) != shape[0]:
+        raise ValueError(
+            "%s 的形状必须为 %s"
+            % (name, "".join("[%d]" % d for d in shape))
+        )
+    return [
+        _parse_hex_tensor(child, depth - 1, shape[1:], name)
+        for child in node
+    ]
+
+
+def _reject_json_constant(value):
+    """parse_constant 钩子：严格 JSON 不接受 NaN/Infinity，按 ValueError 拒绝。"""
+    raise ValueError("非法 JSON 常量：%s" % value)
+
+
+def load_norm_checkpoint(data):
+    r"""从 dump_norm_checkpoint 产出的 bytes 重建训练态七层与 epoch。
+
+    仅接收 bytes，否则抛 TypeError；非法 UTF-8 抛 UnicodeDecodeError；
+    JSON 语法错、重复/缺失/额外/错序键、非法或非规范 hex、数组形状不符、
+    epoch/dropout_state 越界或值非有限抛 ValueError；容器或字段类型错抛
+    TypeError。
+
+    返回全新的 (layers, epoch)：layers 为无任何前向缓存的训练态七层新
+    list（Conv2D→BatchNorm2D(eps=1e-5,momentum=1)→Dropout(0.25)→
+    MaxPool2D(2,2,0)→Flatten→Linear→SoftmaxCrossEntropy），参数与 BN
+    running 统计取自 model，Dropout 的随机状态 s 恢复为 dropout_state；
+    epoch 为非负 int。加载后续训与不中断训练的参数、BN 统计及 Dropout
+    状态完全一致；不修改实参 data；合法检查点可再次 dump 且逐字节相同。
+    """
+    if not isinstance(data, bytes):
+        raise TypeError(
+            "data 必须是 bytes，得到 %s" % type(data).__name__
+        )
+    text = data.decode("utf-8")
+    doc = json.loads(
+        text,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_json_constant,
+    )
+
+    if not isinstance(doc, dict):
+        raise TypeError("检查点顶层必须是 JSON 对象")
+    if list(doc.keys()) != _CKPT_TOP_KEYS:
+        raise ValueError(
+            "检查点顶层键必须依次为 epoch、model、dropout_state"
+        )
+
+    epoch = doc["epoch"]
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        raise TypeError(
+            "epoch 必须是 int（拒绝 bool），得到 %s"
+            % type(epoch).__name__
+        )
+    if epoch < 0:
+        raise ValueError("epoch 必须为非负整数")
+
+    dropout_state = doc["dropout_state"]
+    if isinstance(dropout_state, bool) or not isinstance(
+        dropout_state, int
+    ):
+        raise TypeError(
+            "dropout_state 必须是 int（拒绝 bool），得到 %s"
+            % type(dropout_state).__name__
+        )
+    if dropout_state < 0 or dropout_state > 0xFFFFFFFF:
+        raise ValueError("dropout_state 必须满足 0 <= s <= 2^32-1")
+
+    model_obj = doc["model"]
+    if not isinstance(model_obj, dict):
+        raise TypeError(
+            "model 必须是 JSON 对象，得到 %s" % type(model_obj).__name__
+        )
+    if list(model_obj.keys()) != _NORM_MODEL_KEYS:
+        raise ValueError("model 的键必须依次为 conv、batchnorm、linear")
+    conv_obj = model_obj["conv"]
+    bn_obj = model_obj["batchnorm"]
+    linear_obj = model_obj["linear"]
+    if not isinstance(conv_obj, dict) or not isinstance(bn_obj, dict) or (
+        not isinstance(linear_obj, dict)
+    ):
+        raise TypeError("model 的 conv/batchnorm/linear 必须是 JSON 对象")
+    if list(conv_obj.keys()) != _NORM_LAYER_KEYS:
+        raise ValueError("conv 的键必须依次为 values、bias")
+    if list(bn_obj.keys()) != _NORM_BN_KEYS:
+        raise ValueError(
+            "batchnorm 的键必须依次为 gamma、beta、running_mean、running_var"
+        )
+    if list(linear_obj.keys()) != _NORM_LAYER_KEYS:
+        raise ValueError("linear 的键必须依次为 values、bias")
+
+    conv_values = _parse_hex_tensor(
+        conv_obj["values"], 4, (2, 1, 1, 1), "conv values"
+    )
+    conv_bias = _parse_hex_tensor(conv_obj["bias"], 1, (2,), "conv bias")
+    gamma = _parse_hex_tensor(bn_obj["gamma"], 1, (2,), "gamma")
+    beta = _parse_hex_tensor(bn_obj["beta"], 1, (2,), "beta")
+    running_mean = _parse_hex_tensor(
+        bn_obj["running_mean"], 1, (2,), "running_mean"
+    )
+    running_var = _parse_hex_tensor(
+        bn_obj["running_var"], 1, (2,), "running_var"
+    )
+    lin_values = _parse_hex_tensor(
+        linear_obj["values"], 2, (2, 2), "linear values"
+    )
+    lin_bias = _parse_hex_tensor(linear_obj["bias"], 1, (2,), "linear bias")
+
+    # 以 fitnorm 同配置新建无缓存训练态七层，再注入恢复的参数、BN 统计
+    # 与 Dropout 随机状态。
+    conv = Conv2D(conv_values, conv_bias)
+    bn = BatchNorm2D(gamma, beta, _NORM_EPS, _NORM_MOMENTUM)
+    bn.running_mean = running_mean
+    bn.running_var = running_var
+    dropout = Dropout(_NORM_DROPOUT_P, dropout_state)
+    dropout.train(True)
+    pool = MaxPool2D(2, 2, 0)
+    flatten = Flatten()
+    linear = Linear(lin_values, lin_bias)
+    loss = SoftmaxCrossEntropy()
+    return [conv, bn, dropout, pool, flatten, linear, loss], epoch
 
 
 def main(argv):
