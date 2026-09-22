@@ -25,6 +25,10 @@
 - load_benchmark(path)：严格校验 benchmark 产物后返回键序为 model、metrics
   的新 dict（model 为全 float 契约，metrics 含 predictions）。
 - predict_batch(model, x)：对 [N][1][1][4] 输入逐样本计算 logit，返回预测类别。
+- predict_norm_batch(model, x)：对 [N][1][2][2] 输入按标准化七层网络
+  （Conv2D→BatchNorm2D 保存统计→Dropout 推理恒等→MaxPool2D(2,2,0)
+  →Flatten→Linear）逐样本推理，返回新元组 (predictions, logits)，
+  依次为 int[N] 与 float[N][2]。
 
 公开训练 API（仅标准库）：
 - train_norm_step(layers, x, labels, lr=0.1)：对
@@ -4997,6 +5001,78 @@ def predict_batch(model, x):
                 pred = o
         predictions.append(pred)
     return predictions
+
+
+def predict_norm_batch(model, x):
+    """对批量 [N][1][2][2] 输入做标准化七层网络推理，返回新元组
+    (predictions, logits)：predictions 为长度 N 的新 int 列表，logits 为
+    float[N][2] 的新嵌套 list。
+
+    model 必须严格为 load_benchmark 或 load_benchmark_batches 返回的 model
+    dict：键依次为 conv、batchnorm、linear；conv/linear 的键依次为
+    values、bias，batchnorm 的键依次为 gamma、beta、running_mean、
+    running_var；形状固定为 conv values [2][1][1][1]、conv bias [2]、
+    batchnorm 四向量各 [2]、linear values [2][2]、linear bias [2]，每个
+    叶值都必须是有限 float（拒绝 int/bool 与非有限值）。x 必须为非空
+    规则 list[N][1][2][2]，元素为有限 int/float（拒绝 bool）。
+
+    逐样本按 Conv2D → BatchNorm2D（推理态，使用保存的 running_mean/
+    running_var，不更新统计）→ Dropout（推理态恒等）→
+    MaxPool2D(2,2,0) → Flatten → Linear 前向；每样本取最大 logit，
+    并列取较小类别。任何中间值或最终 logit 非有限抛 ValueError。
+
+    model 或 x 的容器/标量类型错抛 TypeError；键序、层级、空维、不规则、
+    形状不符或非有限值抛 ValueError。model 经严格校验并深拷贝后才参与
+    计算，x 仅被读取：不修改任一实参，不使用随机数，重复调用结果相同。
+    """
+    # 与 load_benchmark/load_benchmark_batches 同一严格契约校验，并得到
+    # 全新深拷贝；后续层只接触该副本，绝不修改实参 model。
+    m = _parse_benchmark_model(model)
+
+    if not isinstance(x, list):
+        raise TypeError("x 必须是嵌套 list，得到 %s" % type(x).__name__)
+    if _shape_of(x, 4, "x") != (len(x), 1, 2, 2):
+        raise ValueError("x 的形状必须为 [N][1][2][2]（N >= 1）")
+
+    conv_w = m["conv"]["values"]
+    conv_b = m["conv"]["bias"]
+    gamma = m["batchnorm"]["gamma"]
+    beta = m["batchnorm"]["beta"]
+    running_mean = m["batchnorm"]["running_mean"]
+    running_var = m["batchnorm"]["running_var"]
+    lin_w = m["linear"]["values"]
+    lin_b = m["linear"]["bias"]
+
+    predictions = []
+    logits_out = []
+    for n in range(len(x)):
+        # 逐样本前向：BN 用保存的运行统计推理、Dropout 推理恒等。
+        # _norm_forward 内部自建全部临时层并深拷贝 running 统计，不留
+        # 缓存、不推进任何随机状态，与实参完全隔离。
+        try:
+            logits, _, _ = _norm_forward(
+                conv_w, conv_b, gamma, beta, running_mean, running_var,
+                lin_w, lin_b, [x[n]], False,
+            )
+        except OverflowError:
+            # 极大有限 int 与 float 权值相乘在转 float 时溢出，按非有限
+            # 计算统一抛 ValueError。
+            raise ValueError("预测计算产生非有限值（NaN/inf）")
+        row = logits[0]
+        vals = []
+        for o in range(_CNN_NUM_CLASSES):
+            v = float(row[o])
+            if not math.isfinite(v):
+                raise ValueError("预测计算产生非有限值（NaN/inf）")
+            vals.append(v)
+        # 取最大 logit，并列取较小类别。
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if vals[o] > vals[pred]:
+                pred = o
+        predictions.append(int(pred))
+        logits_out.append(vals)
+    return predictions, logits_out
 
 
 # ---------------------------------------------------------------------------
