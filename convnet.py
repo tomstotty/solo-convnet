@@ -4760,6 +4760,146 @@ def _cmd_predictdata(weights_path, data_path, output_path):
 
 
 # ---------------------------------------------------------------------------
+# 命令行数据驱动训练+验证：
+# python convnet.py benchmark_data TRAIN VAL OUTPUT
+# ---------------------------------------------------------------------------
+
+
+def _benchmarkdata_run(train_path, val_path):
+    """TRAIN/VAL 独立加载后训练并在验证集上推理。
+
+    训练集与验证集分别经独立路径按同一契约（_load_fitdata）各加载一次，
+    解析结果互不共享、绝不混用：训练只使用训练集的 x/labels，验证只使用
+    验证集的 x_val/val_labels。以 fitnorm 初值、七层配置（Dropout seed=7）
+    调用 train_norm(epochs=20, lr=0.1)，记录 20 项更新前批均 loss；校验
+    末项严格小于首项、conv 权重/偏置、BN gamma/beta、linear 权重/偏置六组
+    参数至少一组相对初值改变。train_norm 末轮已用训练集 Conv 输出做训练态
+    BN 前向刷新统计（momentum=1，running_* 即当批统计）；随后以该统计、
+    关闭 Dropout 在 VAL 上逐样本推理，取最大 logit、并列取较小类别，
+    accuracy 必须为 1.0，任一 logit 非有限即失败。model 在返回前经
+    _parse_benchmark_model 严格校验（逐层键序、固定形状、叶值全为有限
+    float）并深拷贝，推理也使用该与写出完全同构的副本。
+    返回 (model, losses, predictions, accuracy)。
+    """
+    x, labels = _load_fitdata(train_path)
+    x_val, val_labels = _load_fitdata(val_path)
+
+    layers = _build_norm_layers()
+    conv, bn = layers[0], layers[1]
+
+    init_conv_w = _deep_copy(_CNN_CONV_INIT)
+    init_conv_b = [0.0] * _CNN_NUM_CLASSES
+    init_gamma = _deep_copy(_NORM_GAMMA_INIT)
+    init_beta = _deep_copy(_NORM_BETA_INIT)
+    init_lin_w = _deep_copy(_CNN_LINEAR_INIT)
+    init_lin_b = [0.0] * _CNN_NUM_CLASSES
+
+    losses = train_norm(
+        layers, x, labels, epochs=_NORM_EPOCHS, lr=_NORM_LR
+    )
+    losses = [float(v) for v in losses]
+    for v in losses:
+        if not math.isfinite(v):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+    if len(losses) != _NORM_EPOCHS:
+        raise ValueError("loss 项数与训练轮数不符")
+    if not losses[-1] < losses[0]:
+        raise ValueError("末次 loss 未小于首次 loss")
+
+    conv_w = conv._weights
+    conv_b = conv._bias
+    gamma = bn._gamma
+    beta = bn._beta
+    lin_w = layers[5]._weights
+    lin_b = layers[5]._bias
+    changed = (
+        conv_w != init_conv_w or conv_b != init_conv_b
+        or gamma != init_gamma or beta != init_beta
+        or lin_w != init_lin_w or lin_b != init_lin_b
+    )
+    if not changed:
+        raise ValueError("训练后六组参数均未改变")
+
+    running_mean = _deep_copy(bn.running_mean)
+    running_var = _deep_copy(bn.running_var)
+
+    # 写出前严格校验 model：逐层键序、固定形状，叶值全为有限 float
+    # （拒绝 int/bool 与非有限值）；返回的深拷贝同时用于验证集推理，
+    # 保证推理所用模型与 OUTPUT 中写出的模型逐值一致。
+    model = _parse_benchmark_model({
+        "conv": {"values": conv_w, "bias": conv_b},
+        "batchnorm": {
+            "gamma": gamma,
+            "beta": beta,
+            "running_mean": running_mean,
+            "running_var": running_var,
+        },
+        "linear": {"values": lin_w, "bias": lin_b},
+    })
+
+    # 仅在验证集上以 BN 保存统计、Dropout 推理态预测（不接触训练集）。
+    logits, _, _ = _norm_forward(
+        model["conv"]["values"], model["conv"]["bias"],
+        model["batchnorm"]["gamma"], model["batchnorm"]["beta"],
+        model["batchnorm"]["running_mean"],
+        model["batchnorm"]["running_var"],
+        model["linear"]["values"], model["linear"]["bias"],
+        x_val, False,
+    )
+    n_val = len(x_val)
+    predictions = []
+    correct = 0
+    for n in range(n_val):
+        row = logits[n]
+        for o in range(_CNN_NUM_CLASSES):
+            if not math.isfinite(row[o]):
+                raise ValueError("验证计算产生非有限值（NaN/inf）")
+        # 取最大 logit，并列取较小类别。
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        predictions.append(pred)
+        if pred == val_labels[n]:
+            correct += 1
+    accuracy = correct / n_val
+    if accuracy != 1.0:
+        raise ValueError("验证集 accuracy 不为 1.0")
+
+    return model, losses, predictions, accuracy
+
+
+def _cmd_benchmarkdata(train_path, val_path, output_path):
+    """benchmark_data 子命令主体；契约/训练/未达标/写出失败返回 1 且不改 OUTPUT。"""
+    try:
+        # OUTPUT 不得与任一输入同路径：避免原子写出破坏训练/验证数据。
+        out_abs = os.path.abspath(output_path)
+        if out_abs == os.path.abspath(train_path):
+            raise ValueError("OUTPUT 与 TRAIN 不能是同一路径")
+        if out_abs == os.path.abspath(val_path):
+            raise ValueError("OUTPUT 与 VAL 不能是同一路径")
+        model, losses, predictions, accuracy = _benchmarkdata_run(
+            train_path, val_path
+        )
+        artifact = {
+            "model": model,
+            "metrics": {
+                "epochs": _NORM_EPOCHS,
+                "lr": float(_NORM_LR),
+                "seed": _NORM_DROPOUT_SEED,
+                "loss": losses,
+                "predictions": predictions,
+                "accuracy": accuracy,
+            },
+        }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 命令行梯度检查：python convnet.py gradcheck CONFIG OUTPUT
 # ---------------------------------------------------------------------------
 
@@ -5446,7 +5586,8 @@ def train_norm_batches(
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
-    evaldata/predictdata WEIGHTS DATA OUTPUT 与 gradcheck CONFIG OUTPUT。
+    evaldata/predictdata WEIGHTS DATA OUTPUT、benchmark_data TRAIN VAL
+    OUTPUT 与 gradcheck CONFIG OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -5470,6 +5611,8 @@ def main(argv):
         return _cmd_fitdata(argv[2], argv[3])
     if len(argv) == 5 and argv[1] == "evaldata":
         return _cmd_evaldata(argv[2], argv[3], argv[4])
+    if len(argv) == 5 and argv[1] == "benchmark_data":
+        return _cmd_benchmarkdata(argv[2], argv[3], argv[4])
     if len(argv) == 5 and argv[1] == "predictdata":
         return _cmd_predictdata(argv[2], argv[3], argv[4])
     if len(argv) == 4 and argv[1] == "gradcheck":
@@ -5485,6 +5628,7 @@ def main(argv):
         "evalnorm",
         "fitdata",
         "evaldata",
+        "benchmark_data",
         "predictdata",
         "gradcheck",
     ):
