@@ -744,6 +744,39 @@ class MaxPool2D:
         return dx
 
 
+def _avgpool_out_size(length, pad_lo, pad_hi, kernel, stride, ceil_mode):
+    """计算池化单轴输出长度。
+
+    记 A=L+pad_lo+pad_hi-kernel。floor 模式取 A//stride+1；ceil 模式取
+    (A+stride-1)//stride+1，但若最后窗口起点越过声明补边矩形的真实输入
+    起点（(O-1)*stride >= L+pad_lo）则丢弃该末窗口、轴长减 1。
+    """
+    a = length + pad_lo + pad_hi - kernel
+    if not ceil_mode:
+        return a // stride + 1
+    out = (a + stride - 1) // stride + 1
+    if (out - 1) * stride >= length + pad_lo:
+        out -= 1
+    return out
+
+
+def _avgpool_window_count(base_h, base_w, h_, w_, kh_, kw_,
+                          pt_, pb_, pl_, pr_, include_pad):
+    """返回窗口除数：真实坐标数，或声明补边矩形内的坐标数。
+
+    真实坐标为窗口与 [0,H)×[0,W) 的交；include_pad 为真时除数改取窗口
+    与声明补边矩形 [-PT,H+PB)×[-PL,W+PR) 的交（含补边零值位置），ceil
+    产生的矩形外位置两种情形均不计入。
+    """
+    real_h = max(0, min(base_h + kh_, h_) - max(base_h, 0))
+    real_w = max(0, min(base_w + kw_, w_) - max(base_w, 0))
+    if not include_pad:
+        return real_h * real_w
+    decl_h = max(0, min(base_h + kh_, h_ + pb_) - max(base_h, -pt_))
+    decl_w = max(0, min(base_w + kw_, w_ + pr_) - max(base_w, -pl_))
+    return decl_h * decl_w
+
+
 class AvgPool2D:
     """二维平均池化层（NCHW，嵌套 list，逐通道池化）。
 
@@ -754,15 +787,21 @@ class AvgPool2D:
     时取 (KH, KW)。
     padding: 非负 int（四边同值，展开为 (P, P, P, P)）或恰含
     (PT, PB, PL, PR) 的非负 int tuple，分别为上/下/左/右补边；且
-    PT、PB < KH，PL、PR < KW。补边位置既不求和也不计入除数。
-    输入 x: [N][C][H][W]，输出: [N][C][OH][OW]，
-    OH = (H + PT + PB - KH) // SH + 1，
-    OW = (W + PL + PR - KW) // SW + 1。
-    不能整除时舍弃底部或右侧余量。各窗口以 0.0 起按 kh→kw 累加真实
-    输入坐标，均值 = 真实坐标之和 / 真实坐标数。
+    PT、PB < KH，PL、PR < KW。
+    count_include_pad、ceil_mode 只能为 bool（默认均为 False），否则
+    抛 TypeError。
+    记 A=H+PT+PB-KH、B=W+PL+PR-KW：ceil_mode 为假时
+    OH=A//SH+1、OW=B//SW+1；为真时 OH=(A+SH-1)//SH+1、
+    OW=(B+SW-1)//SW+1，但若最后窗口起点满足 (OH-1)*SH>=H+PT（宽轴为
+    (OW-1)*SW>=W+PL）则相应轴减 1。核大于补边后输入抛 ValueError。
+    窗口超出声明补边矩形的部分忽略；求和只含真实输入坐标。
+    count_include_pad 为假时除数为真实坐标数；为真时除数还计入声明补边
+    矩形内的零值补边位置，但不计 ceil 产生的矩形外位置。
+    输入 x: [N][C][H][W]，输出: [N][C][OH][OW]。
     """
 
-    def __init__(self, kernel_size, stride=None, padding=0):
+    def __init__(self, kernel_size, stride=None, padding=0,
+                 count_include_pad=False, ceil_mode=False):
         kh_, kw_ = _check_kernel2d(kernel_size, "kernel_size")
         if stride is None:
             sh_, sw_ = kh_, kw_
@@ -773,10 +812,22 @@ class AvgPool2D:
             raise ValueError("padding 的 PT、PB 必须小于 KH")
         if pl_ >= kw_ or pr_ >= kw_:
             raise ValueError("padding 的 PL、PR 必须小于 KW")
+        if not isinstance(count_include_pad, bool):
+            raise TypeError(
+                "count_include_pad 必须是 bool，得到 %s"
+                % type(count_include_pad).__name__
+            )
+        if not isinstance(ceil_mode, bool):
+            raise TypeError(
+                "ceil_mode 必须是 bool，得到 %s"
+                % type(ceil_mode).__name__
+            )
 
         self._kernel_size = (kh_, kw_)
         self._stride = (sh_, sw_)
         self._padding = (pt_, pb_, pl_, pr_)
+        self._count_include_pad = count_include_pad
+        self._ceil_mode = ceil_mode
 
         self._x_shape = None    # 最近一次成功 forward 的输入形状
         self._out_shape = None  # 最近一次成功 forward 的输出形状
@@ -790,8 +841,12 @@ class AvgPool2D:
         pt_, pb_, pl_, pr_ = self._padding
         if kh_ > h_ + pt_ + pb_ or kw_ > w_ + pl_ + pr_:
             raise ValueError("池化窗口在补边后仍越界：kernel_size 大于补边后的输入")
-        oh_ = (h_ + pt_ + pb_ - kh_) // sh_ + 1
-        ow_ = (w_ + pl_ + pr_ - kw_) // sw_ + 1
+        oh_ = _avgpool_out_size(
+            h_, pt_, pb_, kh_, sh_, self._ceil_mode
+        )
+        ow_ = _avgpool_out_size(
+            w_, pl_, pr_, kw_, sw_, self._ceil_mode
+        )
 
         out = []
         for n in range(n_):
@@ -805,7 +860,6 @@ class AvgPool2D:
                     for ow in range(ow_):
                         base_w = ow * sw_ - pl_
                         total = 0.0
-                        count = 0
                         for kh in range(kh_):
                             ih = base_h + kh
                             if ih < 0 or ih >= h_:
@@ -815,7 +869,10 @@ class AvgPool2D:
                                 iw = base_w + kw
                                 if 0 <= iw < w_:
                                     total += x_row[iw]
-                                    count += 1
+                        count = _avgpool_window_count(
+                            base_h, base_w, h_, w_, kh_, kw_,
+                            pt_, pb_, pl_, pr_, self._count_include_pad,
+                        )
                         avg = total / count
                         if not math.isfinite(avg):
                             raise ValueError("平均池化计算产生非有限值（NaN/inf）")
@@ -832,8 +889,10 @@ class AvgPool2D:
         """根据上游梯度 dy 返回与输入同形状的 dx。
 
         dy 的形状必须等于最近一次成功 forward 的输出形状；每个窗口把
-        dy / 该窗口真实坐标数按 n→c→oh→ow、kh→kw 累加至各真实输入
-        坐标（补边位置不分摊）。未成功 forward 前调用一律抛 ValueError。
+        dy / 该窗口除数（forward 同一除数：默认仅真实坐标数，
+        count_include_pad 时含声明补边内的零值位置）按 n→c→oh→ow、
+        kh→kw 仅累加至各真实输入坐标（补边位置不分摊）。未成功 forward
+        前调用一律抛 ValueError。
         """
         if self._out_shape is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -863,14 +922,10 @@ class AvgPool2D:
                     dy_row = dy_c[oh]
                     for ow in range(ow_):
                         base_w = ow * sw_ - pl_
-                        count = 0
-                        for kh in range(kh_):
-                            ih = base_h + kh
-                            if 0 <= ih < h_:
-                                for kw in range(kw_):
-                                    iw = base_w + kw
-                                    if 0 <= iw < w_:
-                                        count += 1
+                        count = _avgpool_window_count(
+                            base_h, base_w, h_, w_, kh_, kw_,
+                            pt_, pb_, pl_, pr_, self._count_include_pad,
+                        )
                         share = dy_row[ow] / count
                         if not math.isfinite(share):
                             raise ValueError("平均池化反向计算产生非有限值（NaN/inf）")
