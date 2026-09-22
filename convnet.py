@@ -28,7 +28,8 @@
 
 公开训练 API（仅标准库）：
 - train_norm_step(layers, x, labels, lr=0.1)：对
-  Conv2D→BatchNorm2D→Dropout→MaxPool2D→Flatten→Linear→SoftmaxCrossEntropy
+  Conv2D→BatchNorm2D→Dropout→(MaxPool2D 或
+  AdaptiveAvgPool2D)→Flatten→Linear→SoftmaxCrossEntropy
   七层按序前向、自损失层起逆序反传，做一次同步 SGD 更新，返回 float
   批均损失；任何异常都把七层恢复到入口状态。
 - train_norm(layers, x, labels, epochs=20, lr=0.1)：连续训练 epochs 轮，
@@ -1952,9 +1953,10 @@ def check_cnn_gradients(
 ):
     """用中心差分数值梯度检验 Conv2D→Pool2D→Flatten→Linear 整链。
 
-    conv/pool/flatten/linear 须依次为 Conv2D/MaxPool2D 或 AvgPool2D/
-    Flatten/Linear 实例，其余抛 TypeError。前向按 conv→pool→flatten→linear
-    执行，解析梯度按 linear→flatten→pool→conv 逆序取各层 backward 结果。
+    conv/pool/flatten/linear 须依次为 Conv2D/MaxPool2D、AvgPool2D 或
+    AdaptiveAvgPool2D/Flatten/Linear 实例，其余抛 TypeError。前向按
+    conv→pool→flatten→linear 执行，解析梯度按
+    linear→flatten→pool→conv 逆序取各层 backward 结果。
     标量损失 L：acc=0.0，按线性层输出的嵌套索引从外到内递增执行
     acc += y*dy（y 为整链前向输出）。
 
@@ -1962,7 +1964,7 @@ def check_cnn_gradients(
     （各张量内部按嵌套序），n = (L(v+eps) - L(v-eps)) / (2*eps)。
     pool 为 MaxPool2D 时，任一次前向中任一池化有效窗口并列最大（补边
     位置不参与比较）一律抛 ValueError——max 在并列点梯度无定义；
-    pool 为 AvgPool2D 时不做并列检测。
+    pool 为 AvgPool2D 或 AdaptiveAvgPool2D 时不做并列检测。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -1977,9 +1979,9 @@ def check_cnn_gradients(
         raise TypeError(
             "conv 必须是 Conv2D 实例，得到 %s" % type(conv).__name__
         )
-    if not isinstance(pool, (MaxPool2D, AvgPool2D)):
+    if not isinstance(pool, (MaxPool2D, AvgPool2D, AdaptiveAvgPool2D)):
         raise TypeError(
-            "pool 必须是 MaxPool2D 或 AvgPool2D 实例，得到 %s"
+            "pool 必须是 MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D 实例，得到 %s"
             % type(pool).__name__
         )
     if not isinstance(flatten, Flatten):
@@ -2110,10 +2112,10 @@ def check_norm_gradients(
     """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→Pool2D→Flatten→Linear 训练链。
 
     conv/bn/dropout/pool/flatten/linear 须依次为 Conv2D/BatchNorm2D/Dropout/
-    MaxPool2D 或 AvgPool2D/Flatten/Linear 实例，其余抛 TypeError；bn 或
-    dropout 非训练态抛 ValueError。前向按 conv→bn→dropout→pool→flatten→
-    linear 执行，解析梯度按 linear→flatten→pool→dropout→bn→conv 逆序取
-    各层 backward 结果。标量损失 L：acc=0.0，按线性层输出的嵌套索引从外
+    MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D/Flatten/Linear 实例，其余抛
+    TypeError；bn 或 dropout 非训练态抛 ValueError。前向按
+    conv→bn→dropout→pool→flatten→linear 执行，解析梯度按
+    linear→flatten→pool→dropout→bn→conv 逆序取各层 backward 结果。标量损失 L：acc=0.0，按线性层输出的嵌套索引从外
     到内递增执行 acc += y*dy（y 为整链前向输出）。
 
     数值梯度依次扰动 x、conv 的 weights/bias、bn 的 gamma/beta、linear 的
@@ -2122,8 +2124,8 @@ def check_norm_gradients(
     状态 _s 恢复为入口值，使各次前向重放同一掩码，故同一入口状态结果确定。
     BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D 时，
     任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）一律抛
-    ValueError——max 在并列点梯度无定义；pool 为 AvgPool2D 时不做并列
-    检测。
+    ValueError——max 在并列点梯度无定义；pool 为 AvgPool2D 或
+    AdaptiveAvgPool2D 时不做并列检测。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -2147,9 +2149,9 @@ def check_norm_gradients(
         raise TypeError(
             "dropout 必须是 Dropout 实例，得到 %s" % type(dropout).__name__
         )
-    if not isinstance(pool, (MaxPool2D, AvgPool2D)):
+    if not isinstance(pool, (MaxPool2D, AvgPool2D, AdaptiveAvgPool2D)):
         raise TypeError(
-            "pool 必须是 MaxPool2D 或 AvgPool2D 实例，得到 %s"
+            "pool 必须是 MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D 实例，得到 %s"
             % type(pool).__name__
         )
     if not isinstance(flatten, Flatten):
@@ -2300,7 +2302,7 @@ def check_train_gradients(
     """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→Pool2D→Flatten→Linear→SoftmaxCrossEntropy 训练链。
 
     conv/bn/dropout/pool/flatten/linear 须依次为 Conv2D/BatchNorm2D/Dropout/
-    MaxPool2D 或 AvgPool2D/Flatten/Linear 实例，loss 须为
+    MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D/Flatten/Linear 实例，loss 须为
     SoftmaxCrossEntropy 实例，其余抛 TypeError；bn 或 dropout 非训练态抛
     ValueError。前向按 conv→bn→dropout→pool→flatten→linear 执行得
     logits，标量损失 L = loss.forward(logits, labels) 返回的 float 批均
@@ -2313,8 +2315,8 @@ def check_train_gradients(
     状态 _s 恢复为入口值，使各次前向重放同一掩码，故同一入口状态结果确定。
     BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D 时，
     任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）一律抛
-    ValueError——max 在并列点梯度无定义；pool 为 AvgPool2D 时不做并列
-    检测。
+    ValueError——max 在并列点梯度无定义；pool 为 AvgPool2D 或
+    AdaptiveAvgPool2D 时不做并列检测。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -2339,9 +2341,9 @@ def check_train_gradients(
         raise TypeError(
             "dropout 必须是 Dropout 实例，得到 %s" % type(dropout).__name__
         )
-    if not isinstance(pool, (MaxPool2D, AvgPool2D)):
+    if not isinstance(pool, (MaxPool2D, AvgPool2D, AdaptiveAvgPool2D)):
         raise TypeError(
-            "pool 必须是 MaxPool2D 或 AvgPool2D 实例，得到 %s"
+            "pool 必须是 MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D 实例，得到 %s"
             % type(pool).__name__
         )
     if not isinstance(flatten, Flatten):
@@ -4588,6 +4590,17 @@ def predict_batch(model, x):
 # 随机/运行统计，以及被更新的参数 list 本体。
 def _snapshot_layers(layers):
     conv, bn, dropout, pool, flatten, linear, loss = layers
+    # MaxPool2D 另缓存获胜位置；AdaptiveAvgPool2D 仅有形状缓存。
+    if isinstance(pool, MaxPool2D):
+        pool_state = {
+            "x_shape": pool._x_shape, "out_shape": pool._out_shape,
+            "winners": pool._winners,
+        }
+    else:
+        pool_state = {
+            "x_shape": pool._x_shape, "out_shape": pool._out_shape,
+            "winners": None,
+        }
     return {
         "conv": {
             "weights": conv._weights, "bias": conv._bias,
@@ -4603,10 +4616,7 @@ def _snapshot_layers(layers):
             "training": dropout._training, "s": dropout._s,
             "mask": dropout._mask, "out_shape": dropout._out_shape,
         },
-        "pool": {
-            "x_shape": pool._x_shape, "out_shape": pool._out_shape,
-            "winners": pool._winners,
-        },
+        "pool": pool_state,
         "flatten": {
             "x_shape": flatten._x_shape, "out_shape": flatten._out_shape,
         },
@@ -4640,10 +4650,12 @@ def _restore_layers(layers, snap):
     dropout._mask, dropout._out_shape = (
         snap["dropout"]["mask"], snap["dropout"]["out_shape"]
     )
-    pool._x_shape, pool._out_shape, pool._winners = (
-        snap["pool"]["x_shape"], snap["pool"]["out_shape"],
-        snap["pool"]["winners"],
+    pool._x_shape, pool._out_shape = (
+        snap["pool"]["x_shape"], snap["pool"]["out_shape"]
     )
+    # 仅 MaxPool2D 持有获胜位置；AdaptiveAvgPool2D 无该缓存。
+    if isinstance(pool, MaxPool2D):
+        pool._winners = snap["pool"]["winners"]
     flatten._x_shape, flatten._out_shape = (
         snap["flatten"]["x_shape"], snap["flatten"]["out_shape"]
     )
@@ -4662,12 +4674,13 @@ def _restore_layers(layers, snap):
 def _validate_train_norm_args(layers, lr):
     """train_norm_step 与 train_norm 共用的 layers/lr 校验。
 
-    layers 必须是恰含 Conv2D/BatchNorm2D/Dropout/MaxPool2D/Flatten/
-    Linear/SoftmaxCrossEntropy 七层实例（类型与顺序均固定）的 list：
-    容器或成员类型错抛 TypeError，长度错抛 ValueError；BatchNorm2D 与
-    Dropout 必须处于训练态，否则抛 ValueError。lr 必须是正的有限
-    int/float（拒绝 bool）：类型错抛 TypeError，非有限或非正抛
-    ValueError。
+    layers 必须是恰含 Conv2D/BatchNorm2D/Dropout/(MaxPool2D 或
+    AdaptiveAvgPool2D)/Flatten/Linear/SoftmaxCrossEntropy 七层实例
+    （类型与顺序均固定，第 4 层（索引 3）接受 MaxPool2D 或
+    AdaptiveAvgPool2D）的 list：容器或成员类型错抛 TypeError，长度错抛
+    ValueError；BatchNorm2D 与 Dropout 必须处于训练态，否则抛
+    ValueError。lr 必须是正的有限 int/float（拒绝 bool）：类型错抛
+    TypeError，非有限或非正抛 ValueError。
     """
     if not isinstance(layers, list):
         raise TypeError(
@@ -4678,11 +4691,12 @@ def _validate_train_norm_args(layers, lr):
             "layers 必须恰含 7 层，得到 %d 层" % len(layers)
         )
     expected = (
-        Conv2D, BatchNorm2D, Dropout, MaxPool2D,
+        Conv2D, BatchNorm2D, Dropout, (MaxPool2D, AdaptiveAvgPool2D),
         Flatten, Linear, SoftmaxCrossEntropy,
     )
     names = (
-        "Conv2D", "BatchNorm2D", "Dropout", "MaxPool2D",
+        "Conv2D", "BatchNorm2D", "Dropout",
+        "MaxPool2D 或 AdaptiveAvgPool2D",
         "Flatten", "Linear", "SoftmaxCrossEntropy",
     )
     for idx, (layer, cls, name) in enumerate(
@@ -4715,8 +4729,8 @@ def _require_finite_grads(grad):
 
 
 def train_norm_step(layers, x, labels, lr=0.1):
-    """七层网络（Conv2D/BN/Dropout/MaxPool/Flatten/Linear/SoftmaxCE）的
-    一步标准化训练：按列表顺序前向，自损失层 backward() 起逆序反传，
+    """七层网络（Conv2D/BN/Dropout/(MaxPool 或 AdaptiveAvgPool)/Flatten/
+    Linear/SoftmaxCE）的一步标准化训练：按列表顺序前向，自损失层 backward() 起逆序反传，
     以新 list 同步把 conv 的 weights/bias、BN 的 gamma/beta、linear 的
     weights/bias 各减去 lr 乘对应梯度，返回 float 批均损失。
 
@@ -4801,7 +4815,8 @@ def train_norm_step(layers, x, labels, lr=0.1):
 
 
 def train_norm(layers, x, labels, epochs=20, lr=0.1):
-    """七层网络（Conv2D/BN/Dropout/MaxPool/Flatten/Linear/SoftmaxCE）的
+    """七层网络（Conv2D/BN/Dropout/(MaxPool 或 AdaptiveAvgPool)/Flatten/
+    Linear/SoftmaxCE）的
     多轮标准化训练：连续执行 epochs 轮 train_norm_step，返回各轮更新前
     批均损失组成的新 list[float]。
 
@@ -4845,7 +4860,8 @@ def train_norm(layers, x, labels, epochs=20, lr=0.1):
 def train_norm_batches(
     layers, x, labels, batch_size=1, epochs=1, lr=0.1, seed=0, shuffle=True
 ):
-    """七层网络（Conv2D/BN/Dropout/MaxPool/Flatten/Linear/SoftmaxCE）的
+    """七层网络（Conv2D/BN/Dropout/(MaxPool 或 AdaptiveAvgPool)/Flatten/
+    Linear/SoftmaxCE）的
     分轮分批标准化训练：每轮按顺序 [0,…,N-1]（shuffle 为真时先做
     Fisher–Yates 洗牌）切分若干批，逐批以批内样本调用 train_norm_step，
     返回按轮、批顺序排列的各批更新前批均损失组成的新 list[float]，长度
