@@ -6661,6 +6661,449 @@ def train_deep_batches(
         raise
 
 
+def _check_velocity_tree(v_node, p_node, name):
+    """逐项核对 velocity 子树与参数子树同形，叶为有限 int/float（拒绝 bool）。
+
+    结构（层级/长度）不符或非有限叶抛 ValueError；叶类型错（含 bool）抛
+    TypeError。
+    """
+    if isinstance(p_node, list):
+        if not isinstance(v_node, list):
+            raise ValueError("%s 的层级不足：期望嵌套 list" % name)
+        if len(v_node) != len(p_node):
+            raise ValueError(
+                "%s 的长度 %d 与参数长度 %d 不符"
+                % (name, len(v_node), len(p_node))
+            )
+        for v_child, p_child in zip(v_node, p_node):
+            _check_velocity_tree(v_child, p_child, name)
+        return
+    if isinstance(v_node, list):
+        raise ValueError("%s 的层级过深：标量位置出现了 list" % name)
+    if not _is_number(v_node):
+        raise TypeError(
+            "%s 的元素必须是 int/float（拒绝 bool），得到 %s"
+            % (name, type(v_node).__name__)
+        )
+    if isinstance(v_node, float) and not math.isfinite(v_node):
+        raise ValueError("%s 含有非有限值（NaN/inf）" % name)
+
+
+def train_deep_momentum_batches(
+    layers, x, labels, batch_size=1, epochs=1, lr=0.1, seed=0,
+    shuffle=True, clip=None, momentum=0.9, velocity=None, state=None,
+    max_batches=None,
+):
+    """九层网络（结构同 train_deep_batches）的分轮分批动量 SGD 训练：
+    批次切分、洗牌、暂停/续训、可选全局范数裁剪与失败回滚语义均沿用
+    train_deep_batches，区别在于参数更新规则——每批先按 clip 裁剪梯度
+    g（grad_norms 仍记录裁剪前全局范数），再对八组参数逐叶执行
+    v = momentum*v + g、p = p - lr*v，速度 v 跨批、跨轮延续。
+
+    返回 (losses, grad_norms, velocity, state) 四元组：losses 与
+    grad_norms 为按本次调用实际训练批顺序排列的新 list[float]（语义同
+    train_deep_batches）；velocity 为新的八项 tuple，与八组参数同序同形，
+    承载本次结束后的动量速度；state 为新的 (epoch, order, cursor, rng)
+    四元组，语义同 train_deep_batches（state/max_batches 均为 None 时
+    训练剩余全部批，state 为完成态）。返回值均不与入参别名。
+
+    momentum 必须是 [0, 1) 内的有限 int/float（拒绝 bool）：类型错抛
+    TypeError，非有限或越界抛 ValueError。velocity 为 None 时八组速度
+    均视为与对应参数同形的全零；否则必须是恰含 8 项的 tuple，各项依次
+    对应 conv 权重/偏置、BN gamma/beta、两个 Linear 权重/偏置，且为与
+    对应参数同形的嵌套 list，元素为有限 int/float（拒绝 bool）：容器或
+    叶类型错抛 TypeError，长度、形状或非有限抛 ValueError。入参
+    velocity 不会被修改。
+
+    其余参数（layers、x、labels、batch_size、epochs、lr、seed、shuffle、
+    clip、state、max_batches）的校验、批边界暂停/续训规则、洗牌发生器、
+    裁剪语义与失败恢复均与 train_deep_batches 完全相同：任一失败把九层
+    整体恢复到函数入口状态且不修改 x、labels、velocity 及构造参数所用
+    原 list；任意批边界分段多次调用的 losses/grad_norms 拼接、八组参数、
+    八组速度、层状态与终态均与一次训练完成完全相同。相同入口状态结果
+    完全确定。
+    """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError(
+            "batch_size 必须是 int（拒绝 bool），得到 %s"
+            % type(batch_size).__name__
+        )
+    if batch_size <= 0:
+        raise ValueError("batch_size 必须为正整数")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int（拒绝 bool），得到 %s"
+            % type(epochs).__name__
+        )
+    if epochs <= 0:
+        raise ValueError("epochs 必须为正整数")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            "seed 必须是 int（拒绝 bool），得到 %s" % type(seed).__name__
+        )
+    if seed < 0 or seed > 0xFFFFFFFF:
+        raise ValueError("seed 必须满足 0 <= seed <= 2^32-1")
+    if not isinstance(shuffle, bool):
+        raise TypeError(
+            "shuffle 必须是 bool，得到 %s" % type(shuffle).__name__
+        )
+    _validate_deep_layers(layers)
+    _check_deep_scalar(lr, "lr")
+    if lr <= 0:
+        raise ValueError("lr 必须为正数")
+    if clip is not None:
+        if isinstance(clip, bool) or not isinstance(clip, (int, float)):
+            raise TypeError(
+                "clip 必须是 None 或 int/float（拒绝 bool），得到 %s"
+                % type(clip).__name__
+            )
+        if not math.isfinite(clip) or clip <= 0:
+            raise ValueError("clip 必须为正的有限值")
+    _check_deep_scalar(momentum, "momentum")
+    if momentum < 0 or momentum >= 1:
+        raise ValueError("momentum 必须满足 0 <= momentum < 1")
+    # 八组参数（与梯度展平、更新提交同序）：conv 权重/偏置、BN
+    # gamma/beta、两个 Linear 的权重/偏置。
+    param_groups = (
+        layers[0]._weights, layers[0]._bias,
+        layers[1]._gamma, layers[1]._beta,
+        layers[5]._weights, layers[5]._bias,
+        layers[7]._weights, layers[7]._bias,
+    )
+    if velocity is not None:
+        if not isinstance(velocity, tuple):
+            raise TypeError(
+                "velocity 必须是 None 或八项 tuple，得到 %s"
+                % type(velocity).__name__
+            )
+        if len(velocity) != 8:
+            raise ValueError(
+                "velocity 必须恰含 8 项（与八组参数同序），得到 %d 项"
+                % len(velocity)
+            )
+        for gi, (item, param) in enumerate(zip(velocity, param_groups)):
+            if not isinstance(item, list):
+                raise TypeError(
+                    "velocity[%d] 必须是与参数同形的嵌套 list，得到 %s"
+                    % (gi, type(item).__name__)
+                )
+            _check_velocity_tree(item, param, "velocity[%d]" % gi)
+    _require_list(x, "x")
+    x_shape = _shape_of(x, 4, "x")
+    n_ = x_shape[0]
+    _require_list(labels, "labels")
+    if len(labels) != n_:
+        raise ValueError(
+            "labels 长度 %d 与 x 样本数 %d 不符" % (len(labels), n_)
+        )
+
+    # ---- 批边界暂停/续训参数（state、max_batches）校验 ----
+    resume_mode = state is not None or max_batches is not None
+    if max_batches is not None:
+        if isinstance(max_batches, bool) or not isinstance(max_batches, int):
+            raise TypeError(
+                "max_batches 必须是 None 或 int（拒绝 bool），得到 %s"
+                % type(max_batches).__name__
+            )
+        if max_batches < 0:
+            raise ValueError("max_batches 必须是非负整数")
+    if state is None:
+        cur_epoch, cur_order, cur_cursor, cur_s = 0, [], 0, seed
+    else:
+        if not isinstance(state, tuple):
+            raise TypeError(
+                "state 必须是 None 或 (epoch, order, cursor, rng) 四元组"
+                "（tuple），得到 %s" % type(state).__name__
+            )
+        if len(state) != 4:
+            raise ValueError("state 必须恰含 (epoch, order, cursor, rng) 四项")
+        cur_epoch, cur_order, cur_cursor, cur_s = state
+        if isinstance(cur_epoch, bool) or not isinstance(cur_epoch, int):
+            raise TypeError(
+                "state 的 epoch 必须是 int（拒绝 bool），得到 %s"
+                % type(cur_epoch).__name__
+            )
+        if cur_epoch < 0 or cur_epoch > epochs:
+            raise ValueError(
+                "state 的 epoch 必须满足 0 <= epoch <= epochs（%d）"
+                % epochs
+            )
+        if not isinstance(cur_order, list):
+            raise TypeError(
+                "state 的 order 必须是 list，得到 %s"
+                % type(cur_order).__name__
+            )
+        for v in cur_order:
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise TypeError(
+                    "state 的 order 成员必须是 int（拒绝 bool），得到 %s"
+                    % type(v).__name__
+                )
+        if isinstance(cur_cursor, bool) or not isinstance(cur_cursor, int):
+            raise TypeError(
+                "state 的 cursor 必须是 int（拒绝 bool），得到 %s"
+                % type(cur_cursor).__name__
+            )
+        if isinstance(cur_s, bool) or not isinstance(cur_s, int):
+            raise TypeError(
+                "state 的 rng 必须是 int（拒绝 bool），得到 %s"
+                % type(cur_s).__name__
+            )
+        if cur_s < 0 or cur_s > 0xFFFFFFFF:
+            raise ValueError("state 的 rng 必须满足 0 <= rng <= 2^32-1")
+        if len(cur_order) == 0:
+            if cur_cursor != 0:
+                raise ValueError("state 的 order 为空时 cursor 必须为 0")
+        else:
+            if cur_epoch == epochs:
+                # epoch==epochs 表示训练已完成（轮毕必清空 order），
+                # 不可能同时停在某一轮中途。
+                raise ValueError(
+                    "state 的 epoch 已等于 epochs（%d），order 必须为空"
+                    % epochs
+                )
+            if len(cur_order) != n_:
+                raise ValueError(
+                    "state 的 order 长度 %d 必须等于样本数 %d"
+                    % (len(cur_order), n_)
+                )
+            if sorted(cur_order) != list(range(n_)):
+                raise ValueError(
+                    "state 的 order 必须恰是 0..%d 的一个全排列" % (n_ - 1)
+                )
+            if cur_cursor < 0 or cur_cursor >= n_:
+                raise ValueError(
+                    "state 的 cursor 必须满足 0 <= cursor < N（%d）" % n_
+                )
+            # cursor 必须与按 batch_size 切分的各批起点对齐，且对应批
+            # 仍有样本（cursor==0 只可能是空 order 的轮起点）。
+            if cur_cursor % batch_size != 0:
+                raise ValueError(
+                    "state 的 cursor %d 不是 batch_size=%d 的批起点"
+                    % (cur_cursor, batch_size)
+                )
+    # epoch == epochs：训练已完成，不得再训练任何批。max_batches 为 0 或
+    # None（剩余批为空，自然无事可做）时原样返回完成态；正整数请求训练则
+    # 抛 ValueError。
+    if (
+        cur_epoch == epochs
+        and resume_mode
+        and max_batches is not None
+        and max_batches > 0
+    ):
+        raise ValueError("训练已完成（epoch == epochs），不得继续训练")
+
+    conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
+    snapshot = _snapshot_deep_layers(layers)
+    try:
+        losses = []
+        grad_norms = []
+        # 续训入参 state 绝不修改：order 取副本，游标与 LCG 状态用局部量。
+        epoch_idx = cur_epoch
+        order = list(cur_order)
+        start = cur_cursor
+        s = cur_s
+        # max_batches 为 None 时训练剩余全部批。
+        remaining = max_batches
+        done = False
+
+        def _zeros_like(tree):
+            if isinstance(tree, list):
+                return [_zeros_like(v) for v in tree]
+            return 0
+
+        # 工作速度：None 视为全零；否则深拷贝入参，绝不修改/别名入参。
+        if velocity is None:
+            v_cw = _zeros_like(conv._weights)
+            v_cb = _zeros_like(conv._bias)
+            v_g = _zeros_like(bn._gamma)
+            v_b = _zeros_like(bn._beta)
+            v_l1w = _zeros_like(linear1._weights)
+            v_l1b = _zeros_like(linear1._bias)
+            v_l2w = _zeros_like(linear2._weights)
+            v_l2b = _zeros_like(linear2._bias)
+        else:
+            v_cw = _deep_copy(velocity[0])
+            v_cb = _deep_copy(velocity[1])
+            v_g = _deep_copy(velocity[2])
+            v_b = _deep_copy(velocity[3])
+            v_l1w = _deep_copy(velocity[4])
+            v_l1b = _deep_copy(velocity[5])
+            v_l2w = _deep_copy(velocity[6])
+            v_l2b = _deep_copy(velocity[7])
+
+        def _scaled(tree, factor):
+            # 以新嵌套 list 承载裁剪后梯度，不改 backward 返回的原结构。
+            if isinstance(tree, list):
+                return [_scaled(v, factor) for v in tree]
+            return tree * factor
+
+        # 逐叶动量更新：v = momentum*v + g、p = p - lr*v；全部新值先在
+        # 独立新 list 中算出并校验，再同步提交，保证失败时层内参数与
+        # 构造参数原 list 均不被改动。
+        def _momentum_update(param, vel, grad):
+            if isinstance(param, list):
+                new_param_tree = []
+                new_vel_tree = []
+                for p, v, g in zip(param, vel, grad):
+                    new_p, new_v = _momentum_update(p, v, g)
+                    new_param_tree.append(new_p)
+                    new_vel_tree.append(new_v)
+                return new_param_tree, new_vel_tree
+            new_vel = momentum * vel + grad
+            new_param = param - lr * new_vel
+            if not math.isfinite(new_vel) or not math.isfinite(new_param):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+            return new_param, new_vel
+
+        # max_batches=0：不训练任何批、不在轮界洗牌，直接回传当前进度。
+        if max_batches == 0:
+            done = True
+
+        while not done and epoch_idx < epochs:
+            # order 为空表示停在轮起点：仅此刻在轮界按既有 LCG 洗牌；
+            # 轮中暂停（order 非空）沿用暂停时的 order 与 rng，不重洗。
+            if not order:
+                # 预算恰在上一轮用尽时，不得为下一轮提前洗牌，直接以
+                # 轮界完成态 (epoch, [], 0, rng) 暂停。
+                if remaining == 0:
+                    done = True
+                    continue
+                start = 0
+                order = list(range(n_))
+                if shuffle and n_ > 1:
+                    # Fisher–Yates 洗牌：自 N-1 降至 1，先推进 LCG，
+                    # 再以 j=s%(i+1) 交换；s 跨轮延续。
+                    for i in range(n_ - 1, 0, -1):
+                        s = (1664525 * s + 1013904223) % 4294967296
+                        j = s % (i + 1)
+                        order[i], order[j] = order[j], order[i]
+            while start < n_:
+                if remaining is not None:
+                    remaining -= 1
+                idx = order[start:start + batch_size]
+                batch_x = [x[k] for k in idx]
+                batch_labels = [labels[k] for k in idx]
+
+                # 按列表顺序前向；各层输入错误由其 forward 原样抛出。
+                conv_out = conv.forward(batch_x)
+                bn_out = bn.forward(conv_out)
+                drop_out = dropout.forward(bn_out)
+                pool_out = pool.forward(drop_out)
+                flat = flatten.forward(pool_out)
+                hidden = linear1.forward(flat)
+                relu_out = relu.forward(hidden)
+                logits = linear2.forward(relu_out)
+                loss_value = loss.forward(logits, batch_labels)
+                if not math.isfinite(loss_value):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+                # 自损失层起逆序反传；损失梯度已批均，不再除 N。每层
+                # 返回后立即递归检查其全部输出梯度（含参数梯度与最终
+                # 输入梯度）。
+                grad_logits = loss.backward()
+                _require_finite_grads(grad_logits)
+                dx_relu, dl2w, dl2b = linear2.backward(grad_logits)
+                _require_finite_grads(dx_relu)
+                _require_finite_grads(dl2w)
+                _require_finite_grads(dl2b)
+                dx_hidden = relu.backward(dx_relu)
+                _require_finite_grads(dx_hidden)
+                dx_flat, dl1w, dl1b = linear1.backward(dx_hidden)
+                _require_finite_grads(dx_flat)
+                _require_finite_grads(dl1w)
+                _require_finite_grads(dl1b)
+                dx_pool = flatten.backward(dx_flat)
+                _require_finite_grads(dx_pool)
+                dx_drop = pool.backward(dx_pool)
+                _require_finite_grads(dx_drop)
+                dx_bn = dropout.backward(dx_drop)
+                _require_finite_grads(dx_bn)
+                dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+                _require_finite_grads(dx_conv)
+                _require_finite_grads(dgamma)
+                _require_finite_grads(dbeta)
+                dx_input, dcw, dcb = conv.backward(dx_conv)
+                _require_finite_grads(dx_input)
+                _require_finite_grads(dcw)
+                _require_finite_grads(dcb)
+
+                # 更新前依次展平八组梯度，求裁剪前全局范数。
+                grad_groups = (
+                    dcw, dcb, dgamma, dbeta,
+                    dl1w, dl1b, dl2w, dl2b,
+                )
+                flat_grads = []
+                for group in grad_groups:
+                    _flatten_into(group, flat_grads)
+                grad_norm = math.sqrt(math.fsum(g * g for g in flat_grads))
+                if not math.isfinite(grad_norm):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+                # 可选全局范数裁剪：八组梯度同乘 clip/norm；范数不大于
+                # clip 或 clip 为 None 时保持原梯度。裁剪先于动量更新。
+                if clip is not None and grad_norm > clip:
+                    factor = clip / grad_norm
+                    dcw, dcb, dgamma, dbeta = (
+                        _scaled(dcw, factor), _scaled(dcb, factor),
+                        _scaled(dgamma, factor), _scaled(dbeta, factor),
+                    )
+                    dl1w, dl1b, dl2w, dl2b = (
+                        _scaled(dl1w, factor), _scaled(dl1b, factor),
+                        _scaled(dl2w, factor), _scaled(dl2b, factor),
+                    )
+
+                new_conv_w, v_cw = _momentum_update(conv._weights, v_cw, dcw)
+                new_conv_b, v_cb = _momentum_update(conv._bias, v_cb, dcb)
+                new_gamma, v_g = _momentum_update(bn._gamma, v_g, dgamma)
+                new_beta, v_b = _momentum_update(bn._beta, v_b, dbeta)
+                new_l1_w, v_l1w = _momentum_update(
+                    linear1._weights, v_l1w, dl1w
+                )
+                new_l1_b, v_l1b = _momentum_update(
+                    linear1._bias, v_l1b, dl1b
+                )
+                new_l2_w, v_l2w = _momentum_update(
+                    linear2._weights, v_l2w, dl2w
+                )
+                new_l2_b, v_l2b = _momentum_update(
+                    linear2._bias, v_l2b, dl2b
+                )
+
+                # 同步替换层内参数；其余缓存、BN 统计、Dropout 随机状态保留。
+                conv._weights = new_conv_w
+                conv._bias = new_conv_b
+                bn._gamma = new_gamma
+                bn._beta = new_beta
+                linear1._weights = new_l1_w
+                linear1._bias = new_l1_b
+                linear2._weights = new_l2_w
+                linear2._bias = new_l2_b
+
+                losses.append(float(loss_value))
+                grad_norms.append(float(grad_norm))
+
+                # 批后推进游标（idx 长度即本批实际样本数，末批可短）。
+                start += len(idx)
+                if start >= n_:
+                    # 轮毕：epoch 加一、清空 order、游标归 0；rng 保持
+                    # 本轮轮界洗牌后的值，跨轮延续。
+                    epoch_idx += 1
+                    order = []
+                    start = 0
+                    break
+                if remaining == 0:
+                    # 恰在批边界暂停：游标已是下一批起点。
+                    done = True
+                    break
+        out_velocity = (v_cw, v_cb, v_g, v_b, v_l1w, v_l1b, v_l2w, v_l2b)
+        out_state = (epoch_idx, order, start, s)
+        return losses, grad_norms, out_velocity, out_state
+    except BaseException:
+        _restore_deep_layers(layers, snapshot)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # 训练检查点：dump_norm_checkpoint(layers, epoch)、
 # load_norm_checkpoint(data)
