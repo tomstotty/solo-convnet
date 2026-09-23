@@ -8,6 +8,9 @@
   padding_mode 为 "zeros"/"replicate"/"circular"/"reflect" 之一
   （默认 "zeros"，越界采样坐标的映射规则见 Conv2D 文档）。
 - MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较。
+- ConvTranspose2D 层：NCHW 嵌套 list、转置卷积（weights [C][O][KH][KW]），
+  stride 为正 int、padding 为非负 int（均拒绝 bool），输出
+  [N][O][(H-1)*S-2*P+KH][(W-1)*S-2*P+KW]，forward/backward 语义见类文档。
 - AdaptiveAvgPool2D 层：NCHW 嵌套 list、逐通道自适应平均池化，输出尺寸
   为正 int 或 (OH, OW) tuple，分箱区间 [floor(oh*H/OH), ceil((oh+1)*H/OH))，
   OH/OW 可大于 H/W。
@@ -780,6 +783,228 @@ class Conv2D:
                                     if iw is not None:
                                         dw_row[kw] += g * x_row[iw]
                                         dx_row[iw] += g * w_row[kw]
+        return dx, dw, db
+
+
+class ConvTranspose2D:
+    """二维转置卷积层（NCHW，嵌套 list，stride 插入、padding 裁剪语义）。
+
+    weights: [C][O][KH][KW]，bias: [O]，输入 x: [N][C][H][W]。
+    stride S: 正 int（拒绝 bool）；padding P: 非负 int（拒绝 bool）。
+    输出形状:
+    [N][O][(H-1)*S-2*P+KH][(W-1)*S-2*P+KW]，
+    高或宽非正抛 ValueError。每个输出从 bias[o] 起按 c→kh→kw 累加：
+    仅当 oh+P-kh、ow+P-kw 均可被 S 整除且其商 ih、iw 分别落在
+    [0,H)、[0,W) 内时，加入 x[n][c][ih][iw]*weights[c][o][kh][kw]。
+    backward 返回 (dx, dweights, dbias)，形状依次同 x、weights、bias：
+    dx 按 o→kh→kw 累加（各输入位置对所有相关输出位置求和），dweights
+    按 n→ih→iw 累加（由 ih*S-P+kh、iw*S-P+kw 反解 oh、ow 并校验越界），
+    dbias 按 n→oh→ow 累加。未成功 forward 前调用 backward 抛
+    ValueError；dy 形状与最近一次成功 forward 的输出不符抛 ValueError。
+    张量或标量类型错抛 TypeError；空维、不规则、形状/通道不符、非有限
+    或 S/P 非法抛 ValueError。forward 失败保留旧缓存，仅成功 forward
+    更新缓存；不修改实参，返回值均为新 list。
+    """
+
+    def __init__(self, weights, bias, stride=1, padding=0):
+        if isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError(
+                "stride 必须是 int，得到 %s" % type(stride).__name__
+            )
+        if stride <= 0:
+            raise ValueError("stride 必须为正整数")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError(
+                "padding 必须是 int，得到 %s" % type(padding).__name__
+            )
+        if padding < 0:
+            raise ValueError("padding 必须为非负整数")
+
+        _require_list(weights, "weights")
+        _require_list(bias, "bias")
+        w_shape = _shape_of(weights, 4, "weights")
+        b_shape = _shape_of(bias, 1, "bias")
+        if b_shape[0] != w_shape[1]:
+            raise ValueError(
+                "bias 长度 %d 与 weights 输出通道数 %d 不符"
+                % (b_shape[0], w_shape[1])
+            )
+
+        self._weights = weights
+        self._bias = bias
+        self._stride = stride
+        self._padding = padding
+        self._w_shape = w_shape  # (C, O, KH, KW)
+
+        self._x = None           # 最近一次成功 forward 的输入
+        self._x_shape = None     # 最近一次成功 forward 的输入形状
+        self._out_shape = None   # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 做转置卷积，返回新嵌套 list 并缓存输入。
+
+        输出高宽为 (H-1)*S-2*P+KH、(W-1)*S-2*P+KW，非正抛
+        ValueError；通道与 weights 第一维不符抛 ValueError；任一累加
+        结果非有限抛 ValueError。校验或计算失败不改变实参与旧缓存，
+        仅完整成功后缓存输入、输入形状与输出形状。
+        """
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+        w_c, o_ch, kh_, kw_ = self._w_shape
+        if c_ != w_c:
+            raise ValueError(
+                "输入通道数 %d 与 weights 输入通道数 %d 不符" % (c_, w_c)
+            )
+        s_ = self._stride
+        p_ = self._padding
+        oh_ = (h_ - 1) * s_ - 2 * p_ + kh_
+        ow_ = (w_ - 1) * s_ - 2 * p_ + kw_
+        if oh_ <= 0 or ow_ <= 0:
+            raise ValueError(
+                "转置卷积输出尺寸非法：OH=%d、OW=%d（须均为正）"
+                % (oh_, ow_)
+            )
+
+        weights = self._weights
+        bias = self._bias
+        out = _zeros((n_, o_ch, oh_, ow_))
+        for n in range(n_):
+            for o in range(o_ch):
+                for oh in range(oh_):
+                    for ow in range(ow_):
+                        acc = bias[o]
+                        for c in range(c_):
+                            x_c = x[n][c]
+                            w_c_o = weights[c][o]
+                            for kh in range(kh_):
+                                t_h = oh + p_ - kh
+                                if t_h % s_ != 0:
+                                    continue
+                                ih = t_h // s_
+                                if ih < 0 or ih >= h_:
+                                    continue
+                                x_row = x_c[ih]
+                                w_row = w_c_o[kh]
+                                for kw in range(kw_):
+                                    t_w = ow + p_ - kw
+                                    if t_w % s_ != 0:
+                                        continue
+                                    iw = t_w // s_
+                                    if 0 <= iw < w_:
+                                        acc += x_row[iw] * w_row[kw]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "forward 结果含有非有限值（NaN/inf）"
+                            )
+                        out[n][o][oh][ow] = acc
+
+        self._x = x
+        self._x_shape = (n_, c_, h_, w_)
+        self._out_shape = (n_, o_ch, oh_, ow_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回 (dx, dweights, dbias)。
+
+        dy 的形状必须等于最近一次成功 forward 的输出形状；未成功
+        forward 前调用一律抛 ValueError。dx 按 o→kh→kw 扫描累加，
+        dweights 按 n→ih→iw 扫描累加（oh=ih*S-P+kh、ow=iw*S-P+kw
+        须落在输出范围内），dbias 按 n→oh→ow 累加；任一结果非有限
+        抛 ValueError。返回值均为新 list，不修改实参与缓存。
+        """
+        if self._x is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        x = self._x
+        weights = self._weights
+        n_, c_, h_, w_ = self._x_shape
+        _, o_ch, kh_, kw_ = self._w_shape
+        oh_, ow_ = self._out_shape[2], self._out_shape[3]
+        s_ = self._stride
+        p_ = self._padding
+
+        dx = _zeros((n_, c_, h_, w_))
+        dw = _zeros((c_, o_ch, kh_, kw_))
+        db = _zeros((o_ch,))
+
+        # dx 按 o→kh→kw 累加：固定输入位置后，oh=ih*S-P+kh、
+        # ow=iw*S-P+kw 由 (kh, kw) 唯一反解，越界输出位置不累加。
+        for n in range(n_):
+            for c in range(c_):
+                dx_c = dx[n][c]
+                for ih in range(h_):
+                    dx_row = dx_c[ih]
+                    for iw in range(w_):
+                        acc = 0.0
+                        for o in range(o_ch):
+                            dy_o = dy[n][o]
+                            w_o = weights[c][o]
+                            for kh in range(kh_):
+                                oh = ih * s_ - p_ + kh
+                                if oh < 0 or oh >= oh_:
+                                    continue
+                                dy_row = dy_o[oh]
+                                w_kh = w_o[kh]
+                                for kw in range(kw_):
+                                    ow = iw * s_ - p_ + kw
+                                    if 0 <= ow < ow_:
+                                        acc += dy_row[ow] * w_kh[kw]
+                        dx_row[iw] = acc
+
+        # dweights 按 n→ih→iw 累加：内层按 o→kh→kw 反解输出位置，
+        # 再按 c 把 dy*x 累加进 dw[c][o][kh][kw]。
+        for n in range(n_):
+            for ih in range(h_):
+                for iw in range(w_):
+                    for o in range(o_ch):
+                        for kh in range(kh_):
+                            oh = ih * s_ - p_ + kh
+                            if oh < 0 or oh >= oh_:
+                                continue
+                            for kw in range(kw_):
+                                ow = iw * s_ - p_ + kw
+                                if ow < 0 or ow >= ow_:
+                                    continue
+                                g = dy[n][o][oh][ow]
+                                for c in range(c_):
+                                    dw[c][o][kh][kw] += (
+                                        g * x[n][c][ih][iw]
+                                    )
+
+        # dbias 按 n→oh→ow 累加，内层遍历 o。
+        for n in range(n_):
+            for oh in range(oh_):
+                for ow in range(ow_):
+                    for o in range(o_ch):
+                        db[o] += dy[n][o][oh][ow]
+
+        for c in range(c_):
+            for o in range(o_ch):
+                for kh in range(kh_):
+                    for kw in range(kw_):
+                        if not math.isfinite(dw[c][o][kh][kw]):
+                            raise ValueError(
+                                "backward 的 dweights 含有非有限值"
+                            )
+        for n in range(n_):
+            for c in range(c_):
+                for ih in range(h_):
+                    for iw in range(w_):
+                        if not math.isfinite(dx[n][c][ih][iw]):
+                            raise ValueError(
+                                "backward 的 dx 含有非有限值"
+                            )
+        for o in range(o_ch):
+            if not math.isfinite(db[o]):
+                raise ValueError("backward 的 dbias 含有非有限值")
+
         return dx, dw, db
 
 
