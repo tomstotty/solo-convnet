@@ -783,6 +783,233 @@ class Conv2D:
         return dx, dw, db
 
 
+class ConvTranspose2D:
+    """二维转置卷积层（NCHW，嵌套 list，标量 stride/padding）。
+
+    weights: [C][O][KH][KW]（第一维输入通道 C、第二维输出通道 O），
+    bias: [O]，输入 x: [N][C][H][W]。
+    stride: 正 int（拒绝 bool），记 S；padding: 非负 int（拒绝 bool），
+    记 P。类型错（含 bool）抛 TypeError，stride 非正或 padding 为负
+    抛 ValueError。
+    输出形状:
+    [N][O][(H-1)*S-2*P+KH][(W-1)*S-2*P+KW]，
+    输出高或宽非正抛 ValueError。每个输出从 bias[o] 起按 c→kh→kw 累加；
+    仅当 (oh+P-kh)、(ow+P-kw) 均可被 S 整除且其商 ih、iw 分别落在
+    [0,H)、[0,W) 内时，加入 x[n][c][ih][iw]*weights[c][o][kh][kw]。
+    backward(dy) 返回 (dx, dweights, dbias)，形状依次同 x、weights、
+    bias，均为全新嵌套 list 且不修改任何实参。dx 各元素按 o→kh→kw、
+    dweights 各元素按 n→ih→iw、dbias 各元素按 n→oh→ow 累加。未成功
+    forward 前调用 backward、dy 与最近一次成功 forward 的输出不同形，
+    或反向计算产生非有限值，均抛 ValueError。forward 失败时旧缓存原样
+    保留，仅成功 forward 才更新缓存。
+    """
+
+    def __init__(self, weights, bias, stride=1, padding=0):
+        if isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError(
+                "stride 必须是 int，得到 %s" % type(stride).__name__
+            )
+        if stride <= 0:
+            raise ValueError("stride 必须为正整数")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError(
+                "padding 必须是 int，得到 %s" % type(padding).__name__
+            )
+        if padding < 0:
+            raise ValueError("padding 必须为非负整数")
+
+        _require_list(weights, "weights")
+        _require_list(bias, "bias")
+        w_shape = _shape_of(weights, 4, "weights")
+        b_shape = _shape_of(bias, 1, "bias")
+        c_in_, o_ch_, kh_, kw_ = w_shape
+        if b_shape[0] != o_ch_:
+            raise ValueError(
+                "bias 长度 %d 与 weights 输出通道数 %d 不符"
+                % (b_shape[0], o_ch_)
+            )
+
+        self._weights = weights
+        self._bias = bias
+        self._stride = stride
+        self._padding = padding
+        self._w_shape = w_shape  # (C, O, KH, KW)
+
+        self._x = None           # 最近一次成功 forward 的输入
+        self._out_shape = None   # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """按转置卷积规则计算输出并缓存输入，返回全新嵌套 list。
+
+        输出 [N][O][OH][OW]，OH=(H-1)*S-2*P+KH、
+        OW=(W-1)*S-2*P+KW；每个输出从 bias[o] 起按 c→kh→kw 累加，仅当
+        (oh+P-kh)、(ow+P-kw) 可被 S 整除且商 ih、iw 有效时加入乘积。
+        输出高/宽非正或计算出现非有限值抛 ValueError。校验或计算失败
+        不改变实参与旧缓存；成功后才缓存输入与输出形状。
+        """
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+        c_in_, o_ch_, kh_, kw_ = self._w_shape
+        if c_ != c_in_:
+            raise ValueError(
+                "输入通道数 %d 与 weights 输入通道数 %d 不符"
+                % (c_, c_in_)
+            )
+        s_ = self._stride
+        p_ = self._padding
+        oh_ = (h_ - 1) * s_ - 2 * p_ + kh_
+        ow_ = (w_ - 1) * s_ - 2 * p_ + kw_
+        if oh_ <= 0 or ow_ <= 0:
+            raise ValueError(
+                "转置卷积输出尺寸非正：OH=%d、OW=%d" % (oh_, ow_)
+            )
+
+        weights = self._weights
+        bias = self._bias
+        out = []
+        for n in range(n_):
+            out_n = []
+            x_n = x[n]
+            for o in range(o_ch_):
+                out_o = []
+                for oh in range(oh_):
+                    row = []
+                    for ow in range(ow_):
+                        acc = bias[o]
+                        for c in range(c_in_):
+                            w_c_o = weights[c][o]
+                            x_c = x_n[c]
+                            for kh in range(kh_):
+                                num_h = oh + p_ - kh
+                                if num_h % s_ != 0:
+                                    continue
+                                ih = num_h // s_
+                                if ih < 0 or ih >= h_:
+                                    continue
+                                x_row = x_c[ih]
+                                w_row = w_c_o[kh]
+                                for kw in range(kw_):
+                                    num_w = ow + p_ - kw
+                                    if num_w % s_ != 0:
+                                        continue
+                                    iw = num_w // s_
+                                    if iw < 0 or iw >= w_:
+                                        continue
+                                    acc += x_row[iw] * w_row[kw]
+                        if isinstance(acc, float) and not math.isfinite(acc):
+                            raise ValueError(
+                                "转置卷积前向计算产生非有限值（NaN/inf）"
+                            )
+                        row.append(acc)
+                    out_o.append(row)
+                out_n.append(out_o)
+            out.append(out_n)
+
+        self._x = x
+        self._out_shape = (n_, o_ch_, oh_, ow_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回 (dx, dweights, dbias)。
+
+        dy 的形状必须等于最近一次成功 forward 的输出形状。未成功
+        forward 前调用一律抛 ValueError。dx 形状同 x、dweights 形状同
+        weights、dbias 形状同 bias；dx 各元素按 o→kh→kw、dweights
+        各元素按 n→ih→iw、dbias 各元素按 n→oh→ow 累加，结果均为全新
+        嵌套 list，不修改实参。计算产生非有限值抛 ValueError。
+        """
+        if self._x is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        x = self._x
+        weights = self._weights
+        n_, o_ch_, oh_, ow_ = self._out_shape
+        c_in_, _, kh_, kw_ = self._w_shape
+        h_ = len(x[0][0])
+        w_ = len(x[0][0][0])
+        s_ = self._stride
+        p_ = self._padding
+
+        dx = _zeros((n_, c_in_, h_, w_))
+        dw = _zeros(self._w_shape)
+        db = _zeros((o_ch_,))
+
+        # dx：每个元素按 o→kh→kw 累加；oh=ih*S-P+kh、ow=iw*S-P+kw
+        # 落在输出范围内的 (kh,kw) 才有贡献。
+        for n in range(n_):
+            for c in range(c_in_):
+                for ih in range(h_):
+                    dx_row = dx[n][c][ih]
+                    for iw in range(w_):
+                        cell = 0
+                        for o in range(o_ch_):
+                            w_c_o = weights[c][o]
+                            dy_o = dy[n][o]
+                            for kh in range(kh_):
+                                coh = ih * s_ - p_ + kh
+                                if coh < 0 or coh >= oh_:
+                                    continue
+                                dy_row = dy_o[coh]
+                                w_row = w_c_o[kh]
+                                for kw in range(kw_):
+                                    cow = iw * s_ - p_ + kw
+                                    if 0 <= cow < ow_:
+                                        cell += dy_row[cow] * w_row[kw]
+                        if isinstance(cell, float) and not math.isfinite(cell):
+                            raise ValueError(
+                                "转置卷积反向 dx 计算产生非有限值（NaN/inf）"
+                            )
+                        dx_row[iw] = cell
+
+        # dweights：每个元素按 n→ih→iw 累加。
+        for c in range(c_in_):
+            for o in range(o_ch_):
+                for kh in range(kh_):
+                    for kw in range(kw_):
+                        cell = 0
+                        for n in range(n_):
+                            for ih in range(h_):
+                                coh = ih * s_ - p_ + kh
+                                if coh < 0 or coh >= oh_:
+                                    continue
+                                for iw in range(w_):
+                                    cow = iw * s_ - p_ + kw
+                                    if 0 <= cow < ow_:
+                                        cell += (
+                                            dy[n][o][coh][cow]
+                                            * x[n][c][ih][iw]
+                                        )
+                        if isinstance(cell, float) and not math.isfinite(cell):
+                            raise ValueError(
+                                "转置卷积反向 dweights 计算产生非有限值"
+                                "（NaN/inf）"
+                            )
+                        dw[c][o][kh][kw] = cell
+
+        # dbias：每个元素按 n→oh→ow 累加。
+        for o in range(o_ch_):
+            cell = 0
+            for n in range(n_):
+                for coh in range(oh_):
+                    dy_row = dy[n][o][coh]
+                    for cow in range(ow_):
+                        cell += dy_row[cow]
+            if isinstance(cell, float) and not math.isfinite(cell):
+                raise ValueError(
+                    "转置卷积反向 dbias 计算产生非有限值（NaN/inf）"
+                )
+            db[o] = cell
+
+        return dx, dw, db
+
+
 class MaxPool2D:
     """二维最大池化层（NCHW，嵌套 list，逐通道池化）。
 
