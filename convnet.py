@@ -8057,6 +8057,230 @@ def _cmd_valgatebatchdiff(baseline_path, current_path, output_path):
     return 0 if overall else 3
 
 
+# ---------------------------------------------------------------------------
+# 命令行跨批次趋势闸门：
+# python convnet.py valgatebatchtrend MANIFEST OUTPUT
+# ---------------------------------------------------------------------------
+
+_VALGATEBATCHTREND_MANIFEST_KEYS = ["reports"]
+
+
+def _load_valgatebatchtrend_manifest(raw, manifest_dir):
+    """按 valgatebatchtrend 契约从 MANIFEST 原始字节解析并严格校验。
+
+    raw 不得含 UTF-8 BOM 或字符串字面量之外的任何 JSON 空白（空格、
+    制表、换行、回车），须为紧凑 UTF-8 JSON 对象；唯一键 reports 为长度
+    >= 2 的非空 str 列表（拒绝其他任何 JSON 类型、空字符串、重复/缺失/
+    额外/错序键）并拒绝 NaN/Infinity 常量。相对报告路径以清单目录解析
+    （绝对路径原样使用）为 abspath，各报告绝对化后须两两不同，否则
+    ValueError（MANIFEST/OUTPUT 与报告的冲突由命令层另行校验）。返回按
+    清单顺序的报告 abspath 列表；非法 UTF-8/JSON 或契约不符分别抛
+    UnicodeDecodeError/ValueError/TypeError。
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError(
+            "MANIFEST 必须是 bytes，得到 %s" % type(raw).__name__
+        )
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("MANIFEST 不得含 UTF-8 BOM")
+    text = raw.decode("utf-8")
+    _reject_json_whitespace(raw)
+    _reject_json_constants(raw)
+    doc = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(doc, dict):
+        raise TypeError("MANIFEST 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _VALGATEBATCHTREND_MANIFEST_KEYS:
+        raise ValueError("MANIFEST 唯一键必须为 reports")
+    reports = doc["reports"]
+    if not isinstance(reports, list):
+        raise TypeError(
+            "reports 必须是 list，得到 %s" % type(reports).__name__
+        )
+    if len(reports) < 2:
+        raise ValueError("reports 长度必须 >= 2，得到 %d" % len(reports))
+
+    paths = []
+    seen = set()
+    for idx, value in enumerate(reports):
+        if not isinstance(value, str):
+            raise TypeError(
+                "reports[%d] 必须是非空 str，得到 %s"
+                % (idx, type(value).__name__)
+            )
+        if len(value) == 0:
+            raise ValueError("reports[%d] 不得为空字符串" % idx)
+        path = os.path.abspath(os.path.join(manifest_dir, value))
+        if path in seen:
+            raise ValueError(
+                "各报告路径绝对化后必须两两不同，重复：%s" % path
+            )
+        seen.add(path)
+        paths.append(path)
+    return paths
+
+
+def _valgatebatchtrend_compute(manifest_path):
+    """读取 MANIFEST 与全部 valgatebatch 产物，返回趋势报告 dict。
+
+    MANIFEST 的严格契约见 _load_valgatebatchtrend_manifest；各报告沿用
+    _load_valgatebatch_output 的 valgatebatch 产物契约。所有报告的
+    gate_count 必须相等，且 results 的 name 顺序须逐项一致（数量相同但
+    顺序/名称不同一律拒绝）。对每个 name 与每个指标（balanced_accuracy、
+    macro_f1），取相邻报告（后值减前值，未舍入 float 相减）中的最小
+    差值；差值相等时取最早的一对（最小 from_index）。差值 >= 0 该指标
+    才通过，差值非有限即失败（契约上不会发生，防御性校验）。
+
+    返回 dict（键依次为 report_count、gate_count、results、pass）：
+    results 按 name 顺序，每项键依次为 name、ba、f1、pass；ba/f1 键
+    依次为 worst_delta（float）、from_index、to_index（int，reports
+    零基下标）、pass（bool）；项 pass 为 ba/f1 pass 之与，顶层 pass
+    为各项 pass 之与。输入不可读或契约不符抛
+    OSError/UnicodeDecodeError/ValueError/TypeError。
+    """
+    manifest_abs = os.path.abspath(manifest_path)
+    manifest_dir = os.path.dirname(manifest_abs)
+    with open(manifest_path, "rb") as f:
+        manifest_raw = f.read()
+    report_paths = _load_valgatebatchtrend_manifest(
+        manifest_raw, manifest_dir
+    )
+
+    parsed = []
+    for path in report_paths:
+        with open(path, "rb") as f:
+            raw = f.read()
+        parsed.append(_load_valgatebatch_output(raw))
+
+    first_count, first_items = parsed[0]
+    for rep_idx in range(1, len(parsed)):
+        count, items = parsed[rep_idx]
+        if count != first_count:
+            raise ValueError(
+                "reports[%d] gate_count 与 reports[0] 不一致：%d != %d"
+                % (rep_idx, count, first_count)
+            )
+        for idx, (first_item, item) in enumerate(zip(first_items, items)):
+            if item[0] != first_item[0]:
+                raise ValueError(
+                    "reports[%d].results[%d] 的 name 顺序不一致："
+                    "%r != %r" % (rep_idx, idx, item[0], first_item[0])
+                )
+
+    results = []
+    overall = True
+    for gate_idx, (name, _ba, _f1) in enumerate(first_items):
+        metric_blocks = []
+        item_pass = True
+        for metric_idx, metric_name in enumerate(("ba", "f1")):
+            worst_delta = None
+            worst_from = -1
+            worst_to = -1
+            for pair_idx in range(len(parsed) - 1):
+                prev_value = parsed[pair_idx][1][gate_idx][metric_idx + 1]
+                next_value = parsed[pair_idx + 1][1][gate_idx][metric_idx + 1]
+                delta = next_value - prev_value
+                if not math.isfinite(delta):
+                    raise ValueError(
+                        "name=%r 的 %s 在 reports[%d]->reports[%d] "
+                        "差值非有限"
+                        % (name, metric_name, pair_idx, pair_idx + 1)
+                    )
+                # 平局取最早一对：仅严格更小才替换。
+                if worst_delta is None or delta < worst_delta:
+                    worst_delta = delta
+                    worst_from = pair_idx
+                    worst_to = pair_idx + 1
+            if worst_delta == 0.0:
+                worst_delta = 0.0
+            metric_pass = worst_delta >= 0.0
+            if not metric_pass:
+                item_pass = False
+            metric_blocks.append(
+                (
+                    metric_name,
+                    {
+                        "worst_delta": worst_delta,
+                        "from_index": worst_from,
+                        "to_index": worst_to,
+                        "pass": bool(metric_pass),
+                    },
+                )
+            )
+        if not item_pass:
+            overall = False
+        results.append(
+            {
+                "name": name,
+                "ba": metric_blocks[0][1],
+                "f1": metric_blocks[1][1],
+                "pass": bool(item_pass),
+            }
+        )
+
+    return {
+        "report_count": len(parsed),
+        "gate_count": first_count,
+        "results": results,
+        "pass": bool(overall),
+    }
+
+
+def _cmd_valgatebatchtrend(manifest_path, output_path):
+    """valgatebatchtrend 子命令主体；全部 name 两指标均非回归退出 0、
+    合法但存在回归退出 3、契约/路径/I-O 失败退出 1 且不改 OUTPUT。
+
+    MANIFEST 的严格契约见 _load_valgatebatchtrend_manifest：reports
+    为长度 >= 2 的非空 str 列表，相对路径以 MANIFEST 所在目录解析；
+    相对 OUTPUT 同样以 MANIFEST 所在目录解析（绝对路径原样使用）。
+    绝对化后 MANIFEST、OUTPUT 与各报告路径须两两不同，任一冲突即失败
+    退出 1 且不触碰 OUTPUT。各报告完全复用 _load_valgatebatch_output
+    的 valgatebatch 产物契约，gate_count 及 results 的 name 顺序须跨
+    全部报告一致；对相邻报告取 balanced_accuracy、macro_f1 的后值减
+    前值，各指标取最小差值（平局取最早一对），差值 >= 0 才通过，
+    非有限失败。
+
+    OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），顶层键依次为
+    report_count、gate_count（int）、results（list）、pass（bool）；
+    results 按 name 顺序，每项键依次为 name（str）、ba、f1、pass；
+    ba/f1 键依次为 worst_delta（有限 float，固定 12 位小数、负零
+    归零）、from_index、to_index（int，reports 零基下标）、pass
+    （bool）；同一输入重复运行逐字节相同，标准输出为空。
+    """
+    overall = False
+    try:
+        manifest_abs = os.path.abspath(manifest_path)
+        manifest_dir = os.path.dirname(manifest_abs)
+        # 相对 OUTPUT 以 MANIFEST 所在目录解析（绝对路径原样使用）。
+        out_abs = os.path.abspath(os.path.join(manifest_dir, output_path))
+        if out_abs == manifest_abs:
+            raise ValueError("OUTPUT 与 MANIFEST 不能是同一路径")
+
+        with open(manifest_path, "rb") as f:
+            manifest_raw = f.read()
+        report_paths = _load_valgatebatchtrend_manifest(
+            manifest_raw, manifest_dir
+        )
+        # 清单内各报告两两不同已由加载器保证；绝对化后 MANIFEST、OUTPUT
+        # 与全部报告路径亦须两两不同。
+        for path in report_paths:
+            if path == manifest_abs:
+                raise ValueError(
+                    "MANIFEST 与报告路径不能是同一路径：%s" % path
+                )
+            if path == out_abs:
+                raise ValueError(
+                    "OUTPUT 与报告路径不能是同一路径：%s" % path
+                )
+
+        report = _valgatebatchtrend_compute(manifest_path)
+        overall = report["pass"]
+        payload = (_dump_compact(report) + "\n").encode("utf-8")
+        _atomic_write_output(out_abs, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if overall else 3
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
@@ -8068,7 +8292,8 @@ def main(argv):
     valreport STATS VAL OUTPUT、
     valgate STATS VAL CONFIG OUTPUT、
     valgatebatch MANIFEST OUTPUT 与
-    valgatebatchdiff BASELINE CURRENT OUTPUT。
+    valgatebatchdiff BASELINE CURRENT OUTPUT、
+    valgatebatchtrend MANIFEST OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -8118,6 +8343,8 @@ def main(argv):
         return _cmd_valgatebatch(argv[2], argv[3])
     if len(argv) == 5 and argv[1] == "valgatebatchdiff":
         return _cmd_valgatebatchdiff(argv[2], argv[3], argv[4])
+    if len(argv) == 4 and argv[1] == "valgatebatchtrend":
+        return _cmd_valgatebatchtrend(argv[2], argv[3])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -8141,6 +8368,7 @@ def main(argv):
         "valgate",
         "valgatebatch",
         "valgatebatchdiff",
+        "valgatebatchtrend",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
