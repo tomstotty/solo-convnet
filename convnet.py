@@ -2789,6 +2789,8 @@ def _dump_compact(value):
         return str(value)
     if isinstance(value, float):
         return _fmt_float(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ",".join(_dump_compact(v) for v in value) + "]"
     raise TypeError("产物含不支持的类型：%s" % type(value).__name__)
@@ -5903,6 +5905,18 @@ def _reject_json_constants(data):
             raise ValueError("JSON 不允许 NaN/Infinity/-Infinity 常量")
 
 
+# 紧凑 JSON 不得含结构性空白；字符串字面量内部的空格属于数据（紧凑序列化
+# 不会转义空格），逐字节扫描时跳过字符串，仅在字面量之外命中空白才拒绝。
+_JSON_WS_TOKEN_RE = re.compile(rb'"(?:[^"\\]|\\.)*"|([ \t\n\r])', re.DOTALL)
+
+
+def _reject_json_whitespace(data):
+    """拒绝字符串字面量之外的空格/制表/换行/回车（即要求紧凑序列化）。"""
+    for match in _JSON_WS_TOKEN_RE.finditer(data):
+        if match.group(1) is not None:
+            raise ValueError("不得含结构性空白，须为紧凑 JSON")
+
+
 def _validate_norm_checkpoint_layers(layers):
     """检查点的七层合法性：结构契约 + fitnorm 配置/形状/有限性。
 
@@ -7408,16 +7422,89 @@ def _load_valgate_config(raw):
     return thresholds
 
 
+def _valgate_compute(stats_path, val_path, config_path):
+    """按 valgate 契约读取 STATS/VAL/CONFIG 并重算末轮闸门指标。
+
+    STATS/VAL 的加载、摘要绑定、epoch>=1 校验、以保存模型与 BN 统计
+    关闭 Dropout 重算末轮混淆矩阵并与历史末项核对，全部沿用
+    _cmd_valreport；CONFIG 的严格契约见 _load_valgate_config。由重算
+    混淆矩阵按 valreport 公式取得未舍入 balanced_accuracy、macro_f1，
+    逐项以实测值 >= 阈值判定，pass 为两项之与。
+
+    返回 dict（键依次为 epoch、sample_count、balanced_accuracy、
+    macro_f1、min_balanced_accuracy、min_macro_f1、
+    balanced_accuracy_pass、macro_f1_pass、pass）：前两项 int、
+    中间四项未舍入 float、末三项 bool。路径不存在/不可读、UTF-8/JSON
+    非法、契约或摘要不符、推理非有限分别抛 OSError/UnicodeDecodeError/
+    ValueError/TypeError。
+    """
+    with open(val_path, "rb") as f:
+        val_raw = f.read()
+    val_digest = hashlib.sha256(val_raw).hexdigest()
+    x_val, val_labels = _parse_fitdata(val_raw)
+    n_val = len(val_labels)
+
+    with open(stats_path, "rb") as f:
+        stats_raw = f.read()
+    # 同 valreport：不读 TRAIN，以产物自身的 train_sha 为期望摘要
+    # （仅格式受严格校验），val_sha 与 VAL 实际摘要逐字符比对。
+    pre_doc = json.loads(stats_raw.decode("utf-8"))
+    train_sha = (
+        pre_doc.get("train_sha") if isinstance(pre_doc, dict) else None
+    )
+    state = _load_resumevalstats_checkpoint(
+        stats_raw, train_sha, val_digest, n_val
+    )
+    epoch = state["epoch"]
+    if epoch < 1:
+        raise ValueError("STATS 产物 epoch 必须 >= 1")
+
+    with open(config_path, "rb") as f:
+        config_raw = f.read()
+    thresholds = _load_valgate_config(config_raw)
+
+    layers, _start = _layers_from_checkpoint_state(state)
+    (
+        _val_loss, _accuracy,
+        _class_correct, _class_total, confusion,
+    ) = _eval_norm_stats(layers, x_val, val_labels)
+    if confusion != state["confusion"][-1]:
+        raise ValueError("重算混淆矩阵与产物历史末项不符")
+
+    # 公式同 _cmd_valreport：使用未舍入实测值，仅写出时格式化为 12 位。
+    recall = []
+    f1 = []
+    for c in range(2):
+        col_sum = confusion[0][c] + confusion[1][c]
+        row_sum = confusion[c][0] + confusion[c][1]
+        p = confusion[c][c] / col_sum if col_sum else 0.0
+        r = confusion[c][c] / row_sum if row_sum else 0.0
+        recall.append(r)
+        f1.append(0.0 if p + r == 0.0 else 2.0 * p * r / (p + r))
+    balanced_accuracy = (recall[0] + recall[1]) / 2
+    macro_f1 = (f1[0] + f1[1]) / 2
+
+    ba_pass = balanced_accuracy >= thresholds["balanced_accuracy"]
+    f1_pass = macro_f1 >= thresholds["macro_f1"]
+    return {
+        "epoch": epoch,
+        "sample_count": n_val,
+        "balanced_accuracy": balanced_accuracy,
+        "macro_f1": macro_f1,
+        "min_balanced_accuracy": thresholds["balanced_accuracy"],
+        "min_macro_f1": thresholds["macro_f1"],
+        "balanced_accuracy_pass": bool(ba_pass),
+        "macro_f1_pass": bool(f1_pass),
+        "pass": bool(ba_pass and f1_pass),
+    }
+
+
 def _cmd_valgate(stats_path, val_path, config_path, output_path):
     """valgate 子命令主体；达标退出 0、合法未达标退出 3、契约/路径/I-O
     失败退出 1 且不改 OUTPUT。
 
-    STATS/VAL 的加载、摘要绑定、epoch>=1 校验、以保存模型与 BN 统计
-    关闭 Dropout 重算末轮混淆矩阵并与历史末项核对，全部沿用
-    _cmd_valreport；STATS、VAL、CONFIG、OUTPUT 四路径必须两两不同。
-    CONFIG 的严格契约见 _load_valgate_config。由重算混淆矩阵按
-    valreport 公式取得未舍入 balanced_accuracy、macro_f1，逐项以
-    实测值 >= 阈值判定，pass 为两项之与。
+    STATS、VAL、CONFIG、OUTPUT 四路径必须两两不同。校验、重算与未舍入
+    比较契约见 _valgate_compute。
 
     OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），键依次为 epoch（int）、
     sample_count（int）、balanced_accuracy/macro_f1/min_balanced_accuracy/
@@ -7442,66 +7529,170 @@ def _cmd_valgate(stats_path, val_path, config_path, output_path):
         if os.path.abspath(val_path) == os.path.abspath(config_path):
             raise ValueError("VAL 与 CONFIG 不能是同一路径")
 
-        with open(val_path, "rb") as f:
-            val_raw = f.read()
-        val_digest = hashlib.sha256(val_raw).hexdigest()
-        x_val, val_labels = _parse_fitdata(val_raw)
-        n_val = len(val_labels)
+        report = _valgate_compute(stats_path, val_path, config_path)
+        overall = report["pass"]
+        payload = (_dump_compact(report) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if overall else 3
 
-        with open(stats_path, "rb") as f:
-            stats_raw = f.read()
-        # 同 valreport：不读 TRAIN，以产物自身的 train_sha 为期望摘要
-        # （仅格式受严格校验），val_sha 与 VAL 实际摘要逐字符比对。
-        pre_doc = json.loads(stats_raw.decode("utf-8"))
-        train_sha = (
-            pre_doc.get("train_sha") if isinstance(pre_doc, dict) else None
+
+# ---------------------------------------------------------------------------
+# 命令行批量末轮阈值闸门：
+# python convnet.py valgatebatch MANIFEST OUTPUT
+# ---------------------------------------------------------------------------
+
+_VALGATEBATCH_MANIFEST_KEYS = ["gates"]
+_VALGATEBATCH_ITEM_KEYS = ["name", "stats", "val", "config"]
+
+
+def _load_valgatebatch_manifest(raw, manifest_dir):
+    """按 valgatebatch 契约从 MANIFEST 原始字节解析并严格校验。
+
+    raw 不得含 UTF-8 BOM 或字符串字面量之外的任何 JSON 空白（空格、
+    制表、换行、回车），须为紧凑 UTF-8 JSON 对象；唯一键 gates 为长度
+    >= 2 的 list，重复/缺失/额外/错序键（含各闸门对象内部）一律拒绝
+    （object_pairs_hook 逐对象查重）并拒绝 NaN/Infinity 常量。各项须为
+    JSON 对象，键仅依次
+    为 name、stats、val、config；四值均为非空 str（拒绝其他任何 JSON
+    类型），且 name 全局唯一。stats/val/config 相对清单目录解析
+    （绝对路径原样使用）为 abspath，跨全部闸门两两不同，否则 ValueError。
+    返回按清单顺序的 (name, stats_path, val_path, config_path) 列表；
+    非法 UTF-8/JSON 或契约不符分别抛 UnicodeDecodeError/ValueError/
+    TypeError。
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError(
+            "MANIFEST 必须是 bytes，得到 %s" % type(raw).__name__
         )
-        state = _load_resumevalstats_checkpoint(
-            stats_raw, train_sha, val_digest, n_val
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("MANIFEST 不得含 UTF-8 BOM")
+    text = raw.decode("utf-8")
+    _reject_json_whitespace(raw)
+    _reject_json_constants(raw)
+    doc = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(doc, dict):
+        raise TypeError("MANIFEST 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _VALGATEBATCH_MANIFEST_KEYS:
+        raise ValueError("MANIFEST 唯一键必须为 gates")
+    gates = doc["gates"]
+    if not isinstance(gates, list):
+        raise TypeError("gates 必须是 list，得到 %s" % type(gates).__name__)
+    if len(gates) < 2:
+        raise ValueError("gates 长度必须 >= 2，得到 %d" % len(gates))
+
+    groups = []
+    names = set()
+    seen_paths = set()
+    for idx, item in enumerate(gates):
+        if not isinstance(item, dict):
+            raise TypeError("gates[%d] 必须是 JSON 对象" % idx)
+        if list(item.keys()) != _VALGATEBATCH_ITEM_KEYS:
+            raise ValueError(
+                "gates[%d] 的键必须依次为 name、stats、val、config" % idx
+            )
+        values = {}
+        for key in _VALGATEBATCH_ITEM_KEYS:
+            value = item[key]
+            if not isinstance(value, str):
+                raise TypeError(
+                    "gates[%d].%s 必须是非空 str，得到 %s"
+                    % (idx, key, type(value).__name__)
+                )
+            if len(value) == 0:
+                raise ValueError("gates[%d].%s 不得为空字符串" % (idx, key))
+            values[key] = value
+        name = values["name"]
+        if name in names:
+            raise ValueError("gates 的 name 必须唯一，重复：%r" % name)
+        names.add(name)
+
+        resolved = {}
+        for key in ("stats", "val", "config"):
+            path = os.path.abspath(os.path.join(manifest_dir, values[key]))
+            if path in seen_paths:
+                raise ValueError(
+                    "gates 的 stats/val/config 路径必须两两不同，"
+                    "%s 重复指向 %s" % (key, path)
+                )
+            seen_paths.add(path)
+            resolved[key] = path
+        groups.append(
+            (name, resolved["stats"], resolved["val"], resolved["config"])
         )
-        epoch = state["epoch"]
-        if epoch < 1:
-            raise ValueError("STATS 产物 epoch 必须 >= 1")
+    return groups
 
-        with open(config_path, "rb") as f:
-            config_raw = f.read()
-        thresholds = _load_valgate_config(config_raw)
 
-        layers, _start = _layers_from_checkpoint_state(state)
-        (
-            _val_loss, _accuracy,
-            _class_correct, _class_total, confusion,
-        ) = _eval_norm_stats(layers, x_val, val_labels)
-        if confusion != state["confusion"][-1]:
-            raise ValueError("重算混淆矩阵与产物历史末项不符")
+def _cmd_valgatebatch(manifest_path, output_path):
+    """valgatebatch 子命令主体；全组达标退出 0、合法但未全过退出 3、
+    契约/路径/I-O 失败退出 1 且不改 OUTPUT。
 
-        # 公式同 _cmd_valreport：使用未舍入实测值，仅写出时格式化为 12 位。
-        recall = []
-        f1 = []
-        for c in range(2):
-            col_sum = confusion[0][c] + confusion[1][c]
-            row_sum = confusion[c][0] + confusion[c][1]
-            p = confusion[c][c] / col_sum if col_sum else 0.0
-            r = confusion[c][c] / row_sum if row_sum else 0.0
-            recall.append(r)
-            f1.append(0.0 if p + r == 0.0 else 2.0 * p * r / (p + r))
-        balanced_accuracy = (recall[0] + recall[1]) / 2
-        macro_f1 = (f1[0] + f1[1]) / 2
+    MANIFEST 的严格契约见 _load_valgatebatch_manifest：闸门数 >= 2，
+    name 唯一，清单内 stats/val/config 相对清单目录解析且跨全部闸门
+    两两不同。OUTPUT 另须与 MANIFEST 及所有闸门输入路径不同。每组
+    完全复用 _valgate_compute（即 valgate 对 STATS、VAL、CONFIG 的
+    校验、混淆矩阵重算比对与未舍入阈值比较契约）；任一组失败即整体
+    失败退出 1，OUTPUT 原样保留（所有组重算完成后才一次性原子写盘）。
 
-        ba_pass = balanced_accuracy >= thresholds["balanced_accuracy"]
-        f1_pass = macro_f1 >= thresholds["macro_f1"]
-        overall = bool(ba_pass and f1_pass)
+    OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），顶层键依次为
+    gate_count（int）、passed_count（int）、results（list）、pass
+    （bool，各项 pass 之与）；results 按 gates 顺序，每项键依次为
+    name（str）、epoch、sample_count（int）、balanced_accuracy、
+    macro_f1、min_balanced_accuracy、min_macro_f1（有限 float，固定
+    12 位小数、负零归零）、balanced_accuracy_pass、macro_f1_pass、
+    pass（bool）；同一输入重复运行逐字节相同，标准输出为空。
+    """
+    overall = False
+    try:
+        manifest_abs = os.path.abspath(manifest_path)
+        out_abs = os.path.abspath(output_path)
+        if out_abs == manifest_abs:
+            raise ValueError("OUTPUT 与 MANIFEST 不能是同一路径")
 
+        with open(manifest_path, "rb") as f:
+            manifest_raw = f.read()
+        manifest_dir = os.path.dirname(manifest_abs)
+        groups = _load_valgatebatch_manifest(manifest_raw, manifest_dir)
+
+        # 清单内路径两两不同已由加载器保证；OUTPUT/MANIFEST 也不得与
+        # 任何闸门输入路径重合。
+        for _name, stats_path, val_path, config_path in groups:
+            for path in (stats_path, val_path, config_path):
+                if path == out_abs:
+                    raise ValueError(
+                        "OUTPUT 与闸门输入路径不能是同一路径：%s" % path
+                    )
+                if path == manifest_abs:
+                    raise ValueError(
+                        "MANIFEST 与闸门输入路径不能是同一路径：%s" % path
+                    )
+
+        results = []
+        passed_count = 0
+        for name, stats_path, val_path, config_path in groups:
+            metrics = _valgate_compute(stats_path, val_path, config_path)
+            if metrics["pass"]:
+                passed_count += 1
+            results.append({
+                "name": name,
+                "epoch": metrics["epoch"],
+                "sample_count": metrics["sample_count"],
+                "balanced_accuracy": metrics["balanced_accuracy"],
+                "macro_f1": metrics["macro_f1"],
+                "min_balanced_accuracy": metrics["min_balanced_accuracy"],
+                "min_macro_f1": metrics["min_macro_f1"],
+                "balanced_accuracy_pass": metrics["balanced_accuracy_pass"],
+                "macro_f1_pass": metrics["macro_f1_pass"],
+                "pass": metrics["pass"],
+            })
+
+        overall = passed_count == len(groups)
         report = {
-            "epoch": epoch,
-            "sample_count": n_val,
-            "balanced_accuracy": balanced_accuracy,
-            "macro_f1": macro_f1,
-            "min_balanced_accuracy": thresholds["balanced_accuracy"],
-            "min_macro_f1": thresholds["macro_f1"],
-            "balanced_accuracy_pass": bool(ba_pass),
-            "macro_f1_pass": bool(f1_pass),
-            "pass": overall,
+            "gate_count": len(groups),
+            "passed_count": passed_count,
+            "results": results,
+            "pass": bool(overall),
         }
         payload = (_dump_compact(report) + "\n").encode("utf-8")
         _atomic_write_output(output_path, payload)
@@ -7518,8 +7709,9 @@ def main(argv):
     resumenorm INPUT EPOCHS OUTPUT、resumedata DATA INPUT EPOCHS OUTPUT、
     resumeval TRAIN VAL INPUT EPOCHS OUTPUT、
     resumevalstats TRAIN VAL INPUT EPOCHS OUTPUT、
-    valreport STATS VAL OUTPUT 与
-    valgate STATS VAL CONFIG OUTPUT。
+    valreport STATS VAL OUTPUT、
+    valgate STATS VAL CONFIG OUTPUT 与
+    valgatebatch MANIFEST OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -7565,6 +7757,8 @@ def main(argv):
         return _cmd_valreport(argv[2], argv[3], argv[4])
     if len(argv) == 6 and argv[1] == "valgate":
         return _cmd_valgate(argv[2], argv[3], argv[4], argv[5])
+    if len(argv) == 4 and argv[1] == "valgatebatch":
+        return _cmd_valgatebatch(argv[2], argv[3])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -7586,6 +7780,7 @@ def main(argv):
         "resumevalstats",
         "valreport",
         "valgate",
+        "valgatebatch",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
