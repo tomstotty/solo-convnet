@@ -55,15 +55,21 @@
   错抛 TypeError，长度错或 BN/Dropout 非训练态抛 ValueError；成功
   保留更新与状态推进，任何异常都把九层（含参数引用）恢复到入口状态。
 - train_deep_batches(layers, x, labels, batch_size=1, epochs=1, lr=0.1,
-  seed=0, shuffle=True, clip=None)：每轮按 [0,…,N-1]（shuffle 为真时以
-  seed 起始、跨轮延续的 32 位 LCG 做 Fisher–Yates 洗牌）切分为大小
-  batch_size 的批（末批可短），逐批按 train_deep_step 次序前反向，并在
-  同步 SGD 更新前依次展平 conv 权重/偏置、BN gamma/beta、两个 Linear
-  权重/偏置八组梯度，以 sqrt(fsum(g*g)) 求裁剪前全局范数；clip 非 None
-  且范数大于 clip 时八组梯度同乘 clip/norm，更新不额外除批量。返回
-  (losses, grad_norms)，均为按轮、批顺序排列、长度
-  epochs*ceil(N/batch_size) 的各批更新前批均损失与裁剪前范数新
-  list[float]；任何异常都把九层（含参数引用）整体恢复到入口状态。
+  seed=0, shuffle=True, clip=None, state=None, max_batches=None)：每轮按
+  [0,…,N-1]（shuffle 为真时以 seed 起始、跨轮延续的 32 位 LCG 做
+  Fisher–Yates 洗牌）切分为大小 batch_size 的批（末批可短），逐批按
+  train_deep_step 次序前反向，并在同步 SGD 更新前依次展平 conv
+  权重/偏置、BN gamma/beta、两个 Linear 权重/偏置八组梯度，以
+  sqrt(fsum(g*g)) 求裁剪前全局范数；clip 非 None 且范数大于 clip 时
+  八组梯度同乘 clip/norm，更新不额外除批量。state、max_batches 均为
+  None 时返回 (losses, grad_norms)，长度均为
+  epochs*ceil(N/batch_size)；任一非 None 时返回
+  (losses, grad_norms, state)，前两项仅记录本次批。state 为 None 或
+  (epoch, order, cursor, rng)（None 等价 (0,[],0,seed)），仅在轮界
+  洗牌、批后推进 cursor、轮毕 epoch 加一并清空 order；max_batches 为
+  None 完成剩余批，或为非负 int 限定本次批数（0 不训练）。任意批边界
+  切分的多次调用拼接后与一次训完逐值相同；任何异常都把九层（含参数
+  引用）整体恢复到入口状态，且不修改传入 state。
 - check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6,
   rtol=1e-4)：以中心差分依次检验 x 与上述八组参数的数值梯度，损失、
   误差、容差判定与 (ok, max_e, max_r) 返回沿用 check_train_gradients；
@@ -6273,9 +6279,85 @@ def train_norm_batches(
         raise
 
 
+def _check_deep_resume_state(state, epochs, n_, batch_size):
+    """校验分批续训状态 (epoch, order, cursor, rng)。
+
+    state 必须是恰含 4 项的 tuple：epoch/cursor/rng 为 int、order 为
+    int list，四者及其元素均拒绝 bool——容器或成员类型错抛 TypeError，
+    元组长度错抛 ValueError。范围/关系错抛 ValueError：epoch ∈
+    [0, epochs]；rng ∈ [0, 2^32-1]；order 仅允许为空（此时 cursor
+    必须为 0，表示轮界）或长度恰为 N 的 0..N-1 全排列（此时 cursor
+    必须是 [0, N) 内与 batch_size 对齐的下一批样本起点）；epoch 等于
+    epochs 时不得残留未完成的轮。
+    """
+    if not isinstance(state, tuple):
+        raise TypeError(
+            "state 必须是 None 或 4 元组 (epoch, order, cursor, rng)，"
+            "得到 %s" % type(state).__name__
+        )
+    if len(state) != 4:
+        raise ValueError(
+            "state 必须恰含 4 项 (epoch, order, cursor, rng)，得到 %d 项"
+            % len(state)
+        )
+    epoch_v, order_v, cursor_v, rng_v = state
+    for name_, value in (("epoch", epoch_v), ("cursor", cursor_v),
+                         ("rng", rng_v)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                "state.%s 必须是 int（拒绝 bool），得到 %s"
+                % (name_, type(value).__name__)
+            )
+    if isinstance(order_v, bool) or not isinstance(order_v, list):
+        raise TypeError(
+            "state.order 必须是 int list，得到 %s"
+            % type(order_v).__name__
+        )
+    for k in order_v:
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TypeError(
+                "state.order 元素必须是 int（拒绝 bool），得到 %s"
+                % type(k).__name__
+            )
+    if epoch_v < 0 or epoch_v > epochs:
+        raise ValueError(
+            "state.epoch 必须满足 0 <= epoch <= epochs(%d)，得到 %d"
+            % (epochs, epoch_v)
+        )
+    if rng_v < 0 or rng_v > 0xFFFFFFFF:
+        raise ValueError("state.rng 必须满足 0 <= rng <= 2^32-1")
+    if len(order_v) == 0:
+        if cursor_v != 0:
+            raise ValueError(
+                "state.order 为空（轮界）时 cursor 必须为 0，得到 %d"
+                % cursor_v
+            )
+    else:
+        if len(order_v) != n_:
+            raise ValueError(
+                "state.order 长度 %d 必须为 0 或样本数 %d"
+                % (len(order_v), n_)
+            )
+        if sorted(order_v) != list(range(n_)):
+            raise ValueError(
+                "state.order 非空时必须是 0..N-1 的全排列"
+            )
+        if cursor_v < 0 or cursor_v >= n_:
+            raise ValueError(
+                "state.order 非空时 cursor 必须满足 0 <= cursor < N"
+            )
+        if cursor_v % batch_size != 0:
+            raise ValueError(
+                "state.cursor %d 不是 batch_size=%d 对齐的批起点"
+                % (cursor_v, batch_size)
+            )
+    if epoch_v >= epochs and len(order_v) != 0:
+        raise ValueError("state.epoch 等于 epochs 时不得残留未完成的轮")
+
+
 def train_deep_batches(
     layers, x, labels, batch_size=1, epochs=1, lr=0.1, seed=0,
-    shuffle=True, clip=None,
+    shuffle=True, clip=None, state=None, max_batches=None,
 ):
     """九层网络（Conv2D/BN/Dropout/(MaxPool 或
     AdaptiveAvgPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头）
@@ -6311,9 +6393,33 @@ def train_deep_batches(
 
     任一失败（含参数校验、x/labels 不匹配与各批前反向、非有限值错误）都把
     九层的参数引用、模式、缓存、BN 运行统计、Dropout 随机状态与掩码整体
-    恢复到函数入口状态，且不修改 x、labels 及构造参数所用的原 list；成功时
-    保留全部参数更新与各批带来的 BN 统计、Dropout 随机推进。相同入口状态
-    结果完全确定。
+    恢复到函数入口状态，且不修改 x、labels、传入 state 及构造参数所用的
+    原 list；成功时保留全部参数更新与各批带来的 BN 统计、Dropout 随机
+    推进。相同入口状态结果完全确定。
+
+    state、max_batches 均为默认 None 时签名与行为同旧版，返回
+    (losses, grad_norms)；任一非 None 时返回 (losses, grad_norms,
+    new_state)，前两项只记录本调用实际执行的批。
+
+    max_batches 必须为 None 或非负 int（拒绝 bool）：类型错抛
+    TypeError，负值抛 ValueError；为 0 时不训练任何批。None 表示完成
+    剩余全部批。
+
+    state 必须为 None 或 (epoch, order, cursor, rng)：None 等价
+    (0, [], 0, seed)。epoch/cursor/rng 为 int、order 为 int list，元素
+    同样拒绝 bool，类型错抛 TypeError，元组长度错抛 ValueError。
+    epoch ∈ [0, epochs]；rng ∈ [0, 2^32-1]；order 为空表示轮界，此时
+    cursor 必须为 0；order 非空时长度必须为 N 且为 0..N-1 的全排列，
+    cursor 必须是 [0, N) 内与 batch_size 对齐的下一批起点，其余长度、
+    范围或关系错抛 ValueError。epoch 等于 epochs 时不得再请求训练
+    （max_batches 为 0 的空操作除外），否则抛 ValueError。
+
+    仅在轮界按既有 LCG 洗牌生成该轮 order（轮内 rng 不推进），每训一批
+    后 cursor 推进一个 batch_size；cursor 越界即轮毕：epoch 加一、
+    order 清空、cursor 归 0，rng 跨轮延续。new_state 为同构新 tuple、
+    order 为新 list，绝不修改传入 state。任意批边界切分后分多次调用的
+    losses/grad_norms 拼接、八组参数、BN 统计、Dropout 状态与终态，均
+    与旧版一次训完逐值相同。
     """
     if isinstance(batch_size, bool) or not isinstance(batch_size, int):
         raise TypeError(
@@ -6359,13 +6465,35 @@ def train_deep_batches(
         raise ValueError(
             "labels 长度 %d 与 x 样本数 %d 不符" % (len(labels), n_)
         )
+    if isinstance(max_batches, bool) or (
+        max_batches is not None and not isinstance(max_batches, int)
+    ):
+        raise TypeError(
+            "max_batches 必须是 None 或 int（拒绝 bool），得到 %s"
+            % type(max_batches).__name__
+        )
+    if max_batches is not None and max_batches < 0:
+        raise ValueError("max_batches 必须为非负整数")
+    if state is None:
+        cur_epoch, order, cursor, s = 0, [], 0, seed
+    else:
+        _check_deep_resume_state(state, epochs, n_, batch_size)
+        cur_epoch, order_in, cursor, s = state
+        # 复制 order，任何洗牌/收轮都不触碰传入的 state。
+        order = list(order_in)
+        if max_batches != 0 and cur_epoch >= epochs:
+            raise ValueError(
+                "state.epoch 已等于 epochs=%d，无剩余批可训练" % epochs
+            )
 
     conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
     snapshot = _snapshot_deep_layers(layers)
+    resume_mode = state is not None or max_batches is not None
     try:
         losses = []
         grad_norms = []
-        s = seed
+        # 剩余批计数：max_batches 为 None 时完成全部剩余批。
+        remaining = None if max_batches is None else max_batches
 
         def _scaled(tree, factor):
             # 以新嵌套 list 承载裁剪后梯度，不改 backward 返回的原结构。
@@ -6383,110 +6511,131 @@ def train_deep_batches(
                 raise ValueError("训练计算产生非有限值（NaN/inf）")
             return new_value
 
-        for _ in range(epochs):
-            # 每轮 order 都从 [0,…,N-1] 重新开始；洗牌状态 s 跨轮延续。
-            order = list(range(n_))
-            if shuffle and n_ > 1:
-                # Fisher–Yates 洗牌：自 N-1 降至 1，先推进 LCG，
-                # 再以 j=s%(i+1) 交换；s 跨轮延续。
-                for i in range(n_ - 1, 0, -1):
-                    s = (1664525 * s + 1013904223) % 4294967296
-                    j = s % (i + 1)
-                    order[i], order[j] = order[j], order[i]
-            for start in range(0, n_, batch_size):
-                idx = order[start:start + batch_size]
-                batch_x = [x[k] for k in idx]
-                batch_labels = [labels[k] for k in idx]
+        # 剩余批计数为 None 或正数时继续训练。
+        while remaining is None or remaining > 0:
+            # order 为空表示轮界：仅当仍有未完成轮时才开新轮；在轮界
+            # （初始或上一轮收轮后）按既有 LCG 生成该轮 order，rng 跨轮
+            # 延续、轮内不变。
+            if not order:
+                if cur_epoch >= epochs:
+                    break
+                order = list(range(n_))
+                if shuffle and n_ > 1:
+                    # Fisher–Yates 洗牌：自 N-1 降至 1，先推进 LCG，
+                    # 再以 j=s%(i+1) 交换；s 跨轮延续。
+                    for i in range(n_ - 1, 0, -1):
+                        s = (1664525 * s + 1013904223) % 4294967296
+                        j = s % (i + 1)
+                        order[i], order[j] = order[j], order[i]
+                cursor = 0
+            idx = order[cursor:cursor + batch_size]
+            batch_x = [x[k] for k in idx]
+            batch_labels = [labels[k] for k in idx]
 
-                # 按列表顺序前向；各层输入错误由其 forward 原样抛出。
-                conv_out = conv.forward(batch_x)
-                bn_out = bn.forward(conv_out)
-                drop_out = dropout.forward(bn_out)
-                pool_out = pool.forward(drop_out)
-                flat = flatten.forward(pool_out)
-                hidden = linear1.forward(flat)
-                relu_out = relu.forward(hidden)
-                logits = linear2.forward(relu_out)
-                loss_value = loss.forward(logits, batch_labels)
-                if not math.isfinite(loss_value):
-                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+            # 按列表顺序前向；各层输入错误由其 forward 原样抛出。
+            conv_out = conv.forward(batch_x)
+            bn_out = bn.forward(conv_out)
+            drop_out = dropout.forward(bn_out)
+            pool_out = pool.forward(drop_out)
+            flat = flatten.forward(pool_out)
+            hidden = linear1.forward(flat)
+            relu_out = relu.forward(hidden)
+            logits = linear2.forward(relu_out)
+            loss_value = loss.forward(logits, batch_labels)
+            if not math.isfinite(loss_value):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
 
-                # 自损失层起逆序反传；损失梯度已批均，不再除 N。每层
-                # 返回后立即递归检查其全部输出梯度（含参数梯度与最终
-                # 输入梯度）。
-                grad_logits = loss.backward()
-                _require_finite_grads(grad_logits)
-                dx_relu, dl2w, dl2b = linear2.backward(grad_logits)
-                _require_finite_grads(dx_relu)
-                _require_finite_grads(dl2w)
-                _require_finite_grads(dl2b)
-                dx_hidden = relu.backward(dx_relu)
-                _require_finite_grads(dx_hidden)
-                dx_flat, dl1w, dl1b = linear1.backward(dx_hidden)
-                _require_finite_grads(dx_flat)
-                _require_finite_grads(dl1w)
-                _require_finite_grads(dl1b)
-                dx_pool = flatten.backward(dx_flat)
-                _require_finite_grads(dx_pool)
-                dx_drop = pool.backward(dx_pool)
-                _require_finite_grads(dx_drop)
-                dx_bn = dropout.backward(dx_drop)
-                _require_finite_grads(dx_bn)
-                dx_conv, dgamma, dbeta = bn.backward(dx_bn)
-                _require_finite_grads(dx_conv)
-                _require_finite_grads(dgamma)
-                _require_finite_grads(dbeta)
-                dx_input, dcw, dcb = conv.backward(dx_conv)
-                _require_finite_grads(dx_input)
-                _require_finite_grads(dcw)
-                _require_finite_grads(dcb)
+            # 自损失层起逆序反传；损失梯度已批均，不再除 N。每层
+            # 返回后立即递归检查其全部输出梯度（含参数梯度与最终
+            # 输入梯度）。
+            grad_logits = loss.backward()
+            _require_finite_grads(grad_logits)
+            dx_relu, dl2w, dl2b = linear2.backward(grad_logits)
+            _require_finite_grads(dx_relu)
+            _require_finite_grads(dl2w)
+            _require_finite_grads(dl2b)
+            dx_hidden = relu.backward(dx_relu)
+            _require_finite_grads(dx_hidden)
+            dx_flat, dl1w, dl1b = linear1.backward(dx_hidden)
+            _require_finite_grads(dx_flat)
+            _require_finite_grads(dl1w)
+            _require_finite_grads(dl1b)
+            dx_pool = flatten.backward(dx_flat)
+            _require_finite_grads(dx_pool)
+            dx_drop = pool.backward(dx_pool)
+            _require_finite_grads(dx_drop)
+            dx_bn = dropout.backward(dx_drop)
+            _require_finite_grads(dx_bn)
+            dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+            _require_finite_grads(dx_conv)
+            _require_finite_grads(dgamma)
+            _require_finite_grads(dbeta)
+            dx_input, dcw, dcb = conv.backward(dx_conv)
+            _require_finite_grads(dx_input)
+            _require_finite_grads(dcw)
+            _require_finite_grads(dcb)
 
-                # 更新前依次展平八组梯度，求裁剪前全局范数。
-                grad_groups = (
-                    dcw, dcb, dgamma, dbeta,
-                    dl1w, dl1b, dl2w, dl2b,
+            # 更新前依次展平八组梯度，求裁剪前全局范数。
+            grad_groups = (
+                dcw, dcb, dgamma, dbeta,
+                dl1w, dl1b, dl2w, dl2b,
+            )
+            flat_grads = []
+            for group in grad_groups:
+                _flatten_into(group, flat_grads)
+            grad_norm = math.sqrt(math.fsum(g * g for g in flat_grads))
+            if not math.isfinite(grad_norm):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+            # 可选全局范数裁剪：八组梯度同乘 clip/norm；范数不大于
+            # clip 或 clip 为 None 时保持原梯度。
+            if clip is not None and grad_norm > clip:
+                factor = clip / grad_norm
+                dcw, dcb, dgamma, dbeta = (
+                    _scaled(dcw, factor), _scaled(dcb, factor),
+                    _scaled(dgamma, factor), _scaled(dbeta, factor),
                 )
-                flat_grads = []
-                for group in grad_groups:
-                    _flatten_into(group, flat_grads)
-                grad_norm = math.sqrt(math.fsum(g * g for g in flat_grads))
-                if not math.isfinite(grad_norm):
-                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+                dl1w, dl1b, dl2w, dl2b = (
+                    _scaled(dl1w, factor), _scaled(dl1b, factor),
+                    _scaled(dl2w, factor), _scaled(dl2b, factor),
+                )
 
-                # 可选全局范数裁剪：八组梯度同乘 clip/norm；范数不大于
-                # clip 或 clip 为 None 时保持原梯度。
-                if clip is not None and grad_norm > clip:
-                    factor = clip / grad_norm
-                    dcw, dcb, dgamma, dbeta = (
-                        _scaled(dcw, factor), _scaled(dcb, factor),
-                        _scaled(dgamma, factor), _scaled(dbeta, factor),
-                    )
-                    dl1w, dl1b, dl2w, dl2b = (
-                        _scaled(dl1w, factor), _scaled(dl1b, factor),
-                        _scaled(dl2w, factor), _scaled(dl2b, factor),
-                    )
+            new_conv_w = _step(conv._weights, dcw)
+            new_conv_b = _step(conv._bias, dcb)
+            new_gamma = _step(bn._gamma, dgamma)
+            new_beta = _step(bn._beta, dbeta)
+            new_l1_w = _step(linear1._weights, dl1w)
+            new_l1_b = _step(linear1._bias, dl1b)
+            new_l2_w = _step(linear2._weights, dl2w)
+            new_l2_b = _step(linear2._bias, dl2b)
 
-                new_conv_w = _step(conv._weights, dcw)
-                new_conv_b = _step(conv._bias, dcb)
-                new_gamma = _step(bn._gamma, dgamma)
-                new_beta = _step(bn._beta, dbeta)
-                new_l1_w = _step(linear1._weights, dl1w)
-                new_l1_b = _step(linear1._bias, dl1b)
-                new_l2_w = _step(linear2._weights, dl2w)
-                new_l2_b = _step(linear2._bias, dl2b)
+            # 同步替换层内参数；其余缓存、BN 统计、Dropout 随机状态保留。
+            conv._weights = new_conv_w
+            conv._bias = new_conv_b
+            bn._gamma = new_gamma
+            bn._beta = new_beta
+            linear1._weights = new_l1_w
+            linear1._bias = new_l1_b
+            linear2._weights = new_l2_w
+            linear2._bias = new_l2_b
 
-                # 同步替换层内参数；其余缓存、BN 统计、Dropout 随机状态保留。
-                conv._weights = new_conv_w
-                conv._bias = new_conv_b
-                bn._gamma = new_gamma
-                bn._beta = new_beta
-                linear1._weights = new_l1_w
-                linear1._bias = new_l1_b
-                linear2._weights = new_l2_w
-                linear2._bias = new_l2_b
+            losses.append(float(loss_value))
+            grad_norms.append(float(grad_norm))
+            if remaining is not None:
+                remaining -= 1
 
-                losses.append(float(loss_value))
-                grad_norms.append(float(grad_norm))
+            # 批后推进 cursor；越过本轮末批即收轮：epoch 加一、清空
+            # order、cursor 归 0。LCG 的 s 仅在轮界洗牌时推进，轮内
+            # 与收轮时保持不变。
+            cursor += batch_size
+            if cursor >= n_:
+                cur_epoch += 1
+                order = []
+                cursor = 0
+
+        new_state = (cur_epoch, list(order), cursor, s)
+        if resume_mode:
+            return losses, grad_norms, new_state
         return losses, grad_norms
     except BaseException:
         _restore_deep_layers(layers, snapshot)
