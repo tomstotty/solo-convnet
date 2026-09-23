@@ -2685,6 +2685,159 @@ def check_train_gradients(
     return (bool(ok), float(max_e), float(max_r))
 
 
+def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
+    """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→Pool2D→Flatten→
+    Linear→ReLU→Linear→SoftmaxCrossEntropy 九层训练链。
+
+    layers 须为恰含九层的 list，依次为 Conv2D/BatchNorm2D/Dropout/
+    MaxPool2D 或 AdaptiveAvgPool2D/Flatten/Linear/ReLU/Linear/
+    SoftmaxCrossEntropy 实例：容器或成员类型错抛 TypeError，长度错抛
+    ValueError；BatchNorm2D 或 Dropout 非训练态抛 ValueError。前向按
+    layers 顺序执行得 logits，标量损失 L = loss.forward(logits, labels)
+    返回的 float 批均损失；解析梯度自 loss.backward() 起按 layers 逆序
+    取各层 backward 结果。
+
+    数值梯度依次扰动 x、conv 的 weights/bias、bn 的 gamma/beta、第一个
+    Linear 的 weights/bias、第二个 Linear 的 weights/bias（各张量内部
+    按嵌套序），n = (L(v+eps) - L(v-eps)) / (2*eps)。每次前向（含解析
+    梯度前向与每次正、负扰动前向）之前都把 dropout 的随机状态 _s 恢复
+    为入口值，使各次前向重放同一掩码，故同一入口状态结果确定。
+    BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D 时，
+    任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）一律抛
+    ValueError——max 在并列点梯度无定义；pool 为 AdaptiveAvgPool2D 时
+    不做并列检测。
+
+    令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
+    (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
+    ok 当且仅当每项 e <= atol + rtol * max(abs(a), abs(n))。
+
+    eps/atol/rtol 须为有限 int/float（拒绝 bool）：类型错抛 TypeError；
+    eps 非正、容差为负或任一非有限抛 ValueError。x 的校验沿各层
+    forward，labels 的校验沿 loss.forward；计算产生非有限值抛
+    ValueError。x、labels、参数及九层实例状态（训练/推理模式、缓存、
+    Dropout 随机状态与掩码、BatchNorm2D 运行统计、SoftmaxCrossEntropy
+    缓存）在所有成功或异常路径均原样恢复（含参数引用），重复调用结果
+    一致。
+    """
+    _validate_deep_layers(layers)
+    for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise TypeError(
+                "%s 必须是 int/float（拒绝 bool），得到 %s"
+                % (name, type(val).__name__)
+            )
+        if not math.isfinite(val):
+            raise ValueError("%s 必须是有限值（拒绝 NaN/inf）" % name)
+    if eps <= 0:
+        raise ValueError("eps 必须为正数")
+    if atol < 0:
+        raise ValueError("atol 必须为非负数")
+    if rtol < 0:
+        raise ValueError("rtol 必须为非负数")
+
+    conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
+    saved_state = tuple(dict(layer.__dict__) for layer in layers)
+    dropout_entry_s = dropout._s
+    try:
+        def chain_forward(x_arg):
+            # 每次前向前恢复入口随机状态，使训练前向重放同一掩码。
+            dropout._s = dropout_entry_s
+            conv_out = conv.forward(x_arg)
+            bn_out = bn.forward(conv_out)
+            drop_out = dropout.forward(bn_out)
+            if isinstance(pool, MaxPool2D):
+                _check_pool_window_ties(pool, drop_out)
+            pool_out = pool.forward(drop_out)
+            flat = flatten.forward(pool_out)
+            hidden = relu.forward(linear1.forward(flat))
+            return linear2.forward(hidden)
+
+        def loss_value(x_arg):
+            return loss.forward(chain_forward(x_arg), labels)
+
+        # 前向按 layers 顺序；x 的校验沿各层 forward，labels 的校验沿
+        # loss.forward，MaxPool2D 并列最大在此一并检出。
+        loss_value(x)
+
+        # 解析梯度自 loss.backward() 起按 layers 逆序。
+        dlogits = loss.backward()
+        dx_hidden, dl2w, dl2b = linear2.backward(dlogits)
+        dx_relu = relu.backward(dx_hidden)
+        dx_flat, dl1w, dl1b = linear1.backward(dx_relu)
+        dx_pool = flatten.backward(dx_flat)
+        dx_drop = pool.backward(dx_pool)
+        dx_bn = dropout.backward(dx_drop)
+        dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+        dx, dcw, dcb = conv.backward(dx_conv)
+
+        targets = (
+            ("x", x, dx),
+            ("conv_weights", conv._weights, dcw),
+            ("conv_bias", conv._bias, dcb),
+            ("bn_gamma", bn._gamma, dgamma),
+            ("bn_beta", bn._beta, dbeta),
+            ("linear1_weights", linear1._weights, dl1w),
+            ("linear1_bias", linear1._bias, dl1b),
+            ("linear2_weights", linear2._weights, dl2w),
+            ("linear2_bias", linear2._bias, dl2b),
+        )
+
+        ok = True
+        max_e = 0.0
+        max_r = 0.0
+        for name, original, analytic in targets:
+            analytic_flat = []
+            _flatten_into(analytic, analytic_flat)
+            work = _deep_copy(original)  # 只扰动副本，原张量不被修改
+            if name == "conv_weights":
+                conv._weights = work
+            elif name == "conv_bias":
+                conv._bias = work
+            elif name == "bn_gamma":
+                bn._gamma = work
+            elif name == "bn_beta":
+                bn._beta = work
+            elif name == "linear1_weights":
+                linear1._weights = work
+            elif name == "linear1_bias":
+                linear1._bias = work
+            elif name == "linear2_weights":
+                linear2._weights = work
+            elif name == "linear2_bias":
+                linear2._bias = work
+            idx = 0
+            for container, i in _leaf_slots(work):
+                v = container[i]
+                container[i] = v + eps
+                lp = loss_value(work if name == "x" else x)
+                container[i] = v - eps
+                lm = loss_value(work if name == "x" else x)
+                container[i] = v
+                if not (math.isfinite(lp) and math.isfinite(lm)):
+                    raise ValueError("数值梯度计算产生非有限值（NaN/inf）")
+                n = (lp - lm) / (2 * eps)
+                a = analytic_flat[idx]
+                idx += 1
+                if not (math.isfinite(a) and math.isfinite(n)):
+                    raise ValueError("梯度计算产生非有限值（NaN/inf）")
+                aa = abs(a)
+                an = abs(n)
+                e = abs(a - n)
+                r = e / max(aa, an, 1e-12)
+                if e > atol + rtol * max(aa, an):
+                    ok = False
+                if e > max_e:
+                    max_e = e
+                if r > max_r:
+                    max_r = r
+    finally:
+        for layer, state in zip(layers, saved_state):
+            layer.__dict__.clear()
+            layer.__dict__.update(state)
+
+    return (bool(ok), float(max_e), float(max_r))
+
+
 # ---------------------------------------------------------------------------
 # 命令行训练：python convnet.py train OUTPUT
 # ---------------------------------------------------------------------------
@@ -5925,6 +6078,265 @@ def train_norm_batches(
         return losses
     except BaseException:
         _restore_layers(layers, snapshot)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# 九层双层分类头训练：train_deep_step(layers, x, labels, lr)
+# ---------------------------------------------------------------------------
+
+
+def _validate_deep_layers(layers):
+    """严格九层结构校验（train_deep_step 契约的前四项）。
+
+    layers 必须是恰含 Conv2D/BatchNorm2D/Dropout/(MaxPool2D 或
+    AdaptiveAvgPool2D)/Flatten/Linear/ReLU/Linear/SoftmaxCrossEntropy
+    九层实例（类型与顺序均固定，第 4 层（索引 3）接受 MaxPool2D 或
+    AdaptiveAvgPool2D）的 list：容器或成员类型错抛 TypeError，长度错抛
+    ValueError。另要求 BatchNorm2D 与 Dropout 均处于训练态，否则抛
+    ValueError。
+    """
+    if not isinstance(layers, list):
+        raise TypeError(
+            "layers 必须是 list，得到 %s" % type(layers).__name__
+        )
+    if len(layers) != 9:
+        raise ValueError(
+            "layers 必须恰含 9 层，得到 %d 层" % len(layers)
+        )
+    expected = (
+        Conv2D, BatchNorm2D, Dropout, (MaxPool2D, AdaptiveAvgPool2D),
+        Flatten, Linear, ReLU, Linear, SoftmaxCrossEntropy,
+    )
+    names = (
+        "Conv2D", "BatchNorm2D", "Dropout",
+        "MaxPool2D 或 AdaptiveAvgPool2D",
+        "Flatten", "Linear", "ReLU", "Linear", "SoftmaxCrossEntropy",
+    )
+    for idx, (layer, cls, name) in enumerate(
+        zip(layers, expected, names)
+    ):
+        if not isinstance(layer, cls):
+            raise TypeError(
+                "layers[%d] 必须是 %s 实例，得到 %s"
+                % (idx, name, type(layer).__name__)
+            )
+    if not layers[1]._training:
+        raise ValueError("BatchNorm2D 必须处于训练态")
+    if not layers[2]._training:
+        raise ValueError("Dropout 必须处于训练态")
+
+
+def _validate_train_deep_args(layers, lr):
+    """train_deep_step 的 layers/lr 校验。
+
+    layers 的结构（九项契约的长度/模式/类型）校验见
+    _validate_deep_layers；lr 必须是正的有限 int/float（拒绝 bool）：
+    类型错抛 TypeError，非有限或非正抛 ValueError。
+    """
+    _validate_deep_layers(layers)
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)):
+        raise TypeError(
+            "lr 必须是 int/float（拒绝 bool），得到 %s" % type(lr).__name__
+        )
+    if not math.isfinite(lr) or lr <= 0:
+        raise ValueError("lr 必须是正的有限值")
+
+
+def _snapshot_deep_layers(layers):
+    conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
+    # MaxPool2D 另缓存获胜位置；AdaptiveAvgPool2D 仅有形状缓存。
+    if isinstance(pool, MaxPool2D):
+        pool_state = {
+            "x_shape": pool._x_shape, "out_shape": pool._out_shape,
+            "winners": pool._winners,
+        }
+    else:
+        pool_state = {
+            "x_shape": pool._x_shape, "out_shape": pool._out_shape,
+            "winners": None,
+        }
+    return {
+        "conv": {
+            "weights": conv._weights, "bias": conv._bias,
+            "x": conv._x, "out_shape": conv._out_shape,
+        },
+        "bn": {
+            "gamma": bn._gamma, "beta": bn._beta,
+            "training": bn._training,
+            "running_mean": bn.running_mean, "running_var": bn.running_var,
+            "z": bn._z, "var": bn._var, "out_shape": bn._out_shape,
+        },
+        "dropout": {
+            "training": dropout._training, "s": dropout._s,
+            "mask": dropout._mask, "out_shape": dropout._out_shape,
+        },
+        "pool": pool_state,
+        "flatten": {
+            "x_shape": flatten._x_shape, "out_shape": flatten._out_shape,
+        },
+        "linear1": {
+            "weights": linear1._weights, "bias": linear1._bias,
+            "x": linear1._x, "out_shape": linear1._out_shape,
+        },
+        "relu": {
+            "x": relu._x, "out_shape": relu._out_shape,
+        },
+        "linear2": {
+            "weights": linear2._weights, "bias": linear2._bias,
+            "x": linear2._x, "out_shape": linear2._out_shape,
+        },
+        "loss": {
+            "probs": loss._probs, "labels": loss._labels,
+            "out_shape": loss._out_shape,
+        },
+    }
+
+
+def _restore_deep_layers(layers, snap):
+    conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
+    conv._weights, conv._bias = snap["conv"]["weights"], snap["conv"]["bias"]
+    conv._x, conv._out_shape = (
+        snap["conv"]["x"], snap["conv"]["out_shape"]
+    )
+    bn._gamma, bn._beta = snap["bn"]["gamma"], snap["bn"]["beta"]
+    bn._training = snap["bn"]["training"]
+    bn.running_mean, bn.running_var = (
+        snap["bn"]["running_mean"], snap["bn"]["running_var"]
+    )
+    bn._z, bn._var, bn._out_shape = (
+        snap["bn"]["z"], snap["bn"]["var"], snap["bn"]["out_shape"]
+    )
+    dropout._training = snap["dropout"]["training"]
+    dropout._s = snap["dropout"]["s"]
+    dropout._mask, dropout._out_shape = (
+        snap["dropout"]["mask"], snap["dropout"]["out_shape"]
+    )
+    pool._x_shape, pool._out_shape = (
+        snap["pool"]["x_shape"], snap["pool"]["out_shape"]
+    )
+    # 仅 MaxPool2D 持有获胜位置；AdaptiveAvgPool2D 无该缓存。
+    if isinstance(pool, MaxPool2D):
+        pool._winners = snap["pool"]["winners"]
+    flatten._x_shape, flatten._out_shape = (
+        snap["flatten"]["x_shape"], snap["flatten"]["out_shape"]
+    )
+    linear1._weights, linear1._bias = (
+        snap["linear1"]["weights"], snap["linear1"]["bias"]
+    )
+    linear1._x, linear1._out_shape = (
+        snap["linear1"]["x"], snap["linear1"]["out_shape"]
+    )
+    relu._x, relu._out_shape = (
+        snap["relu"]["x"], snap["relu"]["out_shape"]
+    )
+    linear2._weights, linear2._bias = (
+        snap["linear2"]["weights"], snap["linear2"]["bias"]
+    )
+    linear2._x, linear2._out_shape = (
+        snap["linear2"]["x"], snap["linear2"]["out_shape"]
+    )
+    loss._probs, loss._labels, loss._out_shape = (
+        snap["loss"]["probs"], snap["loss"]["labels"],
+        snap["loss"]["out_shape"],
+    )
+
+
+def train_deep_step(layers, x, labels, lr=0.1):
+    """九层网络（Conv2D/BN/Dropout/(MaxPool 或 AdaptiveAvgPool)/Flatten/
+    Linear/ReLU/Linear/SoftmaxCE）的一步双层分类头训练：按列表顺序前向，
+    自损失层 backward() 起逆序反传，以新 list 同步把 conv 的
+    weights/bias、BN 的 gamma/beta 及两个 Linear 的 weights/bias 各减去
+    lr 乘对应梯度，返回 float 批均损失。
+
+    layers 与 lr 的校验见 _validate_train_deep_args。损失层梯度已按
+    批均（含 1/N），参数更新时不再除 N。被调层方法的输入校验错误
+    （类型/形状/取值）原样传播。损失、梯度或更新后的参数含非有限值抛
+    ValueError：损失层及每个反向层返回后，递归检查全部传播梯度、参数
+    梯度与最终输入梯度，任一非有限值即抛错。
+
+    成功时替换层内参数，前向产生的正常缓存、BN 运行统计与 Dropout 随机
+    推进均保留；任何路径都不修改 x、labels 及构造参数所用的原 list；
+    一旦出错（含校验与非有限值），九层全部恢复到入口状态（含随机状态、
+    运行统计与旧缓存），如同本次调用从未发生。
+    """
+    _validate_train_deep_args(layers, lr)
+
+    conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
+    snapshot = _snapshot_deep_layers(layers)
+    try:
+        # 按列表顺序前向；各层输入错误由其 forward 原样抛出。
+        conv_out = conv.forward(x)
+        bn_out = bn.forward(conv_out)
+        drop_out = dropout.forward(bn_out)
+        pool_out = pool.forward(drop_out)
+        flat = flatten.forward(pool_out)
+        hidden = relu.forward(linear1.forward(flat))
+        logits = linear2.forward(hidden)
+        loss_value = loss.forward(logits, labels)
+        if not math.isfinite(loss_value):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+        # 自损失层起逆序反传；损失梯度已批均，不再除 N。每层返回后
+        # 立即递归检查其全部输出梯度（含参数梯度与最终输入梯度）。
+        grad_logits = loss.backward()
+        _require_finite_grads(grad_logits)
+        dx_hidden, dl2w, dl2b = linear2.backward(grad_logits)
+        _require_finite_grads(dx_hidden)
+        _require_finite_grads(dl2w)
+        _require_finite_grads(dl2b)
+        dx_relu = relu.backward(dx_hidden)
+        _require_finite_grads(dx_relu)
+        dx_flat, dl1w, dl1b = linear1.backward(dx_relu)
+        _require_finite_grads(dx_flat)
+        _require_finite_grads(dl1w)
+        _require_finite_grads(dl1b)
+        dx_pool = flatten.backward(dx_flat)
+        _require_finite_grads(dx_pool)
+        dx_drop = pool.backward(dx_pool)
+        _require_finite_grads(dx_drop)
+        dx_bn = dropout.backward(dx_drop)
+        _require_finite_grads(dx_bn)
+        dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+        _require_finite_grads(dx_conv)
+        _require_finite_grads(dgamma)
+        _require_finite_grads(dbeta)
+        dx_input, dcw, dcb = conv.backward(dx_conv)
+        _require_finite_grads(dx_input)
+        _require_finite_grads(dcw)
+        _require_finite_grads(dcb)
+
+        # 全部新参数先在独立新 list 中算出并校验，再同步提交，保证
+        # 失败时层内参数与构造参数原 list 均不被改动。
+        def _step(param, grad):
+            if isinstance(param, list):
+                return [_step(v, g) for v, g in zip(param, grad)]
+            new_value = param - lr * grad
+            if not math.isfinite(new_value):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+            return new_value
+
+        new_conv_w = _step(conv._weights, dcw)
+        new_conv_b = _step(conv._bias, dcb)
+        new_gamma = _step(bn._gamma, dgamma)
+        new_beta = _step(bn._beta, dbeta)
+        new_lin1_w = _step(linear1._weights, dl1w)
+        new_lin1_b = _step(linear1._bias, dl1b)
+        new_lin2_w = _step(linear2._weights, dl2w)
+        new_lin2_b = _step(linear2._bias, dl2b)
+
+        # 同步替换层内参数；其余缓存、BN 统计、Dropout 随机状态保留。
+        conv._weights = new_conv_w
+        conv._bias = new_conv_b
+        bn._gamma = new_gamma
+        bn._beta = new_beta
+        linear1._weights = new_lin1_w
+        linear1._bias = new_lin1_b
+        linear2._weights = new_lin2_w
+        linear2._bias = new_lin2_b
+        return float(loss_value)
+    except BaseException:
+        _restore_deep_layers(layers, snapshot)
         raise
 
 
