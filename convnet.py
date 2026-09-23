@@ -55,15 +55,21 @@
   错抛 TypeError，长度错或 BN/Dropout 非训练态抛 ValueError；成功
   保留更新与状态推进，任何异常都把九层（含参数引用）恢复到入口状态。
 - train_deep_batches(layers, x, labels, batch_size=1, epochs=1, lr=0.1,
-  seed=0, shuffle=True, clip=None)：每轮按 [0,…,N-1]（shuffle 为真时以
-  seed 起始、跨轮延续的 32 位 LCG 做 Fisher–Yates 洗牌）切分为大小
-  batch_size 的批（末批可短），逐批按 train_deep_step 次序前反向，并在
-  同步 SGD 更新前依次展平 conv 权重/偏置、BN gamma/beta、两个 Linear
-  权重/偏置八组梯度，以 sqrt(fsum(g*g)) 求裁剪前全局范数；clip 非 None
-  且范数大于 clip 时八组梯度同乘 clip/norm，更新不额外除批量。返回
-  (losses, grad_norms)，均为按轮、批顺序排列、长度
+  seed=0, shuffle=True, clip=None, state=None, max_batches=None)：每轮按
+  [0,…,N-1]（shuffle 为真时以 seed 起始、跨轮延续的 32 位 LCG 做
+  Fisher–Yates 洗牌）切分为大小 batch_size 的批（末批可短），逐批按
+  train_deep_step 次序前反向，并在同步 SGD 更新前依次展平 conv
+  权重/偏置、BN gamma/beta、两个 Linear 权重/偏置八组梯度，以
+  sqrt(fsum(g*g)) 求裁剪前全局范数；clip 非 None 且范数大于 clip 时八组
+  梯度同乘 clip/norm，更新不额外除批量。state 与 max_batches 均为 None
+  时返回 (losses, grad_norms)，均为按轮、批顺序排列、长度
   epochs*ceil(N/batch_size) 的各批更新前批均损失与裁剪前范数新
-  list[float]；任何异常都把九层（含参数引用）整体恢复到入口状态。
+  list[float]；任一非 None 时返回 (losses, grad_norms, state)，前两项仅
+  记录本次实际训练的批，state 为 (epoch, order, cursor, rng) 进度四元组，
+  支持批边界暂停/续训（max_batches 为 None 完成剩余批，否则为非负 int，
+  0 不训练；state 为 None 等价 (0,[],0,seed)，仅在轮界洗牌），任意切分
+  拼接与一次训练完全相同；任何异常都把九层（含参数引用）整体恢复到入口
+  状态。
 - check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6,
   rtol=1e-4)：以中心差分依次检验 x 与上述八组参数的数值梯度，损失、
   误差、容差判定与 (ok, max_e, max_r) 返回沿用 check_train_gradients；
@@ -6275,16 +6281,44 @@ def train_norm_batches(
 
 def train_deep_batches(
     layers, x, labels, batch_size=1, epochs=1, lr=0.1, seed=0,
-    shuffle=True, clip=None,
+    shuffle=True, clip=None, state=None, max_batches=None,
 ):
     """九层网络（Conv2D/BN/Dropout/(MaxPool 或
     AdaptiveAvgPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头）
     的分轮分批训练：每轮按顺序 [0,…,N-1]（shuffle 为真时先做 Fisher–
     Yates 洗牌）切分若干批，逐批按 train_deep_step 的次序前向、自损失层
     起逆序反传，并在同步 SGD 更新前对全部八组参数梯度做可选全局范数裁剪；
-    返回 (losses, grad_norms)，二者均为按轮、批顺序排列的新 list[float]，
-    长度均为 epochs*ceil(N/batch_size)，分别记录各批更新前批均损失与
+    state 与 max_batches 均为 None（默认）时返回 (losses, grad_norms)，
+    二者均为按轮、批顺序排列的新 list[float]，长度均为
+    epochs*ceil(N/batch_size)，分别记录各批更新前批均损失与
     裁剪前全局梯度范数。
+
+    state 或 max_batches 非 None 时启用批边界暂停/续训，返回
+    (losses, grad_norms, state)：前两项仅记录本次调用实际训练的批
+    （新 list[float]），state 为新的 (epoch, order, cursor, rng) 四元组，
+    描述本次结束（暂停或完成）后的训练进度，不与入参别名。
+    max_batches 为 None 时完成剩余全部批；否则必须是非负 int（拒绝
+    bool）：类型错抛 TypeError，负值抛 ValueError，0 表示不训练任何批
+    （直接返回当前进度状态）。state 为 None 时等价于
+    (0, [], 0, seed)，即从第 0 轮起点开始；否则必须是长度恰为 4 的
+    tuple，依次为 epoch(int)、order(list[int])、cursor(int)、
+    rng(int)，四者均拒绝 bool：容器或成员类型错抛 TypeError，长度、
+    范围或相互关系错抛 ValueError。epoch 必须属于 [0, epochs]；
+    order 为空时 cursor 必须为 0（轮起点，尚未洗牌）；order 非空时
+    必须恰是 0..N-1 的一个全排列，且 cursor 必须属于 [0, N)，为该轮
+    下一批的起点（按 batch_size 切分时与各轮各批起点对齐，轮内最后一批
+    可短）；rng 必须属于 [0, 2^32-1]。epoch == epochs 时训练已完成、不得
+    再训练任何批：max_batches 为正整数即抛 ValueError；max_batches 为 0
+    或 None（剩余批为空）时不训练、原样返回完成态。
+
+    续训仅在轮界洗牌：order 为空（轮起点）时，先按既有 32 位 LCG 自
+    rng 起生成该轮 order 并把推进后的 rng 记入状态，再从 cursor 切批；
+    order 非空（轮中暂停）时沿用既有 order/rng，不重复洗牌。每训练一批
+    后 cursor 前进一个批长（最后一批可为短批）；cursor 到达 N 即轮毕：
+    epoch 加一、order 清空、cursor 归 0（rng 保持轮界洗牌后的值）。
+    入参 state 不会被修改。任意批边界切分后多次调用的两列表拼接、八组
+    参数、BN 运行统计、Dropout 随机状态（含掩码）及终态，均与原函数一次
+    训练完成完全相同。
 
     layers 的九层类型/顺序与 BN/Dropout 训练态校验、lr 校验以及各批 x、
     labels 的校验均沿用 train_deep_step（各批仅切取 x、labels 的新子
@@ -6360,12 +6394,115 @@ def train_deep_batches(
             "labels 长度 %d 与 x 样本数 %d 不符" % (len(labels), n_)
         )
 
+    # ---- 批边界暂停/续训参数（state、max_batches）校验 ----
+    resume_mode = state is not None or max_batches is not None
+    if max_batches is not None:
+        if isinstance(max_batches, bool) or not isinstance(max_batches, int):
+            raise TypeError(
+                "max_batches 必须是 None 或 int（拒绝 bool），得到 %s"
+                % type(max_batches).__name__
+            )
+        if max_batches < 0:
+            raise ValueError("max_batches 必须是非负整数")
+    if state is None:
+        cur_epoch, cur_order, cur_cursor, cur_s = 0, [], 0, seed
+    else:
+        if not isinstance(state, tuple):
+            raise TypeError(
+                "state 必须是 None 或 (epoch, order, cursor, rng) 四元组"
+                "（tuple），得到 %s" % type(state).__name__
+            )
+        if len(state) != 4:
+            raise ValueError("state 必须恰含 (epoch, order, cursor, rng) 四项")
+        cur_epoch, cur_order, cur_cursor, cur_s = state
+        if isinstance(cur_epoch, bool) or not isinstance(cur_epoch, int):
+            raise TypeError(
+                "state 的 epoch 必须是 int（拒绝 bool），得到 %s"
+                % type(cur_epoch).__name__
+            )
+        if cur_epoch < 0 or cur_epoch > epochs:
+            raise ValueError(
+                "state 的 epoch 必须满足 0 <= epoch <= epochs（%d）"
+                % epochs
+            )
+        if not isinstance(cur_order, list):
+            raise TypeError(
+                "state 的 order 必须是 list，得到 %s"
+                % type(cur_order).__name__
+            )
+        for v in cur_order:
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise TypeError(
+                    "state 的 order 成员必须是 int（拒绝 bool），得到 %s"
+                    % type(v).__name__
+                )
+        if isinstance(cur_cursor, bool) or not isinstance(cur_cursor, int):
+            raise TypeError(
+                "state 的 cursor 必须是 int（拒绝 bool），得到 %s"
+                % type(cur_cursor).__name__
+            )
+        if isinstance(cur_s, bool) or not isinstance(cur_s, int):
+            raise TypeError(
+                "state 的 rng 必须是 int（拒绝 bool），得到 %s"
+                % type(cur_s).__name__
+            )
+        if cur_s < 0 or cur_s > 0xFFFFFFFF:
+            raise ValueError("state 的 rng 必须满足 0 <= rng <= 2^32-1")
+        if len(cur_order) == 0:
+            if cur_cursor != 0:
+                raise ValueError("state 的 order 为空时 cursor 必须为 0")
+        else:
+            if cur_epoch == epochs:
+                # epoch==epochs 表示训练已完成（轮毕必清空 order），
+                # 不可能同时停在某一轮中途。
+                raise ValueError(
+                    "state 的 epoch 已等于 epochs（%d），order 必须为空"
+                    % epochs
+                )
+            if len(cur_order) != n_:
+                raise ValueError(
+                    "state 的 order 长度 %d 必须等于样本数 %d"
+                    % (len(cur_order), n_)
+                )
+            if sorted(cur_order) != list(range(n_)):
+                raise ValueError(
+                    "state 的 order 必须恰是 0..%d 的一个全排列" % (n_ - 1)
+                )
+            if cur_cursor < 0 or cur_cursor >= n_:
+                raise ValueError(
+                    "state 的 cursor 必须满足 0 <= cursor < N（%d）" % n_
+                )
+            # cursor 必须与按 batch_size 切分的各批起点对齐，且对应批
+            # 仍有样本（cursor==0 只可能是空 order 的轮起点）。
+            if cur_cursor % batch_size != 0:
+                raise ValueError(
+                    "state 的 cursor %d 不是 batch_size=%d 的批起点"
+                    % (cur_cursor, batch_size)
+                )
+    # epoch == epochs：训练已完成，不得再训练任何批。max_batches 为 0 或
+    # None（剩余批为空，自然无事可做）时原样返回完成态；正整数请求训练则
+    # 抛 ValueError。
+    if (
+        cur_epoch == epochs
+        and resume_mode
+        and max_batches is not None
+        and max_batches > 0
+    ):
+        raise ValueError("训练已完成（epoch == epochs），不得继续训练")
+
     conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
     snapshot = _snapshot_deep_layers(layers)
     try:
         losses = []
         grad_norms = []
-        s = seed
+        # 续训入参 state 绝不修改：order 取副本，游标与 LCG 状态用局部量。
+        epoch_idx = cur_epoch
+        order = list(cur_order)
+        start = cur_cursor
+        s = cur_s
+        # max_batches 为 None 时训练剩余全部批。
+        remaining = max_batches
+        done = False
 
         def _scaled(tree, factor):
             # 以新嵌套 list 承载裁剪后梯度，不改 backward 返回的原结构。
@@ -6383,17 +6520,31 @@ def train_deep_batches(
                 raise ValueError("训练计算产生非有限值（NaN/inf）")
             return new_value
 
-        for _ in range(epochs):
-            # 每轮 order 都从 [0,…,N-1] 重新开始；洗牌状态 s 跨轮延续。
-            order = list(range(n_))
-            if shuffle and n_ > 1:
-                # Fisher–Yates 洗牌：自 N-1 降至 1，先推进 LCG，
-                # 再以 j=s%(i+1) 交换；s 跨轮延续。
-                for i in range(n_ - 1, 0, -1):
-                    s = (1664525 * s + 1013904223) % 4294967296
-                    j = s % (i + 1)
-                    order[i], order[j] = order[j], order[i]
-            for start in range(0, n_, batch_size):
+        # max_batches=0：不训练任何批、不在轮界洗牌，直接回传当前进度。
+        if max_batches == 0:
+            done = True
+
+        while not done and epoch_idx < epochs:
+            # order 为空表示停在轮起点：仅此刻在轮界按既有 LCG 洗牌；
+            # 轮中暂停（order 非空）沿用暂停时的 order 与 rng，不重洗。
+            if not order:
+                # 预算恰在上一轮用尽时，不得为下一轮提前洗牌，直接以
+                # 轮界完成态 (epoch, [], 0, rng) 暂停。
+                if remaining == 0:
+                    done = True
+                    continue
+                start = 0
+                order = list(range(n_))
+                if shuffle and n_ > 1:
+                    # Fisher–Yates 洗牌：自 N-1 降至 1，先推进 LCG，
+                    # 再以 j=s%(i+1) 交换；s 跨轮延续。
+                    for i in range(n_ - 1, 0, -1):
+                        s = (1664525 * s + 1013904223) % 4294967296
+                        j = s % (i + 1)
+                        order[i], order[j] = order[j], order[i]
+            while start < n_:
+                if remaining is not None:
+                    remaining -= 1
                 idx = order[start:start + batch_size]
                 batch_x = [x[k] for k in idx]
                 batch_labels = [labels[k] for k in idx]
@@ -6487,6 +6638,23 @@ def train_deep_batches(
 
                 losses.append(float(loss_value))
                 grad_norms.append(float(grad_norm))
+
+                # 批后推进游标（idx 长度即本批实际样本数，末批可短）。
+                start += len(idx)
+                if start >= n_:
+                    # 轮毕：epoch 加一、清空 order、游标归 0；rng 保持
+                    # 本轮轮界洗牌后的值，跨轮延续。
+                    epoch_idx += 1
+                    order = []
+                    start = 0
+                    break
+                if remaining == 0:
+                    # 恰在批边界暂停：游标已是下一批起点。
+                    done = True
+                    break
+        if resume_mode:
+            out_state = (epoch_idx, order, start, s)
+            return losses, grad_norms, out_state
         return losses, grad_norms
     except BaseException:
         _restore_deep_layers(layers, snapshot)
