@@ -8297,6 +8297,16 @@ def _cmd_valgatebatchtrend(manifest_path, output_path):
 # ---------------------------------------------------------------------------
 
 _TRENDSTATS_MANIFEST_KEYS = ["trends"]
+_TRENDSTATS_OUTPUT_KEYS = ["trend_count", "gate_count", "results", "pass"]
+_TRENDSTATS_OUTPUT_ITEM_KEYS = ["name", "ba", "f1", "pass"]
+_TRENDSTATS_OUTPUT_METRIC_KEYS = [
+    "regressions",
+    "worst_delta",
+    "trend",
+    "from",
+    "to",
+    "pass",
+]
 
 
 def _load_trendstats_manifest(raw, manifest_dir):
@@ -8710,6 +8720,412 @@ def _cmd_trendstats(manifest_path, output_path):
     return 0 if overall else 3
 
 
+# ---------------------------------------------------------------------------
+# 命令行趋势汇总可配置质量门禁：
+# python convnet.py trendgate STATS CONFIG OUTPUT
+# ---------------------------------------------------------------------------
+
+_TRENDGATE_TOP_KEYS = ["ba", "f1"]
+_TRENDGATE_LIMIT_KEYS = ["max_regressions", "min_worst_delta"]
+_TRENDGATE_OUTPUT_TOP_KEYS = ["gate_count", "limits", "results", "pass"]
+_TRENDGATE_OUTPUT_ITEM_KEYS = ["name", "ba", "f1", "pass"]
+_TRENDGATE_OUTPUT_METRIC_KEYS = ["regressions", "worst_delta", "pass"]
+
+
+def _load_trendstats_output(raw):
+    """按 trendstats 产物契约从原始字节严格解析一份趋势汇总产物。
+
+    与 trendstats 写出的逐字节产物一致：不得含 UTF-8 BOM，须以恰好一个
+    LF 结尾（拒绝 CR 与多余空行），其前正文不得含字符串字面量之外的任何
+    JSON 空白（紧凑 JSON），拒绝 NaN/Infinity 常量与重复键。正文顶层键
+    须依次为 trend_count、gate_count、results、pass：trend_count 与
+    gate_count 均为 >= 2 的 int（拒绝 bool），pass 为 bool；results 长度
+    恰为 gate_count。每项键须依次为 name/ba/f1/pass：name 为非空 str 且
+    全局唯一，pass 为 bool；ba/f1 键须依次为 regressions、worst_delta、
+    trend、from、to、pass：regressions 为满足
+    0 <= regressions <= trend_count 的 int，worst_delta 为有限 float，
+    trend 为满足 0 <= trend < trend_count 的 int，from/to 为满足
+    0 <= from < to 的 int（照录自对应份 valgatebatchtrend 产物），
+    pass 为 bool 且须与 regressions == 0 自洽；各项 pass 须恰为 ba/f1
+    pass 之与，顶层 pass 须恰为各项 pass 之与。非法 UTF-8/JSON 或契约
+    不符分别抛 UnicodeDecodeError/ValueError/TypeError。返回
+    (trend_count, gate_count,
+    [(name, ba_regressions, ba_worst, f1_regressions, f1_worst), ...])。
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError(
+            "trendstats 产物必须是 bytes，得到 %s" % type(raw).__name__
+        )
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("trendstats 产物不得含 UTF-8 BOM")
+    if b"\r" in raw:
+        raise ValueError("trendstats 产物不得含回车（CR）")
+    if not raw.endswith(b"\n"):
+        raise ValueError("trendstats 产物必须以恰好一个 LF 结尾")
+    body = raw[:-1]
+    if body.endswith(b"\n"):
+        raise ValueError("trendstats 产物末尾仅可有一个 LF")
+    _reject_json_whitespace(body)
+    _reject_json_constants(body)
+    text = body.decode("utf-8")
+    doc = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(doc, dict):
+        raise TypeError("trendstats 产物顶层必须是 JSON 对象")
+    if list(doc.keys()) != _TRENDSTATS_OUTPUT_KEYS:
+        raise ValueError(
+            "trendstats 产物顶层键必须依次为 "
+            "trend_count、gate_count、results、pass"
+        )
+
+    trend_count = doc["trend_count"]
+    if isinstance(trend_count, bool) or not isinstance(trend_count, int):
+        raise TypeError(
+            "trend_count 必须是 int，得到 %s" % type(trend_count).__name__
+        )
+    if trend_count < 2:
+        raise ValueError("trend_count 必须 >= 2，得到 %d" % trend_count)
+
+    gate_count = doc["gate_count"]
+    if isinstance(gate_count, bool) or not isinstance(gate_count, int):
+        raise TypeError(
+            "gate_count 必须是 int，得到 %s" % type(gate_count).__name__
+        )
+    if gate_count < 2:
+        raise ValueError("gate_count 必须 >= 2，得到 %d" % gate_count)
+
+    overall_pass = doc["pass"]
+    if not isinstance(overall_pass, bool):
+        raise TypeError(
+            "顶层 pass 必须是 bool，得到 %s"
+            % type(overall_pass).__name__
+        )
+
+    results = doc["results"]
+    if not isinstance(results, list):
+        raise TypeError(
+            "results 必须是 list，得到 %s" % type(results).__name__
+        )
+    if len(results) != gate_count:
+        raise ValueError(
+            "results 长度必须等于 gate_count（%d），得到 %d"
+            % (gate_count, len(results))
+        )
+
+    items = []
+    names = set()
+    all_pass = True
+    for idx, item in enumerate(results):
+        if not isinstance(item, dict):
+            raise TypeError("results[%d] 必须是 JSON 对象" % idx)
+        if list(item.keys()) != _TRENDSTATS_OUTPUT_ITEM_KEYS:
+            raise ValueError(
+                "results[%d] 的键必须依次为 name、ba、f1、pass" % idx
+            )
+        name = item["name"]
+        if not isinstance(name, str) or len(name) == 0:
+            raise TypeError(
+                "results[%d].name 必须是非空 str，得到 %s"
+                % (idx, type(name).__name__)
+            )
+        if name in names:
+            raise ValueError("results 的 name 必须唯一，重复：%r" % name)
+        names.add(name)
+
+        item_pass = item["pass"]
+        if not isinstance(item_pass, bool):
+            raise TypeError(
+                "results[%d].pass 必须是 bool，得到 %s"
+                % (idx, type(item_pass).__name__)
+            )
+
+        metric_values = []
+        metric_passes = []
+        for metric_name in ("ba", "f1"):
+            block = item[metric_name]
+            if not isinstance(block, dict):
+                raise TypeError(
+                    "results[%d].%s 必须是 JSON 对象" % (idx, metric_name)
+                )
+            if list(block.keys()) != _TRENDSTATS_OUTPUT_METRIC_KEYS:
+                raise ValueError(
+                    "results[%d].%s 的键必须依次为 regressions、"
+                    "worst_delta、trend、from、to、pass"
+                    % (idx, metric_name)
+                )
+
+            regressions = block["regressions"]
+            if isinstance(regressions, bool) or not isinstance(
+                regressions, int
+            ):
+                raise TypeError(
+                    "results[%d].%s.regressions 必须是 int，得到 %s"
+                    % (idx, metric_name, type(regressions).__name__)
+                )
+            if not (0 <= regressions <= trend_count):
+                raise ValueError(
+                    "results[%d].%s.regressions 必须满足 "
+                    "0 <= regressions <= trend_count" % (idx, metric_name)
+                )
+
+            worst_delta = block["worst_delta"]
+            if isinstance(worst_delta, bool) or not isinstance(
+                worst_delta, float
+            ):
+                raise TypeError(
+                    "results[%d].%s.worst_delta 必须是 float，得到 %s"
+                    % (idx, metric_name, type(worst_delta).__name__)
+                )
+            if not math.isfinite(worst_delta):
+                raise ValueError(
+                    "results[%d].%s.worst_delta 必须有限"
+                    % (idx, metric_name)
+                )
+
+            trend = block["trend"]
+            if isinstance(trend, bool) or not isinstance(trend, int):
+                raise TypeError(
+                    "results[%d].%s.trend 必须是 int，得到 %s"
+                    % (idx, metric_name, type(trend).__name__)
+                )
+            if not (0 <= trend < trend_count):
+                raise ValueError(
+                    "results[%d].%s.trend 必须满足 "
+                    "0 <= trend < trend_count" % (idx, metric_name)
+                )
+
+            from_index = block["from"]
+            to_index = block["to"]
+            for edge_key, edge in (("from", from_index), ("to", to_index)):
+                if isinstance(edge, bool) or not isinstance(edge, int):
+                    raise TypeError(
+                        "results[%d].%s.%s 必须是 int，得到 %s"
+                        % (idx, metric_name, edge_key, type(edge).__name__)
+                    )
+            if not (0 <= from_index < to_index):
+                raise ValueError(
+                    "results[%d].%s 的下标必须满足 0 <= from < to"
+                    % (idx, metric_name)
+                )
+
+            metric_pass = block["pass"]
+            if not isinstance(metric_pass, bool):
+                raise TypeError(
+                    "results[%d].%s.pass 必须是 bool，得到 %s"
+                    % (idx, metric_name, type(metric_pass).__name__)
+                )
+            if metric_pass != (regressions == 0):
+                raise ValueError(
+                    "results[%d].%s.pass 须与 regressions == 0 自洽"
+                    % (idx, metric_name)
+                )
+            metric_values.append((regressions, worst_delta))
+            metric_passes.append(metric_pass)
+
+        if item_pass != (metric_passes[0] and metric_passes[1]):
+            raise ValueError(
+                "results[%d].pass 必须为 ba/f1 pass 之与" % idx
+            )
+        if not item_pass:
+            all_pass = False
+
+        items.append(
+            (
+                name,
+                metric_values[0][0],
+                metric_values[0][1],
+                metric_values[1][0],
+                metric_values[1][1],
+            )
+        )
+
+    if overall_pass != all_pass:
+        raise ValueError("顶层 pass 必须为各项 pass 之与")
+
+    return trend_count, gate_count, items
+
+
+def _load_trendgate_config(raw):
+    """按 trendgate 契约从 CONFIG 原始字节解析并严格校验，返回阈值 dict。
+
+    raw 不得含 UTF-8 BOM 或字符串字面量之外的任何 JSON 空白（空格、
+    制表、换行、回车），须为紧凑 UTF-8 JSON 对象，拒绝 NaN/Infinity
+    常量与重复键（object_pairs_hook 逐对象查重）。顶层键仅依次为 ba、f1；
+    两项均为对象，键仅依次为 max_regressions、min_worst_delta：前者为
+    非负 int（拒绝 bool），后者为 [-1,0] 内有限 float（拒绝 int/bool）。
+    非法 UTF-8/JSON 或契约不符分别抛
+    UnicodeDecodeError/ValueError/TypeError。
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError(
+            "CONFIG 必须是 bytes，得到 %s" % type(raw).__name__
+        )
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("CONFIG 不得含 UTF-8 BOM")
+    _reject_json_whitespace(raw)
+    _reject_json_constants(raw)
+    text = raw.decode("utf-8")
+    doc = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(doc, dict):
+        raise TypeError("CONFIG 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _TRENDGATE_TOP_KEYS:
+        raise ValueError("CONFIG 键必须依次为 ba、f1")
+
+    limits = {}
+    for metric_name in _TRENDGATE_TOP_KEYS:
+        block = doc[metric_name]
+        if not isinstance(block, dict):
+            raise TypeError(
+                "CONFIG.%s 必须是 JSON 对象，得到 %s"
+                % (metric_name, type(block).__name__)
+            )
+        if list(block.keys()) != _TRENDGATE_LIMIT_KEYS:
+            raise ValueError(
+                "CONFIG.%s 的键必须依次为 max_regressions、"
+                "min_worst_delta" % metric_name
+            )
+
+        max_regressions = block["max_regressions"]
+        if isinstance(max_regressions, bool) or not isinstance(
+            max_regressions, int
+        ):
+            raise TypeError(
+                "CONFIG.%s.max_regressions 必须是非负 int，得到 %s"
+                % (metric_name, type(max_regressions).__name__)
+            )
+        if max_regressions < 0:
+            raise ValueError(
+                "CONFIG.%s.max_regressions 必须非负，得到 %d"
+                % (metric_name, max_regressions)
+            )
+
+        min_worst_delta = block["min_worst_delta"]
+        if isinstance(min_worst_delta, bool) or isinstance(
+            min_worst_delta, int
+        ) or not isinstance(min_worst_delta, float):
+            raise TypeError(
+                "CONFIG.%s.min_worst_delta 必须是 float（拒绝 int/bool），"
+                "得到 %s" % (metric_name, type(min_worst_delta).__name__)
+            )
+        if not math.isfinite(min_worst_delta) or not (
+            -1.0 <= min_worst_delta <= 0.0
+        ):
+            raise ValueError(
+                "CONFIG.%s.min_worst_delta 必须是 [-1,0] 内的有限 float"
+                % metric_name
+            )
+
+        limits[metric_name] = {
+            "max_regressions": max_regressions,
+            "min_worst_delta": min_worst_delta,
+        }
+    return limits
+
+
+def _trendgate_compute(stats_raw, config_raw):
+    """按 trendgate 契约校验 STATS/CONFIG 并逐 name 判定质量门禁。
+
+    STATS 的严格契约见 _load_trendstats_output（trendstats 严格产物），
+    CONFIG 的严格契约见 _load_trendgate_config。对每个 name 的 ba/f1：
+    指标 pass 当且仅当 regressions <= max_regressions 且
+    worst_delta >= min_worst_delta；项 pass 为 ba/f1 pass 之与；顶层
+    pass 为各项 pass 之与。契约不符抛 ValueError/TypeError。
+
+    返回 dict（键依次为 gate_count、limits、results、pass）：limits 同
+    CONFIG（键依次 ba、f1，各键依次 max_regressions、min_worst_delta）；
+    results 保持 STATS 的 name 顺序，每项键依次为 name、ba、f1、pass；
+    ba/f1 键依次为 regressions（int）、worst_delta（float）、pass
+    （bool）。
+    """
+    _trend_count, gate_count, items = _load_trendstats_output(stats_raw)
+    limits = _load_trendgate_config(config_raw)
+
+    results = []
+    overall = True
+    for name, ba_reg, ba_worst, f1_reg, f1_worst in items:
+        metric_blocks = []
+        item_pass = True
+        for metric_name, regressions, worst_delta in (
+            ("ba", ba_reg, ba_worst),
+            ("f1", f1_reg, f1_worst),
+        ):
+            metric_limits = limits[metric_name]
+            metric_pass = (
+                regressions <= metric_limits["max_regressions"]
+                and worst_delta >= metric_limits["min_worst_delta"]
+            )
+            if not metric_pass:
+                item_pass = False
+            metric_blocks.append(
+                (
+                    metric_name,
+                    {
+                        "regressions": regressions,
+                        "worst_delta": worst_delta,
+                        "pass": bool(metric_pass),
+                    },
+                )
+            )
+        if not item_pass:
+            overall = False
+        results.append(
+            {
+                "name": name,
+                "ba": metric_blocks[0][1],
+                "f1": metric_blocks[1][1],
+                "pass": bool(item_pass),
+            }
+        )
+
+    return {
+        "gate_count": gate_count,
+        "limits": limits,
+        "results": results,
+        "pass": bool(overall),
+    }
+
+
+def _cmd_trendgate(stats_path, config_path, output_path):
+    """trendgate 子命令主体；全部 name 的 ba/f1 均达标退出 0、合法但未
+    通过退出 3、契约/路径/I-O 失败退出 1 且不改 OUTPUT。
+
+    STATS、CONFIG、OUTPUT 三路径绝对化后必须两两不同。STATS 必须是
+    trendstats 的严格产物（契约见 _load_trendstats_output），CONFIG 的
+    严格契约见 _load_trendgate_config；任一读取/校验失败即整体失败退出
+    1，OUTPUT 原样保留（全部读取与计算完成后才一次性原子写盘）。
+
+    OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），顶层键依次为
+    gate_count（int）、limits（同 CONFIG）、results（list）、pass
+    （bool，各项 pass 之与）；results 保持 name 顺序，每项键依次为
+    name（str）、ba、f1、pass（bool）；ba/f1 键依次为 regressions
+    （int）、worst_delta（有限 float，固定 12 位小数、负零归零）、
+    pass（bool）；同一输入重复运行逐字节相同，标准输出为空。
+    """
+    overall = False
+    try:
+        stats_abs = os.path.abspath(stats_path)
+        config_abs = os.path.abspath(config_path)
+        out_abs = os.path.abspath(output_path)
+        if out_abs == stats_abs:
+            raise ValueError("OUTPUT 与 STATS 不能是同一路径")
+        if out_abs == config_abs:
+            raise ValueError("OUTPUT 与 CONFIG 不能是同一路径")
+        if stats_abs == config_abs:
+            raise ValueError("STATS 与 CONFIG 不能是同一路径")
+
+        with open(stats_path, "rb") as f:
+            stats_raw = f.read()
+        with open(config_path, "rb") as f:
+            config_raw = f.read()
+
+        report = _trendgate_compute(stats_raw, config_raw)
+        overall = report["pass"]
+        payload = (_dump_compact(report) + "\n").encode("utf-8")
+        _atomic_write_output(out_abs, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if overall else 3
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
@@ -8722,7 +9138,8 @@ def main(argv):
     valgate STATS VAL CONFIG OUTPUT、
     valgatebatch MANIFEST OUTPUT、
     valgatebatchdiff BASELINE CURRENT OUTPUT、
-    valgatebatchtrend MANIFEST OUTPUT 与 trendstats MANIFEST OUTPUT。
+    valgatebatchtrend MANIFEST OUTPUT、trendstats MANIFEST OUTPUT 与
+    trendgate STATS CONFIG OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -8776,6 +9193,8 @@ def main(argv):
         return _cmd_valgatebatchtrend(argv[2], argv[3])
     if len(argv) == 4 and argv[1] == "trendstats":
         return _cmd_trendstats(argv[2], argv[3])
+    if len(argv) == 5 and argv[1] == "trendgate":
+        return _cmd_trendgate(argv[2], argv[3], argv[4])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -8801,6 +9220,7 @@ def main(argv):
         "valgatebatchdiff",
         "valgatebatchtrend",
         "trendstats",
+        "trendgate",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
