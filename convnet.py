@@ -7630,8 +7630,10 @@ def _cmd_valgatebatch(manifest_path, output_path):
 
     MANIFEST 的严格契约见 _load_valgatebatch_manifest：闸门数 >= 2，
     name 唯一，清单内 stats/val/config 相对清单目录解析且跨全部闸门
-    两两不同。OUTPUT 另须与 MANIFEST 及所有闸门输入路径不同。每组
-    完全复用 _valgate_compute（即 valgate 对 STATS、VAL、CONFIG 的
+    两两不同。OUTPUT 为相对路径时以 MANIFEST 所在目录解析（绝对路径
+    原样使用）；绝对化后 OUTPUT 另须与 MANIFEST 及所有闸门输入路径
+    两两不同，任一冲突即失败退出 1 且不写出/改动 OUTPUT。每组完全
+    复用 _valgate_compute（即 valgate 对 STATS、VAL、CONFIG 的
     校验、混淆矩阵重算比对与未舍入阈值比较契约）；任一组失败即整体
     失败退出 1，OUTPUT 原样保留（所有组重算完成后才一次性原子写盘）。
 
@@ -7646,13 +7648,13 @@ def _cmd_valgatebatch(manifest_path, output_path):
     overall = False
     try:
         manifest_abs = os.path.abspath(manifest_path)
-        out_abs = os.path.abspath(output_path)
+        manifest_dir = os.path.dirname(manifest_abs)
+        out_abs = os.path.abspath(os.path.join(manifest_dir, output_path))
         if out_abs == manifest_abs:
             raise ValueError("OUTPUT 与 MANIFEST 不能是同一路径")
 
         with open(manifest_path, "rb") as f:
             manifest_raw = f.read()
-        manifest_dir = os.path.dirname(manifest_abs)
         groups = _load_valgatebatch_manifest(manifest_raw, manifest_dir)
 
         # 清单内路径两两不同已由加载器保证；OUTPUT/MANIFEST 也不得与
@@ -7695,7 +7697,280 @@ def _cmd_valgatebatch(manifest_path, output_path):
             "pass": bool(overall),
         }
         payload = (_dump_compact(report) + "\n").encode("utf-8")
-        _atomic_write_output(output_path, payload)
+        _atomic_write_output(out_abs, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if overall else 3
+
+
+# ---------------------------------------------------------------------------
+# 命令行批量闸门基线对比：
+# python convnet.py valgatebatchdiff BASELINE CURRENT OUTPUT
+# ---------------------------------------------------------------------------
+
+_VALGATEBATCHDIFF_INPUT_TOP_KEYS = [
+    "gate_count", "passed_count", "results", "pass",
+]
+_VALGATEBATCHDIFF_INPUT_ITEM_KEYS = [
+    "name",
+    "epoch",
+    "sample_count",
+    "balanced_accuracy",
+    "macro_f1",
+    "min_balanced_accuracy",
+    "min_macro_f1",
+    "balanced_accuracy_pass",
+    "macro_f1_pass",
+    "pass",
+]
+_VALGATEBATCHDIFF_OUTPUT_TOP_KEYS = ["gate_count", "results", "pass"]
+_VALGATEBATCHDIFF_OUTPUT_ITEM_KEYS = ["name", "ba", "f1", "pass"]
+_VALGATEBATCHDIFF_METRIC_KEYS = ["baseline", "current", "delta", "pass"]
+
+
+def _load_valgatebatchdiff_input(raw, label):
+    """按 valgatebatch 产物契约解析并严格校验一份基线/当前输入。
+
+    输入须为 valgatebatch 的 OUTPUT 产物：无 BOM、无字符串字面量之外
+    的任何 JSON 空白（紧凑 UTF-8 JSON）、无 NaN/Infinity 常量，重复键
+    一律拒绝。顶层必须是 JSON 对象，键仅依次为 gate_count、
+    passed_count（int，拒绝 bool）、results（list）、pass（bool）；
+    gate_count >= 2、results 长度等于 gate_count、passed_count 落在
+    [0, gate_count]。每项为 JSON 对象，键仅依次为 name（str）、epoch、
+    sample_count（int）、balanced_accuracy、macro_f1、
+    min_balanced_accuracy、min_macro_f1（有限 float，拒绝 bool/int）、
+    balanced_accuracy_pass、macro_f1_pass、pass（bool）。本函数仅消费
+    name、balanced_accuracy、macro_f1，但对全部字段做契约校验。
+
+    返回 (gate_count, [(name, balanced_accuracy, macro_f1), ...])，
+    保持产物中的顺序。非法 UTF-8/JSON 或契约不符分别抛
+    UnicodeDecodeError/ValueError/TypeError。
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError(
+            "%s 必须是 bytes，得到 %s" % (label, type(raw).__name__)
+        )
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("%s 不得含 UTF-8 BOM" % label)
+    text = raw.decode("utf-8")
+    _reject_json_whitespace(raw)
+    _reject_json_constants(raw)
+    doc = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(doc, dict):
+        raise TypeError("%s 顶层必须是 JSON 对象" % label)
+    if list(doc.keys()) != _VALGATEBATCHDIFF_INPUT_TOP_KEYS:
+        raise ValueError(
+            "%s 顶层键必须依次为 gate_count、passed_count、results、pass"
+            % label
+        )
+
+    gate_count = doc["gate_count"]
+    if isinstance(gate_count, bool) or not isinstance(gate_count, int):
+        raise TypeError(
+            "%s.gate_count 必须是 int，得到 %s"
+            % (label, type(gate_count).__name__)
+        )
+    if gate_count < 2:
+        raise ValueError(
+            "%s.gate_count 必须 >= 2，得到 %d" % (label, gate_count)
+        )
+
+    passed_count = doc["passed_count"]
+    if isinstance(passed_count, bool) or not isinstance(passed_count, int):
+        raise TypeError(
+            "%s.passed_count 必须是 int，得到 %s"
+            % (label, type(passed_count).__name__)
+        )
+    if not (0 <= passed_count <= gate_count):
+        raise ValueError(
+            "%s.passed_count（%d）必须落在 [0, gate_count=%d]"
+            % (label, passed_count, gate_count)
+        )
+
+    results = doc["results"]
+    if not isinstance(results, list):
+        raise TypeError(
+            "%s.results 必须是 list，得到 %s"
+            % (label, type(results).__name__)
+        )
+    if len(results) != gate_count:
+        raise ValueError(
+            "%s.results 长度（%d）必须等于 gate_count（%d）"
+            % (label, len(results), gate_count)
+        )
+
+    if not isinstance(doc["pass"], bool):
+        raise TypeError(
+            "%s.pass 必须是 bool，得到 %s"
+            % (label, type(doc["pass"]).__name__)
+        )
+
+    items = []
+    for idx, item in enumerate(results):
+        if not isinstance(item, dict):
+            raise TypeError("%s.results[%d] 必须是 JSON 对象" % (label, idx))
+        if list(item.keys()) != _VALGATEBATCHDIFF_INPUT_ITEM_KEYS:
+            raise ValueError(
+                "%s.results[%d] 必须是 valgatebatch 单项产物，键序不符"
+                % (label, idx)
+            )
+
+        name = item["name"]
+        if not isinstance(name, str):
+            raise TypeError(
+                "%s.results[%d].name 必须是 str，得到 %s"
+                % (label, idx, type(name).__name__)
+            )
+
+        for key in ("epoch", "sample_count"):
+            value = item[key]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    "%s.results[%d].%s 必须是 int，得到 %s"
+                    % (label, idx, key, type(value).__name__)
+                )
+
+        for key in (
+            "balanced_accuracy",
+            "macro_f1",
+            "min_balanced_accuracy",
+            "min_macro_f1",
+        ):
+            value = item[key]
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError(
+                    "%s.results[%d].%s 必须是 float，得到 %s"
+                    % (label, idx, key, type(value).__name__)
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    "%s.results[%d].%s 必须有限" % (label, idx, key)
+                )
+
+        for key in (
+            "balanced_accuracy_pass",
+            "macro_f1_pass",
+            "pass",
+        ):
+            if not isinstance(item[key], bool):
+                raise TypeError(
+                    "%s.results[%d].%s 必须是 bool，得到 %s"
+                    % (label, idx, key, type(item[key]).__name__)
+                )
+
+        items.append(
+            (name, item["balanced_accuracy"], item["macro_f1"])
+        )
+    return gate_count, items
+
+
+def _valgatebatchdiff_diff_metric(baseline_value, current_value):
+    """当前值减基线值；结果非有限即 ValueError，并归一化负零。"""
+    delta = current_value - baseline_value
+    if not math.isfinite(delta):
+        raise ValueError("指标差值非有限（NaN/inf），禁止写出产物")
+    if delta == 0.0:
+        delta = 0.0  # 归一化可能的 -0.0
+    return delta
+
+
+def _cmd_valgatebatchdiff(baseline_path, current_path, output_path):
+    """valgatebatchdiff 子命令主体；全组不退步退出 0、合法但有退步
+    退出 3、契约/路径/计算/I-O 失败退出 1 且不改 OUTPUT。
+
+    BASELINE、CURRENT 均按 valgatebatch 的 OUTPUT 产物校验（见
+    _load_valgatebatchdiff_input）；两者 gate_count 及各 name 顺序必须
+    完全一致，否则退出 1。三路径按各自（相对当前工作目录的）绝对路径
+    处理，BASELINE、CURRENT、OUTPUT 须两两不同，任一冲突即退出 1 且
+    不写出/改动 OUTPUT。
+
+    每组 ba、f1 分别取 balanced_accuracy、macro_f1，差值为当前 float
+    减基线 float（未舍入），delta >= 0 才通过；项 pass 为两指标 pass
+    之与，顶层 pass 为各项 pass 之与。
+
+    OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），顶层键依次为
+    gate_count（int）、results（list）、pass（bool）；results 每项键
+    依次为 name（str）、ba（object）、f1（object）、pass（bool）；
+    ba、f1 键依次均为 baseline、current、delta（有限 float，固定 12
+    位小数、负零归零）、pass（bool）；同一输入重复运行逐字节相同，
+    标准输出为空。
+    """
+    overall = False
+    try:
+        baseline_abs = os.path.abspath(baseline_path)
+        current_abs = os.path.abspath(current_path)
+        out_abs = os.path.abspath(output_path)
+        if baseline_abs == current_abs:
+            raise ValueError("BASELINE 与 CURRENT 不能是同一路径")
+        if out_abs == baseline_abs:
+            raise ValueError("OUTPUT 与 BASELINE 不能是同一路径")
+        if out_abs == current_abs:
+            raise ValueError("OUTPUT 与 CURRENT 不能是同一路径")
+
+        with open(baseline_path, "rb") as f:
+            baseline_raw = f.read()
+        with open(current_path, "rb") as f:
+            current_raw = f.read()
+
+        baseline_count, baseline_items = _load_valgatebatchdiff_input(
+            baseline_raw, "BASELINE"
+        )
+        current_count, current_items = _load_valgatebatchdiff_input(
+            current_raw, "CURRENT"
+        )
+
+        if baseline_count != current_count:
+            raise ValueError(
+                "gate_count 不一致：BASELINE=%d、CURRENT=%d"
+                % (baseline_count, current_count)
+            )
+        for idx, (base_item, cur_item) in enumerate(
+            zip(baseline_items, current_items)
+        ):
+            if base_item[0] != cur_item[0]:
+                raise ValueError(
+                    "第 %d 组 name 顺序不一致：BASELINE=%r、CURRENT=%r"
+                    % (idx, base_item[0], cur_item[0])
+                )
+
+        results = []
+        all_pass = True
+        for base_item, cur_item in zip(baseline_items, current_items):
+            name, base_ba, base_f1 = base_item
+            _cur_name, cur_ba, cur_f1 = cur_item
+
+            ba_delta = _valgatebatchdiff_diff_metric(base_ba, cur_ba)
+            f1_delta = _valgatebatchdiff_diff_metric(base_f1, cur_f1)
+            ba_pass = ba_delta >= 0.0
+            f1_pass = f1_delta >= 0.0
+            item_pass = ba_pass and f1_pass
+            all_pass = all_pass and item_pass
+
+            results.append({
+                "name": name,
+                "ba": {
+                    "baseline": base_ba,
+                    "current": cur_ba,
+                    "delta": ba_delta,
+                    "pass": bool(ba_pass),
+                },
+                "f1": {
+                    "baseline": base_f1,
+                    "current": cur_f1,
+                    "delta": f1_delta,
+                    "pass": bool(f1_pass),
+                },
+                "pass": bool(item_pass),
+            })
+
+        overall = bool(all_pass)
+        report = {
+            "gate_count": baseline_count,
+            "results": results,
+            "pass": bool(overall),
+        }
+        payload = (_dump_compact(report) + "\n").encode("utf-8")
+        _atomic_write_output(out_abs, payload)
     except (ValueError, TypeError, OSError):
         return 1
     return 0 if overall else 3
@@ -7710,8 +7985,9 @@ def main(argv):
     resumeval TRAIN VAL INPUT EPOCHS OUTPUT、
     resumevalstats TRAIN VAL INPUT EPOCHS OUTPUT、
     valreport STATS VAL OUTPUT、
-    valgate STATS VAL CONFIG OUTPUT 与
-    valgatebatch MANIFEST OUTPUT。
+    valgate STATS VAL CONFIG OUTPUT、
+    valgatebatch MANIFEST OUTPUT 与
+    valgatebatchdiff BASELINE CURRENT OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -7759,6 +8035,8 @@ def main(argv):
         return _cmd_valgate(argv[2], argv[3], argv[4], argv[5])
     if len(argv) == 4 and argv[1] == "valgatebatch":
         return _cmd_valgatebatch(argv[2], argv[3])
+    if len(argv) == 5 and argv[1] == "valgatebatchdiff":
+        return _cmd_valgatebatchdiff(argv[2], argv[3], argv[4])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -7781,6 +8059,7 @@ def main(argv):
         "valreport",
         "valgate",
         "valgatebatch",
+        "valgatebatchdiff",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
