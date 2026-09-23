@@ -7364,6 +7364,176 @@ def _cmd_valreport(stats_path, val_path, output_path):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# 命令行末轮阈值闸门：
+# python convnet.py valgate STATS VAL CONFIG OUTPUT
+# ---------------------------------------------------------------------------
+
+# valgate CONFIG 仅含两个阈值键，键序固定；CONFIG 须为无 BOM、无任何空白
+# 字节的紧凑 JSON 对象。
+_VALGATE_CONFIG_KEYS = ["balanced_accuracy", "macro_f1"]
+_VALGATE_JSON_SPACE_BYTES = b" \t\n\r"
+
+
+def _parse_valgate_config(raw):
+    """按 valgate 契约从 CONFIG 原始字节严格解析，返回 (bal_thr, f1_thr)。
+
+    raw 须为 UTF-8 JSON bytes：拒绝 BOM（EF BB BF）与任何 JSON 空白字节
+    （空格/Tab/LF/CR），故只接受逐字节紧凑的文本；非法 UTF-8 抛
+    UnicodeDecodeError，JSON 语法错（含 BOM）或 NaN/Infinity 常量抛
+    ValueError。顶层须为 JSON 对象，键仅依次为 balanced_accuracy、
+    macro_f1，重复、缺失、额外或错序键一律非法；两个值均须为 [0,1] 内的
+    有限 float，拒绝 int/bool 与 NaN/inf。
+    """
+    if raw.startswith(b"\xef\xbb\xbf") or b"\xef\xbb\xbf" in raw:
+        raise ValueError("CONFIG 不允许 UTF-8 BOM")
+    for byte in _VALGATE_JSON_SPACE_BYTES:
+        if bytes((byte,)) in raw:
+            raise ValueError("CONFIG 不允许任何空白，须为紧凑 JSON")
+    text = raw.decode("utf-8")
+    _reject_json_constants(raw)
+    doc = json.loads(
+        text, object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("CONFIG 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _VALGATE_CONFIG_KEYS:
+        raise ValueError(
+            "CONFIG 键必须依次为 balanced_accuracy、macro_f1"
+        )
+    thresholds = []
+    for name in _VALGATE_CONFIG_KEYS:
+        value = doc[name]
+        if isinstance(value, bool) or not isinstance(value, float):
+            raise TypeError(
+                "%s 必须是 float（拒绝 int/bool），得到 %s"
+                % (name, type(value).__name__)
+            )
+        if not math.isfinite(value):
+            raise ValueError("%s 含有非有限值（NaN/inf）" % name)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("%s 必须在 [0,1] 内" % name)
+        thresholds.append(value)
+    return thresholds[0], thresholds[1]
+
+
+def _cmd_valgate(stats_path, val_path, config_path, output_path):
+    """valgate 子命令主体；达标 0、合法未达标 3、契约/路径/I-O 失败 1。
+
+    STATS 须为 epoch>=1 的 resumevalstats 产物（version 3），严格加载、
+    摘要绑定（VAL 沿用 fitdata 契约，原始字节 SHA-256 与产物 val_sha
+    逐字符相同；train_sha 仅校验格式）、以保存模型与 BN 统计关闭 Dropout
+    重算末轮混淆矩阵并与历史末项核对，全部沿用 valreport
+    （_cmd_valreport）。STATS、VAL、CONFIG、OUTPUT 四路径两两不同。
+
+    CONFIG 契约见 _parse_valgate_config。由重算混淆矩阵按 valreport
+    公式（precision=M[c][c]/第 c 列和、recall=M[c][c]/第 c 行和、零分母
+    0.0；F1 在 precision+recall 为 0 时取 0.0 否则 2pr/(p+r)；
+    balanced_accuracy 为两类 recall 均值、macro_f1 为两类 F1 均值）取得
+    未舍入实测值，逐项以 实测值>=阈值 判定。
+
+    OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），键依次为 epoch（int）、
+    sample_count（int）、balanced_accuracy/macro_f1/
+    min_balanced_accuracy/min_macro_f1（有限 float，实测值跟随后两项阈值）、
+    balanced_accuracy_pass/macro_f1_pass/pass（bool，pass 为两项与）；
+    float 固定 12 位小数、负零归零。达标退出 0，合法但未达标也写盘并退出
+    3；输入非法、摘要或统计不符、推理非有限或 I/O 失败均返回 1，标准输出
+    为空且 OUTPUT 原样保留；同一输入重复运行产物逐字节相同。
+    """
+    try:
+        out_abs = os.path.abspath(output_path)
+        stats_abs = os.path.abspath(stats_path)
+        val_abs = os.path.abspath(val_path)
+        config_abs = os.path.abspath(config_path)
+        if out_abs == stats_abs:
+            raise ValueError("OUTPUT 与 STATS 不能是同一路径")
+        if out_abs == val_abs:
+            raise ValueError("OUTPUT 与 VAL 不能是同一路径")
+        if out_abs == config_abs:
+            raise ValueError("OUTPUT 与 CONFIG 不能是同一路径")
+        if stats_abs == val_abs:
+            raise ValueError("STATS 与 VAL 不能是同一路径")
+        if stats_abs == config_abs:
+            raise ValueError("STATS 与 CONFIG 不能是同一路径")
+        if val_abs == config_abs:
+            raise ValueError("VAL 与 CONFIG 不能是同一路径")
+
+        with open(val_path, "rb") as f:
+            val_raw = f.read()
+        val_digest = hashlib.sha256(val_raw).hexdigest()
+        x_val, val_labels = _parse_fitdata(val_raw)
+        n_val = len(val_labels)
+
+        with open(stats_path, "rb") as f:
+            stats_raw = f.read()
+        # 与 valreport 相同：不读 TRAIN，以产物自身 train_sha 为期望摘要
+        # （仅格式受严格校验），val_sha 与 VAL 实际摘要逐字符比对。
+        pre_doc = json.loads(stats_raw.decode("utf-8"))
+        train_sha = (
+            pre_doc.get("train_sha") if isinstance(pre_doc, dict) else None
+        )
+        state = _load_resumevalstats_checkpoint(
+            stats_raw, train_sha, val_digest, n_val
+        )
+        epoch = state["epoch"]
+        if epoch < 1:
+            raise ValueError("STATS 产物 epoch 必须 >= 1")
+
+        layers, _start = _layers_from_checkpoint_state(state)
+        (
+            _val_loss, _accuracy,
+            _class_correct, _class_total, confusion,
+        ) = _eval_norm_stats(layers, x_val, val_labels)
+        if confusion != state["confusion"][-1]:
+            raise ValueError("重算混淆矩阵与产物历史末项不符")
+
+        f1 = []
+        recall = []
+        for c in range(2):
+            col_sum = confusion[0][c] + confusion[1][c]
+            row_sum = confusion[c][0] + confusion[c][1]
+            p = confusion[c][c] / col_sum if col_sum else 0.0
+            r = confusion[c][c] / row_sum if row_sum else 0.0
+            recall.append(r)
+            f1.append(0.0 if p + r == 0.0 else 2.0 * p * r / (p + r))
+        balanced_accuracy = (recall[0] + recall[1]) / 2
+        macro_f1 = (f1[0] + f1[1]) / 2
+        if not math.isfinite(balanced_accuracy):
+            raise ValueError("balanced_accuracy 为非有限值（NaN/inf）")
+        if not math.isfinite(macro_f1):
+            raise ValueError("macro_f1 为非有限值（NaN/inf）")
+
+        with open(config_path, "rb") as f:
+            config_raw = f.read()
+        min_balanced_accuracy, min_macro_f1 = _parse_valgate_config(
+            config_raw
+        )
+
+        # 阈值判定一律使用未舍入的实测值。
+        balanced_accuracy_pass = (
+            balanced_accuracy >= min_balanced_accuracy
+        )
+        macro_f1_pass = macro_f1 >= min_macro_f1
+        passed = balanced_accuracy_pass and macro_f1_pass
+
+        report = {
+            "epoch": epoch,
+            "sample_count": n_val,
+            "balanced_accuracy": balanced_accuracy,
+            "macro_f1": macro_f1,
+            "min_balanced_accuracy": min_balanced_accuracy,
+            "min_macro_f1": min_macro_f1,
+            "balanced_accuracy_pass": balanced_accuracy_pass,
+            "macro_f1_pass": macro_f1_pass,
+            "pass": passed,
+        }
+        payload = (_dump_compact(report) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if passed else 3
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
@@ -7371,10 +7541,11 @@ def main(argv):
     OUTPUT、gradcheck CONFIG OUTPUT、convcheck CONFIG OUTPUT、
     resumenorm INPUT EPOCHS OUTPUT、resumedata DATA INPUT EPOCHS OUTPUT、
     resumeval TRAIN VAL INPUT EPOCHS OUTPUT、
-    resumevalstats TRAIN VAL INPUT EPOCHS OUTPUT 与
-    valreport STATS VAL OUTPUT。
+    resumevalstats TRAIN VAL INPUT EPOCHS OUTPUT、
+    valreport STATS VAL OUTPUT 与
+    valgate STATS VAL CONFIG OUTPUT。
 
-    成功 0、参数数目错 2、其余失败 1。
+    成功 0（valgate 合法未达标为 3）、参数数目错 2、其余失败 1。
     """
     if len(argv) == 3 and argv[1] == "train":
         return _cmd_train(argv[2])
@@ -7416,6 +7587,8 @@ def main(argv):
         )
     if len(argv) == 5 and argv[1] == "valreport":
         return _cmd_valreport(argv[2], argv[3], argv[4])
+    if len(argv) == 6 and argv[1] == "valgate":
+        return _cmd_valgate(argv[2], argv[3], argv[4], argv[5])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -7436,6 +7609,7 @@ def main(argv):
         "resumeval",
         "resumevalstats",
         "valreport",
+        "valgate",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
