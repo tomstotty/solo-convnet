@@ -6521,16 +6521,28 @@ _RESUMEVAL_TOP_KEYS = [
 ]
 _RESUMEVAL_METRICS_KEYS = ["loss", "val_loss", "accuracy"]
 
+# resumevalstats 为 resumeval 的逐类统计版本：顶层契约不变，version 固定为
+# 3；metrics 增加 class_correct、class_total、confusion 三个逐轮整数序列。
+_RESUMEVALSTATS_VERSION = 3
+_RESUMEVALSTATS_TOP_KEYS = _RESUMEVAL_TOP_KEYS
+_RESUMEVAL_FLOAT_KEYS = ["loss", "val_loss", "accuracy"]
+_RESUMEVALSTATS_METRICS_KEYS = _RESUMEVAL_FLOAT_KEYS + [
+    "class_correct", "class_total", "confusion",
+]
 
-def _eval_norm_state(layers, x_val, val_labels):
-    """不改训练状态地评估当前七层网络，返回 (val_loss, accuracy)。
+
+def _eval_norm_stats(layers, x_val, val_labels):
+    """不改训练状态地评估当前七层网络，返回
+    (val_loss, accuracy, class_correct, class_total, confusion)。
 
     取当前 conv/BN/linear 参数与 BN 运行统计，经 _norm_forward 以
     training=False（BN 用保存统计、Dropout 推理恒等）在 VAL 全批上做一次
-    前向：val_loss 为 SoftmaxCrossEntropy 的批均交叉熵；accuracy 为逐样本
-    取最大 logit（并列取较小类别）的正确数除以样本数。layers 的参数、模式、
-    缓存、BN 统计与 Dropout 随机状态均不被读取外的任何修改——_norm_forward
-    由参数深拷贝另建七层，调用后 layers 仍为训练态、Dropout 状态不推进。
+    前向：val_loss 为 SoftmaxCrossEntropy 的批均交叉熵；逐样本取最大 logit
+    （并列取较小类别 0）得预测类。类别序固定 0、1：class_total/class_correct
+    为长度 2 的各类样本数/正确数 list；confusion 为 [2][2]，行真实类、列
+    预测类；accuracy 为对角和/样本数。layers 的参数、模式、缓存、BN 统计
+    与 Dropout 随机状态均不被读取外的任何修改——_norm_forward 由参数深拷贝
+    另建七层，调用后 layers 仍为训练态、Dropout 状态不推进。
     """
     conv, bn, _dropout, _pool, _flatten, linear, _loss = layers
     logits, _, _ = _norm_forward(
@@ -6546,16 +6558,35 @@ def _eval_norm_state(layers, x_val, val_labels):
     val_loss = SoftmaxCrossEntropy().forward(logits, val_labels)
     if not math.isfinite(val_loss):
         raise ValueError("验证计算产生非有限值（NaN/inf）")
-    correct = 0
+    class_correct = [0, 0]
+    class_total = [0, 0]
+    confusion = [[0, 0], [0, 0]]
     for n in range(n_val):
+        true_label = val_labels[n]
+        class_total[true_label] += 1
         row = logits[n]
         pred = 0
         for o in range(1, _CNN_NUM_CLASSES):
             if row[o] > row[pred]:
                 pred = o
-        if pred == val_labels[n]:
-            correct += 1
-    return float(val_loss), correct / n_val
+        confusion[true_label][pred] += 1
+        if pred == true_label:
+            class_correct[true_label] += 1
+    correct = class_correct[0] + class_correct[1]
+    accuracy = correct / n_val
+    return (
+        float(val_loss), accuracy,
+        class_correct, class_total, confusion,
+    )
+
+
+def _eval_norm_state(layers, x_val, val_labels):
+    """_eval_norm_stats 的二元 (val_loss, accuracy) 视图，供 resumeval 复用；
+    逐类统计与混淆矩阵的语义见 _eval_norm_stats。"""
+    val_loss, accuracy, _, _, _ = _eval_norm_stats(
+        layers, x_val, val_labels
+    )
+    return val_loss, accuracy
 
 
 def _load_resumeval_checkpoint(data, train_digest, val_digest):
@@ -6831,13 +6862,414 @@ def _cmd_resumeval(train_path, val_path, input_path, epochs_text, output_path):
     return 0
 
 
+def _resumevalstats_int_pair(value, name):
+    """校验长度恰为 2 的非负 int list（拒绝 bool/嵌套与负值），原样返回。"""
+    _require_list(value, name)
+    if len(value) != 2:
+        raise ValueError("%s 必须是长度 2 的 list" % name)
+    for i, v in enumerate(value):
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise TypeError(
+                "%s[%d] 必须是非负 int（拒绝 bool），得到 %s"
+                % (name, i, type(v).__name__)
+            )
+        if v < 0:
+            raise ValueError("%s[%d] 必须非负" % (name, i))
+    return value
+
+
+def _load_resumevalstats_checkpoint(data, train_digest, val_digest, n_val):
+    """加载并严格校验 resumevalstats 产物，返回状态 dict。
+
+    顶层契约同 resumeval（键依次 version、train_sha、val_sha、epoch、
+    model、rng、metrics），唯 version 恰为 int 3、两份摘要分别与实参相符。
+    metrics 键须依次为 loss、val_loss、accuracy、class_correct、
+    class_total、confusion：前三者为长度等于 epoch 的有限 float list
+    （拒绝 bool/int 与 NaN/inf）；class_correct、class_total 每轮为非负
+    int[2]，confusion 每轮为非负 int[2][2]，全部 int 拒绝 bool。逐轮
+    关系校验：class_total[c] 等于混淆矩阵第 c 行之和、class_correct[c]
+    等于对角项 confusion[c][c]、矩阵总和等于 VAL 样本数 n_val、accuracy
+    恰等于对角和/n_val（空类 total、correct 均为 0）。重复/缺失/额外/错序
+    键、JSON 常量、非规范 hex、摘要不符、历史长度或关系错、类别越界（负值）
+    或类型/形状/范围错分别抛 UnicodeDecodeError/ValueError/TypeError。
+    """
+    if not isinstance(data, bytes):
+        raise TypeError(
+            "data 必须是 bytes，得到 %s" % type(data).__name__
+        )
+    if not isinstance(train_digest, str) or not isinstance(val_digest, str):
+        raise TypeError("数据摘要必须是 str")
+    text = data.decode("utf-8")
+    _reject_json_constants(data)
+    doc = json.loads(
+        text, object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("产物顶层必须是 JSON 对象")
+    if list(doc.keys()) != _RESUMEVALSTATS_TOP_KEYS:
+        raise ValueError(
+            "产物顶层键必须依次为 version、train_sha、val_sha、epoch、"
+            "model、rng、metrics"
+        )
+
+    version = doc["version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(
+            "version 必须是 int，得到 %s" % type(version).__name__
+        )
+    if version != _RESUMEVALSTATS_VERSION:
+        raise ValueError(
+            "version 必须为 %d，得到 %r"
+            % (_RESUMEVALSTATS_VERSION, version)
+        )
+
+    train_sha = doc["train_sha"]
+    val_sha = doc["val_sha"]
+    for name, digest in (
+        ("train_sha", train_sha), ("val_sha", val_sha)
+    ):
+        if not isinstance(digest, str):
+            raise TypeError(
+                "%s 必须是 JSON 字符串，得到 %s"
+                % (name, type(digest).__name__)
+            )
+        if _SHA256_HEX_RE.match(digest) is None:
+            raise ValueError(
+                "%s 必须是 64 位小写十六进制 SHA-256 摘要：%r"
+                % (name, digest)
+            )
+    if train_sha != train_digest:
+        raise ValueError("产物 train_sha 与 TRAIN 摘要不符")
+    if val_sha != val_digest:
+        raise ValueError("产物 val_sha 与 VAL 摘要不符")
+
+    # epoch/model 的校验与 norm 检查点共有字段完全一致；本产物的 rng
+    # 即检查点的 dropout_state，以同构子文档复用同一套严格解析。
+    rng = doc["rng"]
+    if isinstance(rng, bool) or not isinstance(rng, int):
+        raise TypeError(
+            "rng 必须是 int，得到 %s" % type(rng).__name__
+        )
+    if rng < 0 or rng > 0xFFFFFFFF:
+        raise ValueError("rng 必须在 [0, 2^32-1] 内")
+    sub_doc = {
+        "epoch": doc["epoch"],
+        "model": doc["model"],
+        "dropout_state": rng,
+    }
+    state = _parse_norm_checkpoint_state(sub_doc)
+
+    metrics = doc["metrics"]
+    if not isinstance(metrics, dict):
+        raise TypeError(
+            "metrics 必须是 JSON 对象，得到 %s"
+            % type(metrics).__name__
+        )
+    if list(metrics.keys()) != _RESUMEVALSTATS_METRICS_KEYS:
+        raise ValueError(
+            "metrics 的键必须依次为 loss、val_loss、accuracy、"
+            "class_correct、class_total、confusion"
+        )
+    total_epochs = state["epoch"]
+    for name in _RESUMEVAL_FLOAT_KEYS:
+        series = metrics[name]
+        _require_list(series, name)
+        if len(series) != total_epochs:
+            raise ValueError(
+                "%s 长度 %d 与 epoch %d 不符"
+                % (name, len(series), total_epochs)
+            )
+        for v in series:
+            _check_metrics_float(v, name)
+
+    correct_hist = []
+    total_hist = []
+    confusion_hist = []
+    for name in (
+        "class_correct", "class_total", "confusion",
+    ):
+        series = metrics[name]
+        _require_list(series, name)
+        if len(series) != total_epochs:
+            raise ValueError(
+                "%s 长度 %d 与 epoch %d 不符"
+                % (name, len(series), total_epochs)
+            )
+    for e in range(total_epochs):
+        correct = _resumevalstats_int_pair(
+            metrics["class_correct"][e], "class_correct"
+        )
+        per_total = _resumevalstats_int_pair(
+            metrics["class_total"][e], "class_total"
+        )
+        matrix_node = metrics["confusion"][e]
+        _require_list(matrix_node, "confusion")
+        if len(matrix_node) != 2:
+            raise ValueError("confusion 每轮必须是 [2][2] 的 list")
+        matrix = [
+            _resumevalstats_int_pair(matrix_node[c], "confusion[%d]" % c)
+            for c in range(2)
+        ]
+        # 行真实类、列预测类：total 为行和，correct 为对角。
+        for c in range(2):
+            row_sum = matrix[c][0] + matrix[c][1]
+            if per_total[c] != row_sum:
+                raise ValueError(
+                    "第 %d 轮 class_total[%d]=%d 与混淆矩阵行和 %d 不符"
+                    % (e, c, per_total[c], row_sum)
+                )
+            if correct[c] != matrix[c][c]:
+                raise ValueError(
+                    "第 %d 轮 class_correct[%d]=%d 与对角项 %d 不符"
+                    % (e, c, correct[c], matrix[c][c])
+                )
+        matrix_sum = sum(sum(row) for row in matrix)
+        if matrix_sum != n_val:
+            raise ValueError(
+                "第 %d 轮混淆矩阵总和 %d 与 VAL 样本数 %d 不符"
+                % (e, matrix_sum, n_val)
+            )
+        diag = matrix[0][0] + matrix[1][1]
+        # accuracy 以固定 12 位小数序列化，关系校验须在同一精度下比较：
+        # 载入值与对角和/样本数各自的 12 位渲染必须一致，否则 1/3 这类
+        # 自产物反而无法被续训载入。
+        expected_accuracy = float(metrics["accuracy"][e])
+        if _fmt_float(expected_accuracy) != _fmt_float(diag / n_val):
+            raise ValueError(
+                "第 %d 轮 accuracy %r 与对角和/样本数 %r 不符"
+                % (e, expected_accuracy, diag / n_val)
+            )
+        correct_hist.append([correct[0], correct[1]])
+        total_hist.append([per_total[0], per_total[1]])
+        confusion_hist.append([
+            [matrix[0][0], matrix[0][1]],
+            [matrix[1][0], matrix[1][1]],
+        ])
+
+    state["losses"] = [float(v) for v in metrics["loss"]]
+    state["val_losses"] = [float(v) for v in metrics["val_loss"]]
+    state["accuracies"] = [float(v) for v in metrics["accuracy"]]
+    state["class_correct"] = correct_hist
+    state["class_total"] = total_hist
+    state["confusion"] = confusion_hist
+    return state
+
+
+def _dump_resumevalstats_checkpoint(
+    layers, epoch, train_digest, val_digest,
+    losses, val_losses, accuracies,
+    class_correct_hist, class_total_hist, confusion_hist,
+):
+    """序列化 resumevalstats 产物，返回紧凑 UTF-8 JSON bytes（末尾 LF）。
+
+    顶层键依次为 version（int 3）、train_sha/val_sha（64 位小写 hex）、
+    epoch（非负 int）、model（与 dump_data_checkpoint 同构的 hex 张量，
+    校验同 _validate_norm_checkpoint_layers）、rng（Dropout 当前 LCG
+    状态，[0,2^32-1] 内 int）、metrics（键依次 loss、val_loss、accuracy、
+    class_correct、class_total、confusion）。前三者为长度 epoch 的有限
+    float list（固定 12 位小数、负零归零）；后三者每轮分别为非负 int[2]、
+    int[2]、int[2][2]（拒绝 bool）。同一状态重复调用逐字节相同。
+    """
+    _validate_norm_checkpoint_layers(layers)
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        raise TypeError(
+            "epoch 必须是 int（拒绝 bool），得到 %s"
+            % type(epoch).__name__
+        )
+    if epoch < 0:
+        raise ValueError("epoch 必须为非负整数")
+    for name, digest in (
+        ("train_sha256", train_digest), ("val_sha256", val_digest)
+    ):
+        if not isinstance(digest, str):
+            raise TypeError(
+                "%s 必须是 str，得到 %s" % (name, type(digest).__name__)
+            )
+        if _SHA256_HEX_RE.match(digest) is None:
+            raise ValueError(
+                "%s 必须是 64 位小写十六进制 SHA-256 摘要：%r"
+                % (name, digest)
+            )
+    for series_name, series in (
+        ("loss", losses), ("val_loss", val_losses),
+        ("accuracy", accuracies),
+    ):
+        _require_list(series, series_name)
+        if len(series) != epoch:
+            raise ValueError(
+                "%s 长度 %d 与 epoch %d 不符"
+                % (series_name, len(series), epoch)
+            )
+        for v in series:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError(
+                    "%s 的元素必须为 float，得到 %s"
+                    % (series_name, type(v).__name__)
+                )
+            if not math.isfinite(v):
+                raise ValueError(
+                    "%s 含有非有限值（NaN/inf）" % series_name
+                )
+    for series_name, series in (
+        ("class_correct", class_correct_hist),
+        ("class_total", class_total_hist),
+        ("confusion", confusion_hist),
+    ):
+        _require_list(series, series_name)
+        if len(series) != epoch:
+            raise ValueError(
+                "%s 长度 %d 与 epoch %d 不符"
+                % (series_name, len(series), epoch)
+            )
+        for e, node in enumerate(series):
+            if series_name == "confusion":
+                _require_list(node, "%s[%d]" % (series_name, e))
+                if len(node) != 2:
+                    raise ValueError(
+                        "confusion[%d] 必须是 [2][2] 的 list" % e
+                    )
+                for c in range(2):
+                    _resumevalstats_int_pair(
+                        node[c], "%s[%d][%d]" % (series_name, e, c)
+                    )
+            else:
+                _resumevalstats_int_pair(
+                    node, "%s[%d]" % (series_name, e)
+                )
+
+    conv, bn, dropout, _pool, _flatten, linear, _loss = layers
+    parts = []
+    parts.append('"version":' + str(int(_RESUMEVALSTATS_VERSION)))
+    parts.append('"train_sha":' + json.dumps(train_digest))
+    parts.append('"val_sha":' + json.dumps(val_digest))
+    parts.append('"epoch":' + str(int(epoch)))
+    parts.append(_dump_checkpoint_model_text(conv, bn, linear))
+    parts.append('"rng":' + str(int(dropout._s)))
+    metrics = {
+        "loss": [float(v) for v in losses],
+        "val_loss": [float(v) for v in val_losses],
+        "accuracy": [float(v) for v in accuracies],
+        "class_correct": class_correct_hist,
+        "class_total": class_total_hist,
+        "confusion": confusion_hist,
+    }
+    parts.append('"metrics":' + _dump_compact(metrics))
+    text = "{" + ",".join(parts) + "}\n"
+    return text.encode("utf-8")
+
+
+def _cmd_resumevalstats(
+    train_path, val_path, input_path, epochs_text, output_path
+):
+    """resumevalstats 子命令主体；成功 0、契约/阈值/路径/I-O 失败 1 且不改
+    OUTPUT。
+
+    训练、校验、阈值、路径互异与原子写契约完全沿用 resumeval
+    （_cmd_resumeval），区别仅在：INPUT 为 "-" 时从初值与空历史开始，否则
+    载入同类产物（version 为 int 3 的 resumevalstats 产物，拒绝 resumeval
+    的 version 2 等异质产物）；每轮校验另记录 class_correct/class_total/
+    confusion（语义见 _eval_norm_stats 与
+    _load_resumevalstats_checkpoint），OUTPUT 为
+    _dump_resumevalstats_checkpoint 的字节。失败时标准输出为空且 OUTPUT
+    原样保留。
+    """
+    try:
+        out_abs = os.path.abspath(output_path)
+        if out_abs == os.path.abspath(train_path):
+            raise ValueError("OUTPUT 与 TRAIN 不能是同一路径")
+        if out_abs == os.path.abspath(val_path):
+            raise ValueError("OUTPUT 与 VAL 不能是同一路径")
+        if os.path.abspath(train_path) == os.path.abspath(val_path):
+            raise ValueError("TRAIN 与 VAL 不能是同一路径")
+        if input_path != "-":
+            if os.path.abspath(input_path) == os.path.abspath(train_path):
+                raise ValueError("INPUT 与 TRAIN 不能是同一路径")
+            if os.path.abspath(input_path) == os.path.abspath(val_path):
+                raise ValueError("INPUT 与 VAL 不能是同一路径")
+            if out_abs == os.path.abspath(input_path):
+                raise ValueError("INPUT 与 OUTPUT 不能是同一路径")
+        epochs = _parse_resume_epochs(epochs_text)
+
+        with open(train_path, "rb") as f:
+            train_raw = f.read()
+        train_digest = hashlib.sha256(train_raw).hexdigest()
+        x, labels = _parse_fitdata(train_raw)
+        with open(val_path, "rb") as f:
+            val_raw = f.read()
+        val_digest = hashlib.sha256(val_raw).hexdigest()
+        x_val, val_labels = _parse_fitdata(val_raw)
+        n_val = len(val_labels)
+
+        if input_path == "-":
+            layers = _build_norm_layers()
+            start = 0
+            losses = []
+            val_losses = []
+            accuracies = []
+            class_correct_hist = []
+            class_total_hist = []
+            confusion_hist = []
+        else:
+            with open(input_path, "rb") as f:
+                checkpoint_raw = f.read()
+            state = _load_resumevalstats_checkpoint(
+                checkpoint_raw, train_digest, val_digest, n_val
+            )
+            layers, start = _layers_from_checkpoint_state(state)
+            losses = state["losses"]
+            val_losses = state["val_losses"]
+            accuracies = state["accuracies"]
+            class_correct_hist = state["class_correct"]
+            class_total_hist = state["class_total"]
+            confusion_hist = state["confusion"]
+
+        # 逐轮追加：每轮 train_norm(epochs=1) 与连续 train_norm(epochs=E)
+        # 逐位等价（末轮 BN 统计刷新与 Dropout 推进完全一致）；评估在另建
+        # 的推理态网络上进行，训练态参数、缓存、统计与随机状态均不受影响。
+        for _ in range(epochs):
+            (step_loss,) = train_norm(
+                layers, x, labels, epochs=1, lr=_NORM_LR
+            )
+            step_loss = float(step_loss)
+            if not math.isfinite(step_loss):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+            (
+                val_loss, accuracy,
+                class_correct, class_total, confusion,
+            ) = _eval_norm_stats(layers, x_val, val_labels)
+            losses.append(step_loss)
+            val_losses.append(val_loss)
+            accuracies.append(accuracy)
+            class_correct_hist.append(class_correct)
+            class_total_hist.append(class_total)
+            confusion_hist.append(confusion)
+
+        total = start + epochs
+        if total >= 20:
+            if not losses[-1] < losses[0]:
+                raise ValueError("末次 loss 未小于首次 loss")
+            if accuracies[-1] != 1.0:
+                raise ValueError("末次 validation accuracy 不为 1.0")
+
+        payload = _dump_resumevalstats_checkpoint(
+            layers, total, train_digest, val_digest,
+            losses, val_losses, accuracies,
+            class_correct_hist, class_total_hist, confusion_hist,
+        )
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
     evaldata/predictdata WEIGHTS DATA OUTPUT、benchmark_data TRAIN VAL
     OUTPUT、gradcheck CONFIG OUTPUT、convcheck CONFIG OUTPUT、
-    resumenorm INPUT EPOCHS OUTPUT、resumedata DATA INPUT EPOCHS OUTPUT 与
-    resumeval TRAIN VAL INPUT EPOCHS OUTPUT。
+    resumenorm INPUT EPOCHS OUTPUT、resumedata DATA INPUT EPOCHS OUTPUT、
+    resumeval TRAIN VAL INPUT EPOCHS OUTPUT 与
+    resumevalstats TRAIN VAL INPUT EPOCHS OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -6875,6 +7307,10 @@ def main(argv):
         return _cmd_resumedata(argv[2], argv[3], argv[4], argv[5])
     if len(argv) == 7 and argv[1] == "resumeval":
         return _cmd_resumeval(argv[2], argv[3], argv[4], argv[5], argv[6])
+    if len(argv) == 7 and argv[1] == "resumevalstats":
+        return _cmd_resumevalstats(
+            argv[2], argv[3], argv[4], argv[5], argv[6]
+        )
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -6893,6 +7329,7 @@ def main(argv):
         "resumenorm",
         "resumedata",
         "resumeval",
+        "resumevalstats",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
