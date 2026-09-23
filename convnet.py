@@ -6882,7 +6882,10 @@ def _load_resumevalstats_checkpoint(data, train_digest, val_digest, n_val):
     """加载并严格校验 resumevalstats 产物，返回状态 dict。
 
     顶层契约同 resumeval（键依次 version、train_sha、val_sha、epoch、
-    model、rng、metrics），唯 version 恰为 int 3、两份摘要分别与实参相符。
+    model、rng、metrics），唯 version 恰为 int 3、val_sha 与实参相符。
+    train_digest 为 None 时（valreport 无 TRAIN 入参）仅跳过 train_sha
+    相等性比较，train_sha 仍须为 64 位小写十六进制 str，其余严格契约
+    一概不变；非 None 时两份摘要分别与实参相符。
     metrics 键须依次为 loss、val_loss、accuracy、class_correct、
     class_total、confusion：前三者为长度等于 epoch 的有限 float list
     （拒绝 bool/int 与 NaN/inf）；class_correct、class_total 每轮为非负
@@ -6897,7 +6900,9 @@ def _load_resumevalstats_checkpoint(data, train_digest, val_digest, n_val):
         raise TypeError(
             "data 必须是 bytes，得到 %s" % type(data).__name__
         )
-    if not isinstance(train_digest, str) or not isinstance(val_digest, str):
+    if not isinstance(val_digest, str) or (
+        train_digest is not None and not isinstance(train_digest, str)
+    ):
         raise TypeError("数据摘要必须是 str")
     text = data.decode("utf-8")
     _reject_json_constants(data)
@@ -6938,7 +6943,7 @@ def _load_resumevalstats_checkpoint(data, train_digest, val_digest, n_val):
                 "%s 必须是 64 位小写十六进制 SHA-256 摘要：%r"
                 % (name, digest)
             )
-    if train_sha != train_digest:
+    if train_digest is not None and train_sha != train_digest:
         raise ValueError("产物 train_sha 与 TRAIN 摘要不符")
     if val_sha != val_digest:
         raise ValueError("产物 val_sha 与 VAL 摘要不符")
@@ -7262,14 +7267,141 @@ def _cmd_resumevalstats(
     return 0
 
 
+# ---------------------------------------------------------------------------
+# 末轮逐类统计报告：
+# python convnet.py valreport STATS VAL OUTPUT
+# ---------------------------------------------------------------------------
+
+_VALREPORT_KEYS = [
+    "epoch", "sample_count", "confusion", "precision", "recall", "f1",
+    "balanced_accuracy", "macro_f1",
+]
+
+
+def _valreport_rate(numerator, denominator):
+    """precision/recall：零分母取 0.0，否则取二者之比（结果须有限）。"""
+    if denominator == 0:
+        return 0.0
+    rate = numerator / denominator
+    if not math.isfinite(rate):
+        raise ValueError("统计计算产生非有限值（NaN/inf）")
+    return rate
+
+
+def _valreport_f1(precision, recall):
+    """F1：precision 与 recall 之和为 0 时取 0.0，否则取 2pr/(p+r)。"""
+    total = precision + recall
+    if total == 0.0:
+        return 0.0
+    f1 = 2.0 * precision * recall / total
+    if not math.isfinite(f1):
+        raise ValueError("统计计算产生非有限值（NaN/inf）")
+    return f1
+
+
+def _cmd_valreport(stats_path, val_path, output_path):
+    """valreport 子命令主体；成功 0、契约/摘要/统计/I-O 失败 1 且不改 OUTPUT。
+
+    STATS、VAL、OUTPUT 三路径两两不同。STATS 须为 epoch>=1 的 version 3
+    resumevalstats 产物，沿用 _load_resumevalstats_checkpoint 的严格加载
+    契约（valreport 无 TRAIN 入参，仅跳过 train_sha 相等性比较，其格式与
+    其余字段仍严格校验）。VAL 沿用 fitdata 契约（_parse_fitdata），身份为
+    原始字节 SHA-256 小写 hex，须与 STATS 的 val_sha 逐字符相同。
+
+    以 STATS 保存的模型参数与 BN 运行统计，经 _norm_forward 以
+    training=False（BN 用保存统计、Dropout 关闭）在 VAL 全批上重算末轮
+    混淆矩阵 M：逐样本仅在 logit 有限时取最大 logit、并列（相等）取类别 0；
+    行真实类、列预测类。M 须与 STATS metrics.confusion 的历史末项逐格相等，
+    否则失败。类别序固定 0、1：precision[c]=M[c][c]/列和、
+    recall[c]=M[c][c]/行和，零分母取 0.0；f1[c] 在 precision 与 recall
+    之和为 0 时取 0.0，否则取 2pr/(p+r)；balanced_accuracy 为两 recall
+    的均值，macro_f1 为两 f1 的均值。
+
+    OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），键依次为 epoch（int）、
+    sample_count（int）、confusion（非负 int[2][2]）、precision、recall、
+    f1（各为有限 float[2]，固定 12 位小数、负零归零）、balanced_accuracy、
+    macro_f1（有限 float）。同一 STATS/VAL 字节输入逐字节一致。失败时
+    标准输出为空且 OUTPUT 原样保留。
+    """
+    try:
+        out_abs = os.path.abspath(output_path)
+        if out_abs == os.path.abspath(stats_path):
+            raise ValueError("OUTPUT 与 STATS 不能是同一路径")
+        if out_abs == os.path.abspath(val_path):
+            raise ValueError("OUTPUT 与 VAL 不能是同一路径")
+        if os.path.abspath(stats_path) == os.path.abspath(val_path):
+            raise ValueError("STATS 与 VAL 不能是同一路径")
+
+        with open(val_path, "rb") as f:
+            val_raw = f.read()
+        val_digest = hashlib.sha256(val_raw).hexdigest()
+        x_val, val_labels = _parse_fitdata(val_raw)
+        n_val = len(val_labels)
+
+        with open(stats_path, "rb") as f:
+            stats_raw = f.read()
+        # 无 TRAIN 入参：train_digest=None 仅跳过 train_sha 相等性比较，
+        # 严格加载契约（含 val_sha 相符、epoch>=1、历史关系）一概不变。
+        state = _load_resumevalstats_checkpoint(
+            stats_raw, None, val_digest, n_val
+        )
+        epoch = state["epoch"]
+        if epoch < 1:
+            raise ValueError("STATS 的 epoch 必须 >= 1")
+
+        layers, _ = _layers_from_checkpoint_state(state)
+        _, _, _, _, confusion = _eval_norm_stats(layers, x_val, val_labels)
+        if confusion != state["confusion"][-1]:
+            raise ValueError(
+                "重算末轮混淆矩阵与 STATS 历史末项不符"
+            )
+
+        precision = [
+            _valreport_rate(confusion[c][c], confusion[0][c] + confusion[1][c])
+            for c in range(2)
+        ]
+        recall = [
+            _valreport_rate(confusion[c][c], confusion[c][0] + confusion[c][1])
+            for c in range(2)
+        ]
+        f1 = [
+            _valreport_f1(precision[c], recall[c]) for c in range(2)
+        ]
+        balanced_accuracy = (recall[0] + recall[1]) / 2.0
+        macro_f1 = (f1[0] + f1[1]) / 2.0
+        if not math.isfinite(balanced_accuracy):
+            raise ValueError("balanced_accuracy 为非有限值（NaN/inf）")
+        if not math.isfinite(macro_f1):
+            raise ValueError("macro_f1 为非有限值（NaN/inf）")
+
+        report = {
+            "epoch": int(epoch),
+            "sample_count": int(n_val),
+            "confusion": confusion,
+            "precision": [float(precision[0]), float(precision[1])],
+            "recall": [float(recall[0]), float(recall[1])],
+            "f1": [float(f1[0]), float(f1[1])],
+            "balanced_accuracy": float(balanced_accuracy),
+            "macro_f1": float(macro_f1),
+        }
+        if list(report.keys()) != _VALREPORT_KEYS:
+            raise ValueError("valreport 输出键序契约不符")
+        payload = (_dump_compact(report) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
     evaldata/predictdata WEIGHTS DATA OUTPUT、benchmark_data TRAIN VAL
     OUTPUT、gradcheck CONFIG OUTPUT、convcheck CONFIG OUTPUT、
     resumenorm INPUT EPOCHS OUTPUT、resumedata DATA INPUT EPOCHS OUTPUT、
-    resumeval TRAIN VAL INPUT EPOCHS OUTPUT 与
-    resumevalstats TRAIN VAL INPUT EPOCHS OUTPUT。
+    resumeval TRAIN VAL INPUT EPOCHS OUTPUT、
+    resumevalstats TRAIN VAL INPUT EPOCHS OUTPUT 与
+    valreport STATS VAL OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -7311,6 +7443,8 @@ def main(argv):
         return _cmd_resumevalstats(
             argv[2], argv[3], argv[4], argv[5], argv[6]
         )
+    if len(argv) == 5 and argv[1] == "valreport":
+        return _cmd_valreport(argv[2], argv[3], argv[4])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -7330,6 +7464,7 @@ def main(argv):
         "resumedata",
         "resumeval",
         "resumevalstats",
+        "valreport",
     ):
         return 2
     # 其他入口保持现状（信息打印）。

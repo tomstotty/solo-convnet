@@ -14,6 +14,7 @@
 """
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -585,6 +586,279 @@ class NormCheckpointStrictTests(unittest.TestCase):
         payload = json.dumps(doc, separators=(",", ":")).encode()
         layers, _ = self._load(payload)
         self.assertEqual(layers[0]._weights[0][0][0][0], 0.0)
+
+
+class ValReportTests(unittest.TestCase):
+    """valreport STATS VAL OUTPUT：成功路径、指标语义、失败退出 1 不改
+    OUTPUT、参数数目错退出 2 与逐字节确定性。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        sys.path.insert(0, _HERE)
+        import convnet
+        self.convnet = convnet
+
+    def tearDown(self):
+        sys.path.pop(0)
+        self._tmp.cleanup()
+
+    def _path(self, name):
+        return os.path.join(self.tmp, name)
+
+    @staticmethod
+    def _data(rows):
+        return {
+            "x": [[[[v[0], v[1]], [v[2], v[3]]]] for _, v in rows],
+            "labels": [lab for lab, _ in rows],
+        }
+
+    def _write_data(self, name, rows):
+        path = self._path(name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(self._data(rows), separators=(",", ":")))
+        return path
+
+    def _stats(self, train, val, epochs, name):
+        out = self._path(name)
+        rc, _, err = _run(
+            "resumevalstats", train, val, "-", str(epochs), out
+        )
+        self.assertEqual(rc, 0, err.decode())
+        return out
+
+    def _report(self, stats, val, name):
+        out = self._path(name)
+        rc, _, err = _run("valreport", stats, val, out)
+        self.assertEqual(rc, 0, err.decode())
+        with open(out, "rb") as f:
+            raw = f.read()
+        return raw, json.loads(raw.decode("utf-8"))
+
+    def _train_val(self):
+        train_rows = [
+            (0, [0, 0, 0, 0]), (1, [5, 5, 5, 5]),
+            (0, [1, 0, 1, 0]), (1, [4, 4, 4, 4]),
+        ]
+        tr = self._write_data("train.json", train_rows)
+        # 真实 0 中一个误判为 1：混淆矩阵 [[1,1],[0,2]]。
+        val_rows = [
+            (0, [-6, 0, 0, -6]), (0, [0, 0, 0, 6]),
+            (1, [0, 0, 5, 0]), (1, [0, 0, 5, 3]),
+        ]
+        va = self._write_data("val.json", val_rows)
+        return tr, va
+
+    def test_success_contract_and_metrics(self):
+        tr, va = self._train_val()
+        stats = self._stats(tr, va, 1, "s1.json")
+        raw, doc = self._report(stats, va, "r1.json")
+
+        self.assertEqual(
+            list(doc.keys()),
+            ["epoch", "sample_count", "confusion", "precision", "recall",
+             "f1", "balanced_accuracy", "macro_f1"],
+        )
+        self.assertIs(doc["epoch"], 1)
+        self.assertIsInstance(doc["epoch"], int)
+        self.assertIs(doc["sample_count"], 4)
+        self.assertEqual(doc["confusion"], [[1, 1], [0, 1 + 1]])
+        for key in ("precision", "recall", "f1"):
+            self.assertEqual(len(doc[key]), 2)
+            for v in doc[key]:
+                self.assertIsInstance(v, float)
+                self.assertNotIsInstance(v, bool)
+                self.assertTrue(math.isfinite(v))
+        for key in ("balanced_accuracy", "macro_f1"):
+            self.assertIsInstance(doc[key], float)
+            self.assertTrue(math.isfinite(doc[key]))
+
+        # 列 0 和=1：precision[0]=1/1=1；列 1 和=3：precision[1]=2/3。
+        self.assertEqual(doc["precision"][0], 1.0)
+        self.assertAlmostEqual(doc["precision"][1], 2.0 / 3.0, places=11)
+        # 行和 2、2：recall[0]=1/2=0.5，recall[1]=1。
+        self.assertEqual(doc["recall"], [0.5, 1.0])
+        # f1[0]=2*1*.5/1.5=2/3；f1[1]=2*(2/3)*1/(5/3)=4/5。
+        self.assertAlmostEqual(doc["f1"][0], 2.0 / 3.0, places=11)
+        self.assertAlmostEqual(doc["f1"][1], 0.8, places=12)
+        self.assertEqual(doc["balanced_accuracy"], 0.75)
+        self.assertAlmostEqual(doc["macro_f1"], 11.0 / 15.0, places=11)
+
+        # 紧凑无空格、末尾 LF、无负零。
+        text = raw.decode("utf-8")
+        self.assertTrue(text.endswith("\n"))
+        self.assertNotIn(" ", text)
+        self.assertNotIn("-0.000000000000", text)
+        for token in re.findall(r"-?[0-9]+\.[0-9]+", text):
+            self.assertRegex(token, r"^-?[0-9]+\.[0-9]{12}$")
+
+    def test_zero_denominators(self):
+        cn = self.convnet
+        tr, _ = self._train_val()
+        # 末轮混淆矩阵 [[0,1],[0,1]]：列 0 和为 0（precision[0]=0.0），
+        # recall[0]=0.0 且 precision[0]+recall[0]=0（f1[0]=0.0）。
+        val_rows = [(0, [0, 0, 0, 6]), (1, [0, 0, 5, 6])]
+        va = self._write_data("valz.json", val_rows)
+        stats = self._stats(tr, va, 1, "sz.json")
+        _, doc = self._report(stats, va, "rz.json")
+        self.assertEqual(doc["confusion"], [[0, 1], [0, 1]])
+        self.assertEqual(doc["precision"], [0.0, 0.5])
+        self.assertEqual(doc["recall"], [0.0, 1.0])
+        self.assertAlmostEqual(doc["f1"][1], 2.0 / 3.0, places=11)
+        self.assertEqual(doc["f1"][0], 0.0)
+        self.assertEqual(doc["balanced_accuracy"], 0.5)
+        self.assertAlmostEqual(doc["macro_f1"], 1.0 / 3.0, places=11)
+
+    def test_tie_logits_predict_class_zero(self):
+        # 手工构造两行 linear 完全相同的合法 v3 产物：logit 严格相等，
+        # 验证并列必须取类别 0。
+        cn = self.convnet
+        tr, _ = self._train_val()
+        val_rows = [
+            (0, [0, 0, 0, 0]), (1, [5, 5, 5, 5]), (0, [1, 0, 1, 0]),
+        ]
+        va = self._write_data("valt.json", val_rows)
+        with open(tr, "rb") as f:
+            x, labels = cn._parse_fitdata(f.read())
+        with open(va, "rb") as f:
+            val_raw = f.read()
+        x_val, val_labels = cn._parse_fitdata(val_raw)
+        layers = cn._build_norm_layers()
+        cn.train_norm(layers, x, labels, epochs=1, lr=0.1)
+        layers[5]._weights = [
+            list(layers[5]._weights[0]), list(layers[5]._weights[0])
+        ]
+        layers[5]._bias = [0.0, 0.0]
+        val_loss, accuracy, cc, ct, confusion = cn._eval_norm_stats(
+            layers, x_val, val_labels
+        )
+        self.assertEqual(confusion, [[2, 0], [1, 0]])
+        import hashlib
+        payload = cn._dump_resumevalstats_checkpoint(
+            layers, 1, "0" * 64,
+            hashlib.sha256(val_raw).hexdigest(),
+            [0.1], [val_loss], [accuracy], [cc], [ct], [confusion],
+        )
+        stats = self._path("st.json")
+        with open(stats, "wb") as f:
+            f.write(payload)
+        _, doc = self._report(stats, va, "rt.json")
+        self.assertEqual(doc["confusion"], [[2, 0], [1, 0]])
+        self.assertEqual(doc["recall"], [1.0, 0.0])
+
+    def test_epoch_zero_and_v2_rejected(self):
+        tr, va = self._train_val()
+        e0 = self._path("e0.json")
+        rc, _, err = _run("resumevalstats", tr, va, "-", "0", e0)
+        self.assertEqual(rc, 0, err.decode())
+        v2 = self._path("v2.json")
+        rc, _, err = _run("resumeval", tr, va, "-", "1", v2)
+        self.assertEqual(rc, 0, err.decode())
+        for name, stats in (("epoch0", e0), ("v2", v2)):
+            out = self._path("o_%s.json" % name)
+            with open(out, "wb") as f:
+                f.write(b"SENTINEL")
+            rc, stdout, _ = _run("valreport", stats, va, out)
+            self.assertEqual(rc, 1, name)
+            self.assertEqual(stdout, b"")
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"SENTINEL", name)
+
+    def test_failures_leave_output_untouched(self):
+        tr, va = self._train_val()
+        stats = self._stats(tr, va, 1, "s.json")
+        with open(stats, "rb") as f:
+            good = json.loads(f.read().decode("utf-8"))
+        compact = lambda d: json.dumps(d, separators=(",", ":")).encode()
+
+        # 另一份合法 fitdata 但字节不同：val_sha 不符。
+        other = self._write_data(
+            "other.json",
+            [(0, [0, 0, 0, 0]), (1, [5, 5, 5, 5]),
+             (0, [1, 0, 1, 0]), (1, [4, 4, 4, 4])],
+        )
+        # 历史末项被改成与模型重算不一致（行和等关系仍自洽）。
+        import copy
+        mismatch = copy.deepcopy(good)
+        mismatch["metrics"]["confusion"][0] = [[0, 1], [1, 2]]
+        mismatch["metrics"]["class_total"][0] = [1, 3]
+        mismatch["metrics"]["class_correct"][0] = [0, 2]
+        mismatch["metrics"]["accuracy"][0] = 0.25
+        # 模型权重被篡改（合法 hex，但重算结果改变）。
+        tampered = copy.deepcopy(good)
+        tampered["model"]["linear"]["values"][1][1] = "0x1.0p+0"
+        # train_sha 格式非法仍须拒绝；val_sha 不符同样拒绝。
+        bad_train = copy.deepcopy(good)
+        bad_train["train_sha"] = "ZZZ"
+
+        cases = {
+            "wrong_sha": (stats, other),
+            "missing_stats": (self._path("nope.json"), va),
+            "missing_val": (stats, self._path("nope.json")),
+            "hist_mismatch": None,
+            "tampered_model": None,
+            "bad_train_sha": None,
+        }
+        payloads = {
+            "hist_mismatch": mismatch,
+            "tampered_model": tampered,
+            "bad_train_sha": bad_train,
+        }
+        for name, pair in cases.items():
+            out = self._path("o_%s.json" % name)
+            with open(out, "wb") as f:
+                f.write(b"SENTINEL")
+            if pair is not None:
+                st, vl = pair
+            else:
+                st = self._path("st_%s.json" % name)
+                with open(st, "wb") as f:
+                    f.write(compact(payloads[name]))
+                vl = va
+            rc, stdout, _ = _run("valreport", st, vl, out)
+            self.assertEqual(rc, 1, "应失败：%s" % name)
+            self.assertEqual(stdout, b"", name)
+            with open(out, "rb") as f:
+                self.assertEqual(
+                    f.read(), b"SENTINEL", "不得改写 OUTPUT：%s" % name
+                )
+
+    def test_path_conflicts_and_argc(self):
+        tr, va = self._train_val()
+        stats = self._stats(tr, va, 1, "s.json")
+        # 三路径两两不同：任何二者相同都退出 1、空 stdout。
+        before_stats = open(stats, "rb").read()
+        before_val = open(va, "rb").read()
+        rc, stdout, _ = _run("valreport", stats, va, stats)
+        self.assertEqual((rc, stdout), (1, b""))
+        rc, stdout, _ = _run("valreport", stats, va, va)
+        self.assertEqual((rc, stdout), (1, b""))
+        rc, stdout, _ = _run(
+            "valreport", va, va, self._path("x.json")
+        )
+        self.assertEqual((rc, stdout), (1, b""))
+        with open(stats, "rb") as f:
+            self.assertEqual(f.read(), before_stats)
+        with open(va, "rb") as f:
+            self.assertEqual(f.read(), before_val)
+
+        self.assertEqual(_run("valreport")[0], 2)
+        self.assertEqual(_run("valreport", "a")[0], 2)
+        self.assertEqual(_run("valreport", "a", "b")[0], 2)
+        self.assertEqual(_run("valreport", "a", "b", "c", "d")[0], 2)
+
+    def test_deterministic_and_last_epoch(self):
+        tr, va = self._train_val()
+        stats = self._stats(tr, va, 3, "s3.json")
+        raw1, doc1 = self._report(stats, va, "r_a.json")
+        raw2, doc2 = self._report(stats, va, "r_b.json")
+        self.assertEqual(raw1, raw2)
+        self.assertIs(doc1["epoch"], 3)
+        with open(stats, "rb") as f:
+            stats_doc = json.loads(f.read().decode())
+        self.assertEqual(
+            doc1["confusion"], stats_doc["metrics"]["confusion"][-1]
+        )
 
 
 class ExistingEntryTests(unittest.TestCase):
