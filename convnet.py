@@ -139,6 +139,22 @@
   float[40]、恰为 [0,1] 的 int 列表、float 1.0。紧凑 UTF-8 原子写盘，
   float 固定 12 位、负零归零、禁非有限、末尾 LF，相同基线逐字节一致；任一
   数据、计算、阈值、重载、路径冲突或 I/O 失败退出 1 且不改 OUTPUT。
+- `python convnet.py benchmarkdeep OUTPUT`：训练沿用 data/tiny.csv，另以
+  与其逐字节相同的 data/tiny-val.csv 为验证集（各自独立加载、绝不混用，
+  沿用 benchmark 数据契约）；九层网络前五层（Conv2D→BatchNorm2D→
+  Dropout→MaxPool2D→Flatten）沿用 fitnorm 初值（Dropout seed=7），后接
+  Linear（2×2 单位权重、零偏置）→ReLU→Linear（沿用 _CNN_LINEAR_INIT、
+  零偏置）→SoftmaxCrossEntropy，原样调用
+  train_deep_momentum_batches(batch_size=2, epochs=20, lr=0.1, seed=7,
+  shuffle=True, clip=1.0, momentum=0.9)，共 20 项更新前批均 loss。要求
+  20 项 loss 末项严格小于首项，卷积权重及两个 Linear 权重三组均须改变；
+  末批更新后按 fitnorm 同法以完整训练集训练态 BN 前向刷新最终运行统计，
+  随后以 BN 保存统计、Dropout 推理态在验证集预测（最大 logit 平局取小
+  类），预测须恰为 [0,1]、accuracy 为 1.0。OUTPUT 键依次为 loss、
+  predictions、accuracy，取值依次为有限 float[20]、恰为 [0,1] 的 int
+  列表、float 1.0。紧凑 UTF-8 原子写盘，float 固定 12 位、负零归零、
+  末尾 LF，重复运行逐字节一致；任一数据、计算、阈值、路径冲突或 I/O
+  失败退出 1 且不改 OUTPUT。成功退出 0、参数数目错退出 2。
 - load_benchmark(path)：读取完整 benchmark 产物，返回键序为 model、
   metrics 的新 dict（所有嵌套 dict/list 均深拷贝）；model 严格沿用
   benchmark 修复后的逐层键序、形状与全 float 契约，metrics 严格校验
@@ -4642,6 +4658,261 @@ def _cmd_benchmark_batches(output_path):
             "model": model,
             "metrics": metrics,
         }
+        payload = (_dump_compact(artifact) + "\n").encode("utf-8")
+        _atomic_write_output(output_path, payload)
+    except (_BenchDataError, ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 命令行双层头带动量训练：python convnet.py benchmarkdeep OUTPUT
+# ---------------------------------------------------------------------------
+
+# benchmarkdeep 固定超参数（题面逐项固定，不接受命令行覆盖）。
+_BD_BATCH_SIZE = 2
+_BD_EPOCHS = 20
+_BD_LR = 0.1
+_BD_SEED = 7
+_BD_SHUFFLE = True
+_BD_CLIP = 1.0
+_BD_MOMENTUM = 0.9
+# 首个 Linear 为 2×2 单位权重、零偏置；末 Linear 沿用 _CNN_LINEAR_INIT、
+# 零偏置。
+_BD_LINEAR1_INIT = [[1.0, 0.0], [0.0, 1.0]]  # [2][2]
+_BD_TOP_KEYS = ["loss", "predictions", "accuracy"]
+
+
+def _build_deep_bench_layers():
+    """以 fitnorm 前五层初值与双层分类头新建训练态九层链。
+
+    Conv2D/BatchNorm2D/Dropout/MaxPool2D/Flatten 沿用 fitnorm 初值
+    （Dropout seed=7）；首个 Linear 为 2×2 单位权重、零偏置，后接 ReLU，
+    末 Linear 沿用 _CNN_LINEAR_INIT、零偏置，SoftmaxCrossEntropy 收尾。
+    """
+    conv = Conv2D(_deep_copy(_CNN_CONV_INIT), [0.0] * _CNN_NUM_CLASSES)
+    bn = BatchNorm2D(
+        _deep_copy(_NORM_GAMMA_INIT),
+        _deep_copy(_NORM_BETA_INIT),
+        _NORM_EPS,
+        _NORM_MOMENTUM,
+    )
+    dropout = Dropout(_NORM_DROPOUT_P, _NORM_DROPOUT_SEED)
+    pool = MaxPool2D(2, 2, 0)
+    flatten = Flatten()
+    linear1 = Linear(
+        _deep_copy(_BD_LINEAR1_INIT), [0.0] * _CNN_NUM_CLASSES
+    )
+    relu = ReLU()
+    linear2 = Linear(
+        _deep_copy(_CNN_LINEAR_INIT), [0.0] * _CNN_NUM_CLASSES
+    )
+    loss = SoftmaxCrossEntropy()
+    return [
+        conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss,
+    ]
+
+
+def _deep_forward_infer(
+    conv_w, conv_b, gamma, beta, running_mean, running_var,
+    lin1_w, lin1_b, lin2_w, lin2_b, images,
+):
+    """推理态九层前向，返回 logits。
+
+    Conv2D→BatchNorm2D（保存统计）→Dropout（推理恒等）→MaxPool→Flatten
+    →Linear→ReLU→Linear；BN 切推理态使用传入 running_mean/running_var
+    仿射，Dropout 切推理态原样复制，末 Linear 给出两类 logits。
+    """
+    conv = Conv2D(conv_w, conv_b)
+    bn = BatchNorm2D(gamma, beta, _NORM_EPS, _NORM_MOMENTUM)
+    bn.running_mean = _deep_copy(running_mean)
+    bn.running_var = _deep_copy(running_var)
+    bn.train(False)
+    dropout = Dropout(_NORM_DROPOUT_P, _NORM_DROPOUT_SEED)
+    dropout.train(False)
+    pool = MaxPool2D(2, 2, 0)
+    flatten = Flatten()
+    linear1 = Linear(lin1_w, lin1_b)
+    relu = ReLU()
+    linear2 = Linear(lin2_w, lin2_b)
+    conv_out = conv.forward(images)
+    bn_out = bn.forward(conv_out)
+    drop_out = dropout.forward(bn_out)
+    pool_out = pool.forward(drop_out)
+    flat = flatten.forward(pool_out)
+    hidden = relu.forward(linear1.forward(flat))
+    logits = linear2.forward(hidden)
+    return logits
+
+
+def _benchmarkdeep_run():
+    """执行双层头带动量批训练并在验证集以推理态预测。
+
+    训练集与验证集分别经独立路径加载（沿用 benchmark 数据契约：字节须
+    恰为 data/tiny.csv 约定内容，两份逐字节相同，训练只用训练集、预测
+    只用验证集）。九层链以 _build_deep_bench_layers 构建，原样调用
+    train_deep_momentum_batches(batch_size=2, epochs=20, lr=0.1, seed=7,
+    shuffle=True, clip=1.0, momentum=0.9)：整批 2 样本 × 20 轮，共 20 项
+    更新前批均 loss。要求 20 项均有限且末项严格小于首项；卷积权重及两个
+    Linear 权重三组均须相对各自初值改变。末批更新后按 fitnorm 同法以全新
+    Conv2D 与训练态 BN 对完整训练集仅做一次前向刷新最终运行统计
+    （momentum=1 即当批统计），不经过 Dropout、不更新参数。随后以 BN
+    保存统计、Dropout 推理态（九层含 ReLU 双层头）在验证集逐样本预测，
+    最大 logit 并列取较小类别，任一 logit 非有限即失败；预测须恰为
+    [0, 1]、accuracy 为 1.0。返回 (losses, predictions, accuracy)。
+    """
+    x, labels, train_bytes = _load_bench_samples(_BENCH_TRAIN_PATH)
+    x_val, val_labels, val_bytes = _load_bench_samples(_BENCH_VAL_PATH)
+    if val_bytes != train_bytes:
+        raise _BenchDataError("训练集与验证集字节内容不一致")
+
+    layers = _build_deep_bench_layers()
+    conv, bn = layers[0], layers[1]
+    linear1, linear2 = layers[5], layers[7]
+
+    init_conv_w = _deep_copy(_CNN_CONV_INIT)
+    init_lin1_w = _deep_copy(_BD_LINEAR1_INIT)
+    init_lin2_w = _deep_copy(_CNN_LINEAR_INIT)
+
+    losses, _grad_norms, _velocity, _state = train_deep_momentum_batches(
+        layers, x, labels,
+        batch_size=_BD_BATCH_SIZE, epochs=_BD_EPOCHS, lr=_BD_LR,
+        seed=_BD_SEED, shuffle=_BD_SHUFFLE, clip=_BD_CLIP,
+        momentum=_BD_MOMENTUM,
+    )
+    losses = [float(v) for v in losses]
+    for v in losses:
+        if not math.isfinite(v):
+            raise ValueError("训练计算产生非有限值（NaN/inf）")
+    if len(losses) != _BD_EPOCHS:
+        raise ValueError("loss 项数与训练轮数不符")
+    if not losses[-1] < losses[0]:
+        raise ValueError("末次 loss 未小于首次 loss")
+
+    conv_w = conv._weights
+    conv_b = conv._bias
+    lin1_w = linear1._weights
+    lin2_w = linear2._weights
+    # 题面阈值：卷积及两个 Linear 的权重三组都必须改变。
+    if conv_w == init_conv_w:
+        raise ValueError("训练后卷积权重未改变")
+    if lin1_w == init_lin1_w:
+        raise ValueError("训练后首个 Linear 权重未改变")
+    if lin2_w == init_lin2_w:
+        raise ValueError("训练后末 Linear 权重未改变")
+
+    # 末批更新后以全新 Conv2D 与训练态 BN 对完整训练集仅做一次前向，按
+    # fitnorm 同法刷新最终 running 统计；不经过 Dropout、不更新参数。
+    gamma = bn._gamma
+    beta = bn._beta
+    final_bn = BatchNorm2D(gamma, beta, _NORM_EPS, _NORM_MOMENTUM)
+    final_bn.forward(Conv2D(conv_w, conv_b).forward(x))
+    running_mean = _deep_copy(final_bn.running_mean)
+    running_var = _deep_copy(final_bn.running_var)
+
+    # 仅在验证集上以 BN 保存统计、Dropout 推理态预测（不接触训练集）。
+    logits = _deep_forward_infer(
+        conv_w, conv_b, gamma, beta, running_mean, running_var,
+        lin1_w, linear1._bias, lin2_w, linear2._bias, x_val,
+    )
+    n_ = len(x_val)
+    predictions = []
+    correct = 0
+    for n in range(n_):
+        row = logits[n]
+        for o in range(_CNN_NUM_CLASSES):
+            if not math.isfinite(row[o]):
+                raise ValueError("验证计算产生非有限值（NaN/inf）")
+        # 并列取较小类别：自小类向大类扫描，仅严格更大才更换。
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        predictions.append(pred)
+        if pred == val_labels[n]:
+            correct += 1
+    accuracy = correct / n_
+    if predictions != [0, 1]:
+        raise ValueError("验证集预测必须为 [0, 1]")
+    if accuracy != 1.0:
+        raise ValueError("验证集 accuracy 不为 1.0")
+    return losses, predictions, accuracy
+
+
+def _parse_bd_metrics(metrics_obj):
+    """严格校验 benchmarkdeep 产物对象，返回深拷贝的全新 dict。
+
+    键依次为 loss、predictions、accuracy；取值依次为长度 20 的有限
+    float list（拒绝 int/bool）、恰为 [0,1] 的 int 列表（元素拒绝
+    bool）、float 1.0。容器类型错抛 TypeError；错序/缺失/额外键、长度、
+    取值或非有限错抛 ValueError。
+    """
+    if not isinstance(metrics_obj, dict):
+        raise TypeError(
+            "产物必须是 JSON 对象，得到 %s"
+            % type(metrics_obj).__name__
+        )
+    if list(metrics_obj.keys()) != _BD_TOP_KEYS:
+        raise ValueError("产物键必须依次为 loss、predictions、accuracy")
+
+    loss = metrics_obj["loss"]
+    if not isinstance(loss, list):
+        raise TypeError(
+            "loss 必须是 list，得到 %s" % type(loss).__name__
+        )
+    if len(loss) != _BD_EPOCHS:
+        raise ValueError(
+            "loss 长度 %d 与训练轮数 %d 不符" % (len(loss), _BD_EPOCHS)
+        )
+    for entry in loss:
+        _check_metrics_float(entry, "loss")
+
+    predictions = metrics_obj["predictions"]
+    if not isinstance(predictions, list):
+        raise TypeError(
+            "predictions 必须是 list，得到 %s"
+            % type(predictions).__name__
+        )
+    # 先逐个校验标量类型（int 且拒绝 bool；注意 True == 1，不能只靠
+    # 等值比较），类型错归 TypeError；随后校验取值，归 ValueError。
+    for idx, pred in enumerate(predictions):
+        if isinstance(pred, bool) or not isinstance(pred, int):
+            raise TypeError(
+                "predictions[%d] 必须是 int（拒绝 bool），得到 %s"
+                % (idx, type(pred).__name__)
+            )
+    if predictions != _BENCH_EXPECTED_PREDICTIONS:
+        raise ValueError("predictions 必须恰为 [0, 1]")
+
+    accuracy = metrics_obj["accuracy"]
+    _check_metrics_float(accuracy, "accuracy")
+    if accuracy != _BENCH_EXPECTED_ACCURACY:
+        raise ValueError("accuracy 必须为 1.0")
+
+    return {
+        "loss": _deep_copy(loss),
+        "predictions": _deep_copy(predictions),
+        "accuracy": accuracy,
+    }
+
+
+def _cmd_benchmarkdeep(output_path):
+    """benchmarkdeep 子命令主体；失败返回 1 且不改 OUTPUT。"""
+    try:
+        # OUTPUT 不得与任一数据文件同路径：避免原子写出破坏训练/验证数据。
+        out_abs = os.path.abspath(output_path)
+        if out_abs == os.path.abspath(_BENCH_TRAIN_PATH):
+            raise ValueError("OUTPUT 与训练集不能是同一路径")
+        if out_abs == os.path.abspath(_BENCH_VAL_PATH):
+            raise ValueError("OUTPUT 与验证集不能是同一路径")
+        losses, predictions, accuracy = _benchmarkdeep_run()
+        # 写出前以严格契约校验产物（键序、类型、长度、取值），并以其深拷贝
+        # 作为唯一载荷。
+        artifact = _parse_bd_metrics({
+            "loss": losses,
+            "predictions": predictions,
+            "accuracy": accuracy,
+        })
         payload = (_dump_compact(artifact) + "\n").encode("utf-8")
         _atomic_write_output(output_path, payload)
     except (_BenchDataError, ValueError, TypeError, OSError):
@@ -11270,8 +11541,8 @@ def _cmd_trendauditbatchdiff(baseline_path, current_path, output_path):
 
 
 def main(argv):
-    """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
-    OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
+    """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches/
+    benchmarkdeep OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
     evaldata/predictdata WEIGHTS DATA OUTPUT、benchmark_data TRAIN VAL
     OUTPUT、gradcheck CONFIG OUTPUT、convcheck CONFIG OUTPUT、
     resumenorm INPUT EPOCHS OUTPUT、resumedata DATA INPUT EPOCHS OUTPUT、
@@ -11303,6 +11574,8 @@ def main(argv):
         return _cmd_benchmark(argv[2])
     if len(argv) == 3 and argv[1] == "benchmark_batches":
         return _cmd_benchmark_batches(argv[2])
+    if len(argv) == 3 and argv[1] == "benchmarkdeep":
+        return _cmd_benchmarkdeep(argv[2])
     if len(argv) == 4 and argv[1] == "evalnorm":
         return _cmd_evalnorm(argv[2], argv[3])
     if len(argv) == 4 and argv[1] == "fitdata":
@@ -11355,6 +11628,7 @@ def main(argv):
         "fitnorm",
         "benchmark",
         "benchmark_batches",
+        "benchmarkdeep",
         "evalnorm",
         "fitdata",
         "evaldata",
