@@ -176,6 +176,25 @@
   逐字节相同；检查点摘要不符（含 DATA 换用其他数据）一律拒绝。DATA/
   INPUT 不可读、契约/轮数/摘要非法、非有限计算、DATA/INPUT/OUTPUT 路径
   冲突或 I/O 失败均退出 1，标准输出为空且不改 OUTPUT；参数数目错退出 2。
+- `python convnet.py resumeval TRAIN VAL INPUT EPOCHS OUTPUT`：TRAIN、VAL
+  各自独立沿用 fitdata 契约加载（绝不混用），身份为原始字节 SHA-256
+  小写 hex；OUTPUT/TRAIN/VAL 与 INPUT/TRAIN/VAL 路径互异（"-" 除外）。
+  INPUT 为 "-" 时以 fitnorm 初值新建训练态七层、start_epoch=0、历史为空；
+  否则载入本命令产物（顶层键依次为 version、train_sha、val_sha、epoch、
+  model、rng、metrics；version 为 int 2；两个摘要须分别与 TRAIN/VAL 摘要
+  逐字符相同；model 结构与 hex 叶编码同 dump_data_checkpoint，逐位精确；
+  rng 为 [0,2^32-1] 内 int；metrics 为等长且长度等于 epoch 的三组 float
+  数组）。
+  EPOCHS 沿用 resumedata 的解析；以 lr=0.1 追加 EPOCHS 轮：每轮 loss 为
+  训练态更新前批均 SoftmaxCrossEntropy；更新后以训练态 BN 前向刷新运行
+  统计，再以保存 BN 统计、Dropout 推理态在 VAL 上算批均 val_loss 与
+  accuracy（正确数/N，最大 logit、并列取小类），评估不改训练状态。
+  OUTPUT 为紧凑 UTF-8 JSON 加 LF，顶层键依次为 version（int 2）、
+  train_sha/val_sha、epoch（非负 int）、model（dump_data_checkpoint 同构
+  hex）、rng、metrics（loss、val_loss、accuracy 依次，均为有限
+  float[epoch]）；指标固定 12 位小数、负零归零。总轮数 >=20 时完整历史的末次 loss 严格小于首次且末次
+  accuracy 恰为 1.0。EPOCHS=0 时状态与历史不变；契约/阈值/路径/I/O 错均
+  退出 1 且不改 OUTPUT；原子替换；同一总轮数的连续与分段产物逐字节相同。
 - dump_norm_checkpoint(layers, epoch)：序列化 fitnorm 训练态七层网络与
   epoch 为紧凑 JSON bytes（末尾 LF）；load_norm_checkpoint(data) 从其
   bytes 重建无缓存训练态七层网络与 epoch，拒绝 JSON 常量
@@ -2787,6 +2806,8 @@ def _dump_compact(value):
         return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, float):
         return _fmt_float(value)
     if isinstance(value, list):
@@ -6510,12 +6531,418 @@ def _cmd_resumedata(data_path, input_path, epochs_text, output_path):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# 命令行数据绑定、带验证指标的检查点续训：
+# python convnet.py resumeval TRAIN VAL INPUT EPOCHS OUTPUT
+# ---------------------------------------------------------------------------
+
+# resumeval 产物版本：当前固定为 2。
+_RESUMEVAL_VERSION = 2
+# 产物顶层键序。
+_RESUMEVAL_TOP_KEYS = [
+    "version", "train_sha", "val_sha", "epoch", "model", "rng", "metrics",
+]
+# metrics 键序：逐轮训练态更新前批均损失、推理态验证损失与准确率。
+_RESUMEVAL_METRICS_KEYS = ["loss", "val_loss", "accuracy"]
+
+
+def _resumeval_eval(logits, val_labels):
+    """在 VAL 推理 logits 上计算批均 softmax 交叉熵与准确率。
+
+    最大 logit 为预测、并列取较小类别；任一 logit 非有限即抛 ValueError。
+    返回 (val_loss, accuracy, n_val)，不改任何网络状态。
+    """
+    n_val = len(val_labels)
+    loss_layer = SoftmaxCrossEntropy()
+    val_loss = float(loss_layer.forward(logits, val_labels))
+    if not math.isfinite(val_loss):
+        raise ValueError("验证计算产生非有限值（NaN/inf）")
+    correct = 0
+    for n in range(n_val):
+        row = logits[n]
+        for o in range(_CNN_NUM_CLASSES):
+            if not math.isfinite(row[o]):
+                raise ValueError("验证计算产生非有限值（NaN/inf）")
+        # 取最大 logit，并列取较小类别。
+        pred = 0
+        for o in range(1, _CNN_NUM_CLASSES):
+            if row[o] > row[pred]:
+                pred = o
+        if pred == val_labels[n]:
+            correct += 1
+    return val_loss, correct / n_val, n_val
+
+
+def _resumeval_model_tensors(model_obj):
+    """严格校验 resumeval 产物的 model 并取出八组 float 张量。
+
+    结构、键序、形状与叶值编码完全沿用 dump_data_checkpoint 的 model
+    契约：conv.values/conv.bias、batchnorm 的 gamma/beta/
+    running_mean/running_var、linear.values/linear.bias；叶值为
+    dump_norm_checkpoint 规范小写 float.hex() 字符串（负零仅
+    "0x0.0p+0"），全部解析为有限 float。容器/叶类型错抛 TypeError，
+    键序/形状/非规范 hex/非有限值错抛 ValueError。返回新 dict（不与原文
+    共享可变结构）。
+    """
+    if not isinstance(model_obj, dict):
+        raise TypeError("model 必须是 JSON 对象")
+    if list(model_obj.keys()) != _CKPT_MODEL_KEYS:
+        raise ValueError("model 的键必须依次为 conv、batchnorm、linear")
+    conv_obj = model_obj["conv"]
+    bn_obj = model_obj["batchnorm"]
+    linear_obj = model_obj["linear"]
+    for obj_name, obj in (
+        ("conv", conv_obj),
+        ("batchnorm", bn_obj),
+        ("linear", linear_obj),
+    ):
+        if not isinstance(obj, dict):
+            raise TypeError(
+                "%s 必须是 JSON 对象，得到 %s"
+                % (obj_name, type(obj).__name__)
+            )
+    if list(conv_obj.keys()) != _CKPT_LAYER_KEYS:
+        raise ValueError("conv 的键必须依次为 values、bias")
+    if list(bn_obj.keys()) != _CKPT_BN_KEYS:
+        raise ValueError(
+            "batchnorm 的键必须依次为 gamma、beta、running_mean、running_var"
+        )
+    if list(linear_obj.keys()) != _CKPT_LAYER_KEYS:
+        raise ValueError("linear 的键必须依次为 values、bias")
+
+    return {
+        "conv_w": _parse_hex_tensor(
+            conv_obj["values"], 4, _CKPT_CONV_W_SHAPE, "conv values"
+        ),
+        "conv_b": _parse_hex_tensor(
+            conv_obj["bias"], 1, _CKPT_BIAS_SHAPE, "conv bias"
+        ),
+        "gamma": _parse_hex_tensor(bn_obj["gamma"], 1, _CKPT_BIAS_SHAPE, "gamma"),
+        "beta": _parse_hex_tensor(bn_obj["beta"], 1, _CKPT_BIAS_SHAPE, "beta"),
+        "running_mean": _parse_hex_tensor(
+            bn_obj["running_mean"], 1, _CKPT_BIAS_SHAPE, "running_mean"
+        ),
+        "running_var": _parse_hex_tensor(
+            bn_obj["running_var"], 1, _CKPT_BIAS_SHAPE, "running_var"
+        ),
+        "lin_w": _parse_hex_tensor(
+            linear_obj["values"], 2, _CKPT_LINEAR_W_SHAPE, "linear values"
+        ),
+        "lin_b": _parse_hex_tensor(
+            linear_obj["bias"], 1, _CKPT_BIAS_SHAPE, "linear bias"
+        ),
+    }
+
+
+def _load_resumeval(raw, train_digest, val_digest):
+    """严格校验并加载 resumeval 产物字节，重建无缓存训练态七层网络。
+
+    raw 须为 UTF-8 JSON bytes（拒绝 JSON 常量 NaN/Infinity/-Infinity、
+    重复/缺失/额外/错序键），顶层键依次为 version、train_sha、val_sha、
+    epoch、model、rng、metrics：version 恰为 int 2；train_sha/val_sha 为
+    64 位小写十六进制 str 且分别与 TRAIN/VAL 的原始字节 SHA-256 摘要逐字符
+    相同；epoch 为非负 int；model 结构与 hex 叶编码同 dump_data_checkpoint
+    （逐位精确保存参数与 BN 统计）；rng 为 [0, 2^32-1] 内 int（Dropout 的
+    LCG 状态）；metrics 键依次为 loss、val_loss、accuracy，三者为等长
+    （长度恰为 epoch）的有限 float 列表。返回 (layers, epoch, losses,
+    val_losses, accuracies, rng)；摘要不符或任一契约违反抛
+    ValueError/TypeError。
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError(
+            "raw 必须是 bytes，得到 %s" % type(raw).__name__
+        )
+    text = raw.decode("utf-8")
+    _reject_json_constants(raw)
+    doc = json.loads(
+        text, object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("resumeval 产物顶层必须是 JSON 对象")
+    if list(doc.keys()) != _RESUMEVAL_TOP_KEYS:
+        raise ValueError(
+            "resumeval 产物顶层键必须依次为 version、train_sha、val_sha、"
+            "epoch、model、rng、metrics"
+        )
+
+    version = doc["version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(
+            "version 必须是 int，得到 %s" % type(version).__name__
+        )
+    if version != _RESUMEVAL_VERSION:
+        raise ValueError(
+            "version 必须为 %d，得到 %r" % (_RESUMEVAL_VERSION, version)
+        )
+
+    for key, expected in (
+        ("train_sha", train_digest),
+        ("val_sha", val_digest),
+    ):
+        digest = doc[key]
+        if not isinstance(digest, str):
+            raise TypeError(
+                "%s 必须是 JSON 字符串，得到 %s"
+                % (key, type(digest).__name__)
+            )
+        if _SHA256_HEX_RE.match(digest) is None:
+            raise ValueError(
+                "%s 必须是 64 位小写十六进制 SHA-256 摘要：%r"
+                % (key, digest)
+            )
+        if digest != expected:
+            raise ValueError("%s 与数据文件摘要不符" % key)
+
+    epoch = doc["epoch"]
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        raise TypeError(
+            "epoch 必须是 int，得到 %s" % type(epoch).__name__
+        )
+    if epoch < 0:
+        raise ValueError("epoch 必须为非负整数")
+
+    # 严格校验 model 并取出八组 float 张量（hex 叶逐位精确）。
+    tensors = _resumeval_model_tensors(doc["model"])
+
+    rng = doc["rng"]
+    if isinstance(rng, bool) or not isinstance(rng, int):
+        raise TypeError(
+            "rng 必须是 int，得到 %s" % type(rng).__name__
+        )
+    if rng < 0 or rng > 0xFFFFFFFF:
+        raise ValueError("rng 必须在 [0, 2^32-1] 内")
+
+    metrics = doc["metrics"]
+    if not isinstance(metrics, dict):
+        raise TypeError("metrics 必须是 JSON 对象")
+    if list(metrics.keys()) != _RESUMEVAL_METRICS_KEYS:
+        raise ValueError(
+            "metrics 键必须依次为 loss、val_loss、accuracy"
+        )
+    series = []
+    for key in _RESUMEVAL_METRICS_KEYS:
+        values = metrics[key]
+        if not isinstance(values, list):
+            raise TypeError(
+                "%s 必须是 list，得到 %s" % (key, type(values).__name__)
+            )
+        for v in values:
+            if isinstance(v, bool) or not isinstance(v, float):
+                raise TypeError(
+                    "%s 的元素必须是 float（拒绝 bool），得到 %s"
+                    % (key, type(v).__name__)
+                )
+            if not math.isfinite(v):
+                raise ValueError("%s 含有非有限值（NaN/inf）" % key)
+        series.append(values)
+    losses, val_losses, accuracies = series
+    if not (len(losses) == len(val_losses) == len(accuracies) == epoch):
+        raise ValueError(
+            "metrics 三个数组长度必须一致且等于 epoch（%d）" % epoch
+        )
+
+    # 以严格 model 重建无缓存训练态七层链：配置同 fitnorm，BN/Dropout
+    # 训练态，running 统计取 model，Dropout 的 LCG 状态取 rng。
+    conv = Conv2D(
+        _deep_copy(tensors["conv_w"]),
+        _deep_copy(tensors["conv_b"]),
+    )
+    bn = BatchNorm2D(
+        _deep_copy(tensors["gamma"]),
+        _deep_copy(tensors["beta"]),
+        _NORM_EPS,
+        _NORM_MOMENTUM,
+    )
+    bn.running_mean = _deep_copy(tensors["running_mean"])
+    bn.running_var = _deep_copy(tensors["running_var"])
+    dropout = Dropout(_NORM_DROPOUT_P, _NORM_DROPOUT_SEED)
+    dropout._s = rng
+    pool = MaxPool2D(2, 2, 0)
+    flatten = Flatten()
+    linear = Linear(
+        _deep_copy(tensors["lin_w"]),
+        _deep_copy(tensors["lin_b"]),
+    )
+    loss = SoftmaxCrossEntropy()
+    layers = [conv, bn, dropout, pool, flatten, linear, loss]
+
+    return (
+        layers,
+        int(epoch),
+        _deep_copy(losses),
+        _deep_copy(val_losses),
+        _deep_copy(accuracies),
+        int(rng),
+    )
+
+
+def _resumeval_model_text(layers):
+    """序列化七层链的 model 为 dump_data_checkpoint 同构 JSON 文本。
+
+    完整沿用 _dump_checkpoint_model_text：逐层键序/形状一致，叶值写为
+    float.hex() 规范小写串（负零 "0x0.0p+0"），保证续训逐位复现。
+    """
+    conv, bn, _dropout, _pool, _flatten, linear, _loss = layers
+    return _dump_checkpoint_model_text(conv, bn, linear)
+
+
+def _dump_resumeval(
+    layers, epoch, train_digest, val_digest, losses, val_losses, accuracies
+):
+    """序列化 resumeval 产物为紧凑 UTF-8 JSON bytes（末尾 LF）。
+
+    顶层键依次为 version（int 2）、train_sha、val_sha（64 位小写 hex）、
+    epoch（非负 int）、model（结构与 hex 叶编码同 dump_data_checkpoint，
+    逐位精确）、rng（[0,2^32-1] 内 int）、metrics（loss、val_loss、
+    accuracy 三个等长、长度恰为 epoch 的有限 float 列表，固定 12 位小数、
+    负零归零、禁非有限）。同一状态重复调用逐字节相同。
+    """
+    rng = layers[2]._s
+    # 与 dump_data_checkpoint 相同的七层合法性/配置/形状/有限性前置校验。
+    _validate_norm_checkpoint_layers(layers)
+    if not (len(losses) == len(val_losses) == len(accuracies) == epoch):
+        raise ValueError(
+            "metrics 三个数组长度必须一致且等于 epoch（%d）" % epoch
+        )
+    # model 沿用检查点的 hex 文本手工拼装，确保逐字节确定且精确保值。
+    parts = []
+    parts.append('"version":' + str(int(_RESUMEVAL_VERSION)))
+    parts.append('"train_sha":' + json.dumps(train_digest))
+    parts.append('"val_sha":' + json.dumps(val_digest))
+    parts.append('"epoch":' + str(int(epoch)))
+    parts.append(_resumeval_model_text(layers))
+    parts.append('"rng":' + str(int(rng)))
+    metrics_obj = {
+        "loss": [float(v) for v in losses],
+        "val_loss": [float(v) for v in val_losses],
+        "accuracy": [float(v) for v in accuracies],
+    }
+    parts.append('"metrics":' + _dump_compact(metrics_obj))
+    text = "{" + ",".join(parts) + "}\n"
+    return text.encode("utf-8")
+
+
+def _cmd_resumeval(train_path, val_path, input_path, epochs_text, output_path):
+    """resumeval 子命令主体；成功 0、契约/阈值/路径/I/O 失败返回 1。
+
+    TRAIN、VAL 各自独立按 fitdata 契约加载（绝不混用），身份为原始字节
+    SHA-256 小写 hex。INPUT 为 "-" 时以 fitnorm 初值新建训练态七层、
+    start_epoch=0、历史与 rng 为空/初值；否则载入本命令产物，且其
+    train_sha/val_sha 须分别与 TRAIN/VAL 摘要逐字符相同，start_epoch 取
+    产物 epoch 并恢复 model/rng/历史。EPOCHS 须为 "0" 或无前导零 ASCII
+    正整数，以 lr=0.1 追加 EPOCHS 轮：每轮先在训练态网络上对 TRAIN 做一次
+    train_norm_step（loss 为更新前批均 SoftmaxCrossEntropy），更新后以
+    更新后的 Conv 输出做训练态 BN 前向刷新运行统计（momentum=1，与
+    train_norm 末轮刷新同法），再以保存的 BN 统计、Dropout 推理态在 VAL
+    上算批均 val_loss 与 accuracy（最大 logit、并列取小类），全程不改训练
+    状态（参数、BN 统计与 Dropout 随机状态）。总轮数 >=20 时要求完整历史
+    的末次 loss 严格小于首次且末次 accuracy 恰为 1.0，否则失败。EPOCHS=0
+    时不训练、不评估，状态与历史原样保持。OUTPUT 写出紧凑 UTF-8 JSON 加
+    LF 并原子替换；任一失败不改 OUTPUT。
+    """
+    try:
+        out_abs = os.path.abspath(output_path)
+        train_abs = os.path.abspath(train_path)
+        val_abs = os.path.abspath(val_path)
+        # TRAIN、VAL、INPUT、OUTPUT 路径两两互异（INPUT 为 "-" 时豁免）。
+        if train_abs == val_abs:
+            raise ValueError("TRAIN 与 VAL 不能是同一路径")
+        if out_abs == train_abs:
+            raise ValueError("OUTPUT 与 TRAIN 不能是同一路径")
+        if out_abs == val_abs:
+            raise ValueError("OUTPUT 与 VAL 不能是同一路径")
+        if input_path != "-":
+            input_abs = os.path.abspath(input_path)
+            if input_abs == train_abs:
+                raise ValueError("INPUT 与 TRAIN 不能是同一路径")
+            if input_abs == val_abs:
+                raise ValueError("INPUT 与 VAL 不能是同一路径")
+            if input_abs == out_abs:
+                raise ValueError("INPUT 与 OUTPUT 不能是同一路径")
+        epochs = _parse_resume_epochs(epochs_text)
+
+        # TRAIN、VAL 各自独立加载一次，仅用其原始字节计算身份摘要。
+        with open(train_path, "rb") as f:
+            train_raw = f.read()
+        train_digest = hashlib.sha256(train_raw).hexdigest()
+        x, labels = _parse_fitdata(train_raw)
+        with open(val_path, "rb") as f:
+            val_raw = f.read()
+        val_digest = hashlib.sha256(val_raw).hexdigest()
+        x_val, val_labels = _parse_fitdata(val_raw)
+
+        if input_path == "-":
+            layers = _build_norm_layers()
+            start = 0
+            losses = []
+            val_losses = []
+            accuracies = []
+        else:
+            with open(input_path, "rb") as f:
+                checkpoint_raw = f.read()
+            (
+                layers, start, losses, val_losses, accuracies, _rng,
+            ) = _load_resumeval(checkpoint_raw, train_digest, val_digest)
+
+        conv, bn, _dropout, _pool, _flatten, linear, _loss = layers
+        if epochs > 0:
+            for _ in range(epochs):
+                # 训练态更新前批均损失：推进 Dropout LCG、更新参数。
+                train_loss = float(
+                    train_norm_step(layers, x, labels, lr=_NORM_LR)
+                )
+                # 更新后以训练态 BN 前向刷新运行统计（momentum=1），
+                # 与 train_norm 末轮刷新逐字同法；仅触达 BN 缓存，不推进
+                # Dropout，也不更新参数。
+                bn.forward(conv.forward(x))
+
+                # 以保存 BN 统计、Dropout 推理态在 VAL 上评估：全新临时
+                # 网络前向，绝不修改训练态参数、统计或随机状态。
+                val_logits, _, _ = _norm_forward(
+                    conv._weights, conv._bias,
+                    bn._gamma, bn._beta,
+                    bn.running_mean, bn.running_var,
+                    linear._weights, linear._bias,
+                    x_val, False,
+                )
+                val_loss, accuracy, _n_val = _resumeval_eval(
+                    val_logits, val_labels
+                )
+
+                losses.append(train_loss)
+                val_losses.append(val_loss)
+                accuracies.append(accuracy)
+
+            for series in (losses, val_losses, accuracies):
+                for v in series:
+                    if not math.isfinite(v):
+                        raise ValueError("训练/验证计算产生非有限值（NaN/inf）")
+
+            # 阈值针对完整历史：总轮数 >=20 时末次 loss 严格小于首次、
+            # 末次 accuracy 恰为 1.0。
+            if start + epochs >= 20:
+                if not losses[-1] < losses[0]:
+                    raise ValueError("末次 loss 未小于首次 loss")
+                if accuracies[-1] != 1.0:
+                    raise ValueError("末次 accuracy 不为 1.0")
+
+        payload = _dump_resumeval(
+            layers, start + epochs, train_digest, val_digest,
+            losses, val_losses, accuracies,
+        )
+        _atomic_write_output(output_path, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
     evaldata/predictdata WEIGHTS DATA OUTPUT、benchmark_data TRAIN VAL
     OUTPUT、gradcheck CONFIG OUTPUT、convcheck CONFIG OUTPUT、
-    resumenorm INPUT EPOCHS OUTPUT 与 resumedata DATA INPUT EPOCHS OUTPUT。
+    resumenorm INPUT EPOCHS OUTPUT、resumedata DATA INPUT EPOCHS OUTPUT 与
+    resumeval TRAIN VAL INPUT EPOCHS OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -6551,6 +6978,8 @@ def main(argv):
         return _cmd_resumenorm(argv[2], argv[3], argv[4])
     if len(argv) == 6 and argv[1] == "resumedata":
         return _cmd_resumedata(argv[2], argv[3], argv[4], argv[5])
+    if len(argv) == 7 and argv[1] == "resumeval":
+        return _cmd_resumeval(argv[2], argv[3], argv[4], argv[5], argv[6])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -6568,6 +6997,7 @@ def main(argv):
         "convcheck",
         "resumenorm",
         "resumedata",
+        "resumeval",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
