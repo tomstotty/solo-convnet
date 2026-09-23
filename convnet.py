@@ -9126,6 +9126,91 @@ def _cmd_trendgate(stats_path, config_path, output_path):
     return 0 if overall else 3
 
 
+# ---------------------------------------------------------------------------
+# 命令行趋势统计与质量门禁一体化审计（内存执行，不落中间文件）：
+# python convnet.py trendaudit MANIFEST CONFIG OUTPUT
+# ---------------------------------------------------------------------------
+
+_TRENDAUDIT_OUTPUT_KEYS = ["stats", "gate"]
+
+
+def _cmd_trendaudit(manifest_path, config_path, output_path):
+    """trendaudit 子命令主体；stats 与 gate 均通过退出 0、合法但任一未
+    通过退出 3、参数数目错退出 2、契约/路径/计算/I-O 失败退出 1 且不改
+    OUTPUT。
+
+    MANIFEST 沿用 trendstats 输入契约（见 _load_trendstats_manifest），
+    CONFIG 沿用 trendgate 配置契约（见 _load_trendgate_config）。相对
+    CONFIG/OUTPUT 以 MANIFEST 所在目录解析（绝对路径原样使用）；绝对化后
+    MANIFEST、CONFIG、OUTPUT 与各输入产物路径须两两不同，任一冲突即失败
+    退出 1 且不触碰 OUTPUT。trendstats 与 trendgate 完全在内存中串行执行
+    （复用 _trendstats_compute、_dump_compact 与 _trendgate_compute，
+    后者严格重校验内存中的 trendstats 字节产物），不写任何中间文件；任
+    一读取/校验/计算失败即整体失败退出 1，OUTPUT 原样保留（全部完成后才
+    一次性原子写盘）。
+
+    OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），顶层键依次为 stats、gate：
+    stats 内容与同输入单独运行 trendstats 的产物逐字段一致（顶层键依次
+    trend_count、gate_count、results、pass），gate 内容与同 STATS/CONFIG
+    单独运行 trendgate 的产物逐字段一致（顶层键依次 gate_count、limits、
+    results、pass，limits 照录 CONFIG）；stats/gate 未通过亦照常写盘。
+    浮点固定 12 位小数、负零归零、禁非有限；同一输入重复运行逐字节相同，
+    标准输出为空。
+    """
+    overall = False
+    try:
+        manifest_abs = os.path.abspath(manifest_path)
+        manifest_dir = os.path.dirname(manifest_abs)
+        # 相对 CONFIG/OUTPUT 以 MANIFEST 所在目录解析（绝对路径原样使用）。
+        config_abs = os.path.abspath(
+            os.path.join(manifest_dir, config_path)
+        )
+        out_abs = os.path.abspath(os.path.join(manifest_dir, output_path))
+        if out_abs == manifest_abs:
+            raise ValueError("OUTPUT 与 MANIFEST 不能是同一路径")
+        if out_abs == config_abs:
+            raise ValueError("OUTPUT 与 CONFIG 不能是同一路径")
+        if config_abs == manifest_abs:
+            raise ValueError("CONFIG 与 MANIFEST 不能是同一路径")
+
+        with open(manifest_path, "rb") as f:
+            manifest_raw = f.read()
+        trend_paths = _load_trendstats_manifest(manifest_raw, manifest_dir)
+
+        # 绝对化后 MANIFEST、CONFIG、OUTPUT 与各输入产物路径须两两不同
+        # （清单内各输入路径两两不同已由加载器保证）。
+        for path in trend_paths:
+            if path == out_abs:
+                raise ValueError(
+                    "OUTPUT 与输入路径不能是同一路径：%s" % path
+                )
+            if path == manifest_abs:
+                raise ValueError(
+                    "MANIFEST 与输入路径不能是同一路径：%s" % path
+                )
+            if path == config_abs:
+                raise ValueError(
+                    "CONFIG 与输入路径不能是同一路径：%s" % path
+                )
+
+        with open(config_abs, "rb") as f:
+            config_raw = f.read()
+
+        # 内存执行 trendstats：序列化为严格字节产物但不落盘。
+        stats_report = _trendstats_compute(trend_paths)
+        stats_raw = (_dump_compact(stats_report) + "\n").encode("utf-8")
+        # 内存执行 trendgate：严格重校验内存中的 trendstats 字节产物。
+        gate_report = _trendgate_compute(stats_raw, config_raw)
+
+        overall = stats_report["pass"] and gate_report["pass"]
+        report = {"stats": stats_report, "gate": gate_report}
+        payload = (_dump_compact(report) + "\n").encode("utf-8")
+        _atomic_write_output(out_abs, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if overall else 3
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
@@ -9138,8 +9223,10 @@ def main(argv):
     valgate STATS VAL CONFIG OUTPUT、
     valgatebatch MANIFEST OUTPUT、
     valgatebatchdiff BASELINE CURRENT OUTPUT、
-    valgatebatchtrend MANIFEST OUTPUT、trendstats MANIFEST OUTPUT 与
-    trendgate STATS CONFIG OUTPUT。
+    valgatebatchtrend MANIFEST OUTPUT、trendstats MANIFEST OUTPUT、
+    trendgate STATS CONFIG OUTPUT 与
+    trendaudit MANIFEST CONFIG OUTPUT（内存执行 trendstats+trendgate，
+    不落中间文件）。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -9195,6 +9282,8 @@ def main(argv):
         return _cmd_trendstats(argv[2], argv[3])
     if len(argv) == 5 and argv[1] == "trendgate":
         return _cmd_trendgate(argv[2], argv[3], argv[4])
+    if len(argv) == 5 and argv[1] == "trendaudit":
+        return _cmd_trendaudit(argv[2], argv[3], argv[4])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -9221,6 +9310,7 @@ def main(argv):
         "valgatebatchtrend",
         "trendstats",
         "trendgate",
+        "trendaudit",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
