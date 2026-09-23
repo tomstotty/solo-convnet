@@ -9449,6 +9449,515 @@ def _cmd_trendauditbatch(manifest_path, output_path):
     return 0 if overall else 3
 
 
+# ---------------------------------------------------------------------------
+# 命令行批量趋势审计逐项回归对比：
+# python convnet.py trendauditbatchdiff BASELINE CURRENT OUTPUT
+# ---------------------------------------------------------------------------
+
+_TRENDAUDITBATCHDIFF_TOP_KEYS = ["audit_count", "results", "pass"]
+_TRENDAUDITBATCHDIFF_ITEM_KEYS = [
+    "name",
+    "regressions_delta",
+    "worst_delta_delta",
+    "pass",
+]
+
+
+def _load_trendauditbatch_gate(gate, gate_count, stats_items):
+    """按 trendgate 产物契约严格校验 trendauditbatch 产物内嵌的 gate 对象。
+
+    gate 须为 JSON 对象，键依次为 gate_count、limits、results、pass：
+    gate_count 为 >= 2 的 int（拒绝 bool）且与对应 stats 的 gate_count
+    一致；limits 键依次为 ba、f1，各键依次为 max_regressions（非负 int，
+    拒绝 bool）、min_worst_delta（[-1,0] 内有限 float，拒绝 int/bool）；
+    results 长度恰为 gate_count，每项键依次为 name、ba、f1、pass：name
+    为非空 str、唯一且顺序与对应 stats 的 results 一致；ba/f1 键依次为
+    regressions（满足 0 <= regressions <= trend_count 的 int）、
+    worst_delta（有限 float）、pass（bool），且 regressions/worst_delta
+    与 stats 对应值逐层相等、pass 与阈值判定自洽；各项 pass 为 ba/f1
+    pass 之与，顶层 pass 为各项 pass 之与。契约不符抛
+    ValueError/TypeError。
+    """
+    if not isinstance(gate, dict):
+        raise TypeError(
+            "gate 必须是 JSON 对象，得到 %s" % type(gate).__name__
+        )
+    if list(gate.keys()) != _TRENDGATE_OUTPUT_TOP_KEYS:
+        raise ValueError(
+            "gate 的键必须依次为 gate_count、limits、results、pass"
+        )
+
+    gate_gate_count = gate["gate_count"]
+    if isinstance(gate_gate_count, bool) or not isinstance(
+        gate_gate_count, int
+    ):
+        raise TypeError(
+            "gate.gate_count 必须是 int，得到 %s"
+            % type(gate_gate_count).__name__
+        )
+    if gate_gate_count < 2:
+        raise ValueError(
+            "gate.gate_count 必须 >= 2，得到 %d" % gate_gate_count
+        )
+    if gate_gate_count != gate_count:
+        raise ValueError(
+            "gate.gate_count 必须与 stats.gate_count 一致：%d != %d"
+            % (gate_gate_count, gate_count)
+        )
+
+    limits = gate["limits"]
+    if not isinstance(limits, dict):
+        raise TypeError(
+            "gate.limits 必须是 JSON 对象，得到 %s" % type(limits).__name__
+        )
+    if list(limits.keys()) != _TRENDGATE_TOP_KEYS:
+        raise ValueError("gate.limits 的键必须依次为 ba、f1")
+    parsed_limits = {}
+    for metric_name in _TRENDGATE_TOP_KEYS:
+        block = limits[metric_name]
+        if not isinstance(block, dict):
+            raise TypeError(
+                "gate.limits.%s 必须是 JSON 对象，得到 %s"
+                % (metric_name, type(block).__name__)
+            )
+        if list(block.keys()) != _TRENDGATE_LIMIT_KEYS:
+            raise ValueError(
+                "gate.limits.%s 的键必须依次为 max_regressions、"
+                "min_worst_delta" % metric_name
+            )
+        max_regressions = block["max_regressions"]
+        if isinstance(max_regressions, bool) or not isinstance(
+            max_regressions, int
+        ):
+            raise TypeError(
+                "gate.limits.%s.max_regressions 必须是非负 int，得到 %s"
+                % (metric_name, type(max_regressions).__name__)
+            )
+        if max_regressions < 0:
+            raise ValueError(
+                "gate.limits.%s.max_regressions 必须非负，得到 %d"
+                % (metric_name, max_regressions)
+            )
+        min_worst_delta = block["min_worst_delta"]
+        if isinstance(min_worst_delta, bool) or isinstance(
+            min_worst_delta, int
+        ) or not isinstance(min_worst_delta, float):
+            raise TypeError(
+                "gate.limits.%s.min_worst_delta 必须是 float"
+                "（拒绝 int/bool），得到 %s"
+                % (metric_name, type(min_worst_delta).__name__)
+            )
+        if not math.isfinite(min_worst_delta) or not (
+            -1.0 <= min_worst_delta <= 0.0
+        ):
+            raise ValueError(
+                "gate.limits.%s.min_worst_delta 必须是 [-1,0] 内的有限 float"
+                % metric_name
+            )
+        parsed_limits[metric_name] = (max_regressions, min_worst_delta)
+
+    gate_pass = gate["pass"]
+    if not isinstance(gate_pass, bool):
+        raise TypeError(
+            "gate.pass 必须是 bool，得到 %s" % type(gate_pass).__name__
+        )
+
+    results = gate["results"]
+    if not isinstance(results, list):
+        raise TypeError(
+            "gate.results 必须是 list，得到 %s" % type(results).__name__
+        )
+    if len(results) != gate_count:
+        raise ValueError(
+            "gate.results 长度必须等于 gate_count（%d），得到 %d"
+            % (gate_count, len(results))
+        )
+
+    all_pass = True
+    for idx, item in enumerate(results):
+        if not isinstance(item, dict):
+            raise TypeError("gate.results[%d] 必须是 JSON 对象" % idx)
+        if list(item.keys()) != _TRENDGATE_OUTPUT_ITEM_KEYS:
+            raise ValueError(
+                "gate.results[%d] 的键必须依次为 name、ba、f1、pass" % idx
+            )
+        name = item["name"]
+        if not isinstance(name, str) or len(name) == 0:
+            raise TypeError(
+                "gate.results[%d].name 必须是非空 str，得到 %s"
+                % (idx, type(name).__name__)
+            )
+        stats_item = stats_items[idx]
+        if name != stats_item[0]:
+            raise ValueError(
+                "gate.results[%d].name 必须与 stats 对应项一致：%r != %r"
+                % (idx, name, stats_item[0])
+            )
+
+        item_pass = item["pass"]
+        if not isinstance(item_pass, bool):
+            raise TypeError(
+                "gate.results[%d].pass 必须是 bool，得到 %s"
+                % (idx, type(item_pass).__name__)
+            )
+
+        metric_passes = []
+        for metric_pos, metric_name in ((0, "ba"), (1, "f1")):
+            block = item[metric_name]
+            if not isinstance(block, dict):
+                raise TypeError(
+                    "gate.results[%d].%s 必须是 JSON 对象"
+                    % (idx, metric_name)
+                )
+            if list(block.keys()) != _TRENDGATE_OUTPUT_METRIC_KEYS:
+                raise ValueError(
+                    "gate.results[%d].%s 的键必须依次为 regressions、"
+                    "worst_delta、pass" % (idx, metric_name)
+                )
+            regressions = block["regressions"]
+            if isinstance(regressions, bool) or not isinstance(
+                regressions, int
+            ):
+                raise TypeError(
+                    "gate.results[%d].%s.regressions 必须是 int，得到 %s"
+                    % (idx, metric_name, type(regressions).__name__)
+                )
+            worst_delta = block["worst_delta"]
+            if isinstance(worst_delta, bool) or not isinstance(
+                worst_delta, float
+            ):
+                raise TypeError(
+                    "gate.results[%d].%s.worst_delta 必须是 float，得到 %s"
+                    % (idx, metric_name, type(worst_delta).__name__)
+                )
+            if not math.isfinite(worst_delta):
+                raise ValueError(
+                    "gate.results[%d].%s.worst_delta 必须有限"
+                    % (idx, metric_name)
+                )
+            stats_regressions = stats_item[1 + metric_pos * 2]
+            stats_worst = stats_item[2 + metric_pos * 2]
+            if regressions != stats_regressions:
+                raise ValueError(
+                    "gate.results[%d].%s.regressions 必须与 stats 对应值"
+                    "一致：%d != %d"
+                    % (idx, metric_name, regressions, stats_regressions)
+                )
+            if worst_delta != stats_worst:
+                raise ValueError(
+                    "gate.results[%d].%s.worst_delta 必须与 stats 对应值"
+                    "一致" % (idx, metric_name)
+                )
+            metric_pass = block["pass"]
+            if not isinstance(metric_pass, bool):
+                raise TypeError(
+                    "gate.results[%d].%s.pass 必须是 bool，得到 %s"
+                    % (idx, metric_name, type(metric_pass).__name__)
+                )
+            max_regressions, min_worst_delta = parsed_limits[metric_name]
+            expected_pass = (
+                regressions <= max_regressions
+                and worst_delta >= min_worst_delta
+            )
+            if metric_pass != expected_pass:
+                raise ValueError(
+                    "gate.results[%d].%s.pass 与阈值判定不自洽"
+                    % (idx, metric_name)
+                )
+            metric_passes.append(metric_pass)
+
+        if item_pass != (metric_passes[0] and metric_passes[1]):
+            raise ValueError(
+                "gate.results[%d].pass 必须为 ba/f1 pass 之与" % idx
+            )
+        if not item_pass:
+            all_pass = False
+
+    if gate_pass != all_pass:
+        raise ValueError("gate.pass 必须为各项 pass 之与")
+
+
+def _load_trendauditbatch_output(raw):
+    """按 trendauditbatch 产物契约从原始字节严格解析一份对比输入。
+
+    与 trendauditbatch 写出的逐字节产物一致：不得含 UTF-8 BOM，须以恰好
+    一个 LF（b"\\n"）结尾（拒绝 CR 与多余空行），其前正文不得含字符串
+    字面量之外的任何 JSON 空白（紧凑 JSON），拒绝 NaN/Infinity 常量与
+    重复键。正文顶层键须依次为 audit_count、passed_count、results、
+    pass：audit_count 为 >= 2 的 int（拒绝 bool），passed_count 为
+    [0, audit_count] 内 int 且恰为通过项数，pass 为 bool 且恰为各项
+    pass 之与，results 长度恰为 audit_count；每项键须依次为
+    name/stats/gate/pass：name 为非空 str 且在本份产物内唯一、顺序保留，
+    pass 为 bool 且恰为 gate.pass；stats 须为 trendstats 严格产物对象
+    （复用 _load_trendstats_output 全量契约），gate 须为 trendgate 严格
+    产物对象（见 _load_trendauditbatch_gate，含与 stats 的逐层一致）。
+    非法 UTF-8/JSON 或契约不符分别抛
+    UnicodeDecodeError/ValueError/TypeError。返回
+    (audit_count, [(name, gate_count, stats_items), ...])，其中
+    stats_items 为 _load_trendstats_output 的逐项五元组列表。
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError(
+            "trendauditbatch 产物必须是 bytes，得到 %s"
+            % type(raw).__name__
+        )
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("trendauditbatch 产物不得含 UTF-8 BOM")
+    if b"\r" in raw:
+        raise ValueError("trendauditbatch 产物不得含回车（CR）")
+    # 生产者保证紧凑正文 + 恰好一个末尾 LF。
+    if not raw.endswith(b"\n"):
+        raise ValueError("trendauditbatch 产物必须以恰好一个 LF 结尾")
+    body = raw[:-1]
+    if body.endswith(b"\n"):
+        raise ValueError("trendauditbatch 产物末尾仅可有一个 LF")
+    _reject_json_whitespace(body)
+    _reject_json_constants(body)
+    text = body.decode("utf-8")
+    doc = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(doc, dict):
+        raise TypeError("trendauditbatch 产物顶层必须是 JSON 对象")
+    if list(doc.keys()) != _TRENDAUDITBATCH_OUTPUT_KEYS:
+        raise ValueError(
+            "trendauditbatch 产物顶层键必须依次为 "
+            "audit_count、passed_count、results、pass"
+        )
+
+    audit_count = doc["audit_count"]
+    if isinstance(audit_count, bool) or not isinstance(audit_count, int):
+        raise TypeError(
+            "audit_count 必须是 int，得到 %s" % type(audit_count).__name__
+        )
+    if audit_count < 2:
+        raise ValueError("audit_count 必须 >= 2，得到 %d" % audit_count)
+
+    passed_count = doc["passed_count"]
+    if isinstance(passed_count, bool) or not isinstance(passed_count, int):
+        raise TypeError(
+            "passed_count 必须是 int，得到 %s"
+            % type(passed_count).__name__
+        )
+    if not (0 <= passed_count <= audit_count):
+        raise ValueError(
+            "passed_count 必须在 [0, audit_count] 内，得到 %d"
+            % passed_count
+        )
+
+    overall_pass = doc["pass"]
+    if not isinstance(overall_pass, bool):
+        raise TypeError(
+            "顶层 pass 必须是 bool，得到 %s" % type(overall_pass).__name__
+        )
+
+    results = doc["results"]
+    if not isinstance(results, list):
+        raise TypeError(
+            "results 必须是 list，得到 %s" % type(results).__name__
+        )
+    if len(results) != audit_count:
+        raise ValueError(
+            "results 长度必须等于 audit_count（%d），得到 %d"
+            % (audit_count, len(results))
+        )
+
+    items = []
+    names = set()
+    counted_pass = 0
+    all_pass = True
+    for idx, item in enumerate(results):
+        if not isinstance(item, dict):
+            raise TypeError("results[%d] 必须是 JSON 对象" % idx)
+        if list(item.keys()) != _TRENDAUDITBATCH_OUTPUT_ITEM_KEYS:
+            raise ValueError(
+                "results[%d] 的键必须依次为 name、stats、gate、pass" % idx
+            )
+        name = item["name"]
+        if not isinstance(name, str) or len(name) == 0:
+            raise TypeError(
+                "results[%d].name 必须是非空 str，得到 %s"
+                % (idx, type(name).__name__)
+            )
+        if name in names:
+            raise ValueError(
+                "results 的 name 必须唯一，重复：%r" % name
+            )
+        names.add(name)
+
+        item_pass = item["pass"]
+        if not isinstance(item_pass, bool):
+            raise TypeError(
+                "results[%d].pass 必须是 bool，得到 %s"
+                % (idx, type(item_pass).__name__)
+            )
+
+        stats = item["stats"]
+        if not isinstance(stats, dict):
+            raise TypeError(
+                "results[%d].stats 必须是 JSON 对象，得到 %s"
+                % (idx, type(stats).__name__)
+            )
+        # 内嵌 stats 复用 trendstats 严格产物契约全量校验（紧凑重序列化
+        # 对合法产物为恒等变换，不落任何文件）。
+        stats_raw = (_dump_compact(stats) + "\n").encode("utf-8")
+        _trend_count, gate_count, stats_items = _load_trendstats_output(
+            stats_raw
+        )
+
+        _load_trendauditbatch_gate(item["gate"], gate_count, stats_items)
+        gate_pass = item["gate"]["pass"]
+        if item_pass != gate_pass:
+            raise ValueError(
+                "results[%d].pass 必须与 gate.pass 一致" % idx
+            )
+
+        if item_pass:
+            counted_pass += 1
+        else:
+            all_pass = False
+        items.append((name, gate_count, stats_items))
+
+    if passed_count != counted_pass:
+        raise ValueError(
+            "passed_count 必须等于 results 中 pass 为真的项数"
+        )
+    if overall_pass != all_pass:
+        raise ValueError("顶层 pass 必须为各项 pass 之与")
+    return audit_count, items
+
+
+def _trendauditbatchdiff_compute(baseline_path, current_path):
+    """读取并逐项对比两份 trendauditbatch 产物，返回 diff 报告 dict。
+
+    两份输入均按 _load_trendauditbatch_output 的 trendauditbatch 产物
+    契约严格校验；audit_count 必须相等，各 results 项的 name 顺序必须
+    逐项一致，且对应项 stats 的 gate_count 与 stats.results 的 name
+    顺序也必须一致。每项将其 stats 内全部 results 项的 ba/f1 汇总：
+    regressions 求和、worst_delta 取最小值；regressions_delta 与
+    worst_delta_delta 均为当前汇总减基线汇总（按未舍入值计算），项
+    pass 仅当 regressions_delta <= 0 且 worst_delta_delta >= 0。任何
+    worst_delta_delta 非有限即失败（契约上不会发生，防御性校验）。
+
+    返回 dict（键依次为 audit_count、results、pass）：results 每项键
+    依次为 name、regressions_delta（int）、worst_delta_delta（float）、
+    pass（bool）；顶层 pass 为各项 pass 之与。输入不可读或契约不符抛
+    OSError/UnicodeDecodeError/ValueError/TypeError。
+    """
+    with open(baseline_path, "rb") as f:
+        baseline_raw = f.read()
+    with open(current_path, "rb") as f:
+        current_raw = f.read()
+
+    base_count, base_items = _load_trendauditbatch_output(baseline_raw)
+    cur_count, cur_items = _load_trendauditbatch_output(current_raw)
+    if base_count != cur_count:
+        raise ValueError(
+            "两份产物 audit_count 不一致：%d != %d"
+            % (base_count, cur_count)
+        )
+
+    results = []
+    overall = True
+    for idx, (base_item, cur_item) in enumerate(zip(base_items, cur_items)):
+        base_name, base_gate_count, base_stats = base_item
+        cur_name, cur_gate_count, cur_stats = cur_item
+        if base_name != cur_name:
+            raise ValueError(
+                "results[%d] 的 name 顺序不一致：%r != %r"
+                % (idx, base_name, cur_name)
+            )
+        if base_gate_count != cur_gate_count:
+            raise ValueError(
+                "results[%d] 的 stats.gate_count 不一致：%d != %d"
+                % (idx, base_gate_count, cur_gate_count)
+            )
+        base_stat_names = [stat[0] for stat in base_stats]
+        cur_stat_names = [stat[0] for stat in cur_stats]
+        if base_stat_names != cur_stat_names:
+            raise ValueError(
+                "results[%d] 的 stats.results name 顺序不一致" % idx
+            )
+
+        base_regressions = 0
+        base_worst = None
+        cur_regressions = 0
+        cur_worst = None
+        for base_stat, cur_stat in zip(base_stats, cur_stats):
+            for reg_pos, worst_pos in ((1, 2), (3, 4)):
+                base_regressions += base_stat[reg_pos]
+                cur_regressions += cur_stat[reg_pos]
+                if base_worst is None or base_stat[worst_pos] < base_worst:
+                    base_worst = base_stat[worst_pos]
+                if cur_worst is None or cur_stat[worst_pos] < cur_worst:
+                    cur_worst = cur_stat[worst_pos]
+
+        regressions_delta = cur_regressions - base_regressions
+        worst_delta_delta = cur_worst - base_worst
+        if not math.isfinite(worst_delta_delta):
+            raise ValueError(
+                "results[%d] 的 worst_delta_delta 非有限" % idx
+            )
+        # 负零归零（-0.0 >= 0 为真，但写出时 _fmt_float 亦会归一）。
+        if worst_delta_delta == 0.0:
+            worst_delta_delta = 0.0
+        item_pass = regressions_delta <= 0 and worst_delta_delta >= 0.0
+        if not item_pass:
+            overall = False
+        results.append(
+            {
+                "name": base_name,
+                "regressions_delta": regressions_delta,
+                "worst_delta_delta": worst_delta_delta,
+                "pass": bool(item_pass),
+            }
+        )
+
+    return {
+        "audit_count": base_count,
+        "results": results,
+        "pass": bool(overall),
+    }
+
+
+def _cmd_trendauditbatchdiff(baseline_path, current_path, output_path):
+    """trendauditbatchdiff 子命令主体；全部项无回归退出 0、合法但存在
+    回归退出 3、参数契约/路径/I-O 失败退出 1 且不改 OUTPUT。
+
+    BASELINE、CURRENT 为两份 trendauditbatch 产物，契约见
+    _load_trendauditbatch_output：二者 audit_count 与各 results 项
+    name 顺序必须一致，且对应项 stats 的 gate_count 与 stats.results
+    的 name 顺序必须一致；每项聚合 stats 内 ba/f1（regressions 求和、
+    worst_delta 取最小值），regressions_delta、worst_delta_delta 均为
+    当前汇总减基线汇总，项 pass 仅当前者 <= 0 且后者 >= 0。
+    BASELINE、CURRENT、OUTPUT 三路径绝对化后须两两不同。
+
+    OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），顶层键依次为
+    audit_count（int）、results（list）、pass（bool，各项 pass 之与）；
+    results 每项键依次为 name（str）、regressions_delta（int）、
+    worst_delta_delta（有限 float，固定 12 位小数、负零归零）、pass
+    （bool）；合法但存在回归仍照常写盘，退出码以顶层 pass 为准。同一
+    输入重复运行逐字节相同，标准输出为空。
+    """
+    overall = False
+    try:
+        base_abs = os.path.abspath(baseline_path)
+        cur_abs = os.path.abspath(current_path)
+        out_abs = os.path.abspath(output_path)
+        if base_abs == cur_abs:
+            raise ValueError("BASELINE 与 CURRENT 不能是同一路径")
+        if base_abs == out_abs:
+            raise ValueError("BASELINE 与 OUTPUT 不能是同一路径")
+        if cur_abs == out_abs:
+            raise ValueError("CURRENT 与 OUTPUT 不能是同一路径")
+
+        report = _trendauditbatchdiff_compute(baseline_path, current_path)
+        overall = report["pass"]
+        payload = (_dump_compact(report) + "\n").encode("utf-8")
+        _atomic_write_output(out_abs, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if overall else 3
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
@@ -9464,7 +9973,8 @@ def main(argv):
     valgatebatchtrend MANIFEST OUTPUT、trendstats MANIFEST OUTPUT、
     trendgate STATS CONFIG OUTPUT、
     trendaudit MANIFEST CONFIG OUTPUT 与
-    trendauditbatch MANIFEST OUTPUT。
+    trendauditbatch MANIFEST OUTPUT、
+    trendauditbatchdiff BASELINE CURRENT OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -9524,6 +10034,8 @@ def main(argv):
         return _cmd_trendaudit(argv[2], argv[3], argv[4])
     if len(argv) == 4 and argv[1] == "trendauditbatch":
         return _cmd_trendauditbatch(argv[2], argv[3])
+    if len(argv) == 5 and argv[1] == "trendauditbatchdiff":
+        return _cmd_trendauditbatchdiff(argv[2], argv[3], argv[4])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -9552,6 +10064,7 @@ def main(argv):
         "trendgate",
         "trendaudit",
         "trendauditbatch",
+        "trendauditbatchdiff",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
