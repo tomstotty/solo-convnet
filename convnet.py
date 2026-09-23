@@ -9224,6 +9224,231 @@ def _cmd_trendaudit(manifest_path, config_path, output_path):
     return 0 if overall else 3
 
 
+# ---------------------------------------------------------------------------
+# 命令行批量趋势审计（内存逐项串联 trendaudit）：
+# python convnet.py trendauditbatch MANIFEST OUTPUT
+# ---------------------------------------------------------------------------
+
+_TRENDAUDITBATCH_MANIFEST_KEYS = ["audits"]
+_TRENDAUDITBATCH_ITEM_KEYS = ["name", "manifest", "config"]
+_TRENDAUDITBATCH_OUTPUT_KEYS = [
+    "audit_count",
+    "passed_count",
+    "results",
+    "pass",
+]
+_TRENDAUDITBATCH_OUTPUT_ITEM_KEYS = ["name", "stats", "gate", "pass"]
+
+
+def _load_trendauditbatch_manifest(raw, manifest_dir):
+    """按 trendauditbatch 契约从 MANIFEST 原始字节解析并严格校验。
+
+    raw 不得含 UTF-8 BOM 或字符串字面量之外的任何 JSON 空白（空格、
+    制表、换行、回车），须为紧凑 UTF-8 JSON 对象；唯一键 audits 为长度
+    >= 2 的 list，重复/缺失/额外/错序键（含各项对象内部）一律拒绝
+    （object_pairs_hook 逐对象查重）并拒绝 NaN/Infinity 常量。各项须为
+    JSON 对象，键仅依次为 name、manifest、config；三值均为非空 str
+    （拒绝其他任何 JSON 类型），且 name 全局唯一。manifest 相对批清单
+    目录解析（绝对路径原样使用）为 abspath 并全局两两不同；config 暂存
+    原始相对值，其绝对化改以对应 manifest 所在目录解析、连同其余全部
+    路径的两两互斥在 _cmd_trendauditbatch 预检阶段统一保证。返回按清单
+    顺序的 (name, manifest_abspath, config_rel) 列表；非法 UTF-8/JSON
+    或契约不符分别抛 UnicodeDecodeError/ValueError/TypeError。
+"""
+    if not isinstance(raw, bytes):
+        raise TypeError(
+            "MANIFEST 必须是 bytes，得到 %s" % type(raw).__name__
+        )
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("MANIFEST 不得含 UTF-8 BOM")
+    text = raw.decode("utf-8")
+    _reject_json_whitespace(raw)
+    _reject_json_constants(raw)
+    doc = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(doc, dict):
+        raise TypeError("MANIFEST 顶层必须是 JSON 对象")
+    if list(doc.keys()) != _TRENDAUDITBATCH_MANIFEST_KEYS:
+        raise ValueError("MANIFEST 唯一键必须为 audits")
+    audits = doc["audits"]
+    if not isinstance(audits, list):
+        raise TypeError(
+            "audits 必须是 list，得到 %s" % type(audits).__name__
+        )
+    if len(audits) < 2:
+        raise ValueError("audits 长度必须 >= 2，得到 %d" % len(audits))
+
+    items = []
+    names = set()
+    seen_manifests = set()
+    for idx, item in enumerate(audits):
+        if not isinstance(item, dict):
+            raise TypeError("audits[%d] 必须是 JSON 对象" % idx)
+        if list(item.keys()) != _TRENDAUDITBATCH_ITEM_KEYS:
+            raise ValueError(
+                "audits[%d] 的键必须依次为 name、manifest、config" % idx
+            )
+        values = {}
+        for key in _TRENDAUDITBATCH_ITEM_KEYS:
+            value = item[key]
+            if not isinstance(value, str):
+                raise TypeError(
+                    "audits[%d].%s 必须是非空 str，得到 %s"
+                    % (idx, key, type(value).__name__)
+                )
+            if len(value) == 0:
+                raise ValueError(
+                    "audits[%d].%s 不得为空字符串" % (idx, key)
+                )
+            values[key] = value
+        name = values["name"]
+        if name in names:
+            raise ValueError("audits 的 name 必须唯一，重复：%r" % name)
+        names.add(name)
+
+        manifest_abs = os.path.abspath(
+            os.path.join(manifest_dir, values["manifest"])
+        )
+        if manifest_abs in seen_manifests:
+            raise ValueError(
+                "audits 的 manifest 路径绝对化后必须两两不同，"
+                "重复指向 %s" % manifest_abs
+            )
+        seen_manifests.add(manifest_abs)
+        items.append((name, manifest_abs, values["config"]))
+    return items
+
+
+def _trendauditbatch_compute(entries):
+    """逐项在内存执行 trendaudit，汇总批量审计报告。
+
+    entries 为预检阶段产出的
+    (name, manifest_abs, config_abs, manifest_raw, trend_paths) 列表，
+    全部路径的两两互斥已在 _cmd_trendauditbatch 用全局路径集保证。这里
+    逐项读取 config，随后完全复用 _trendaudit_compute：在内存内串联
+    trendstats 与 trendgate（其清单内 trends 条目以该 manifest 目录解析，
+    与预检解析出的 trend_paths 同源），全程不落任何中间文件。任一文件
+    读取或契约/计算失败抛 OSError/UnicodeDecodeError/ValueError/TypeError。
+
+    返回 dict（键依次为 audit_count、passed_count、results、pass）：
+    results 保持 audits 的输入顺序，每项键依次为 name、stats、gate、
+    pass；stats、gate 为该项单独 trendaudit 输出中同名对象的逐层等值
+    副本（结构分别见 _trendstats_compute 与 _trendgate_compute），项
+    pass 取 gate.pass，passed_count 为通过项数，顶层 pass 为各项 pass
+    之与。
+    """
+    results = []
+    passed_count = 0
+    for name, manifest_abs, config_abs, manifest_raw, _trend_paths in entries:
+        with open(config_abs, "rb") as f:
+            config_raw = f.read()
+        stats_report, gate_report = _trendaudit_compute(
+            manifest_raw, config_raw, os.path.dirname(manifest_abs)
+        )
+        item_pass = gate_report["pass"]
+        if item_pass:
+            passed_count += 1
+        results.append(
+            {
+                "name": name,
+                "stats": stats_report,
+                "gate": gate_report,
+                "pass": bool(item_pass),
+            }
+        )
+
+    return {
+        "audit_count": len(entries),
+        "passed_count": passed_count,
+        "results": results,
+        "pass": bool(passed_count == len(entries)),
+    }
+
+
+def _cmd_trendauditbatch(manifest_path, output_path):
+    """trendauditbatch 子命令主体；全部审计项门禁通过退出 0、合法但未
+    全过退出 3、契约/路径/I-O 失败退出 1 且不改 OUTPUT。
+
+    MANIFEST 的严格契约见 _load_trendauditbatch_manifest：audits 数 >= 2，
+    name 唯一，manifest 相对批清单目录解析且绝对化后两两不同；每项
+    config 相对对应 manifest 所在目录解析。相对 OUTPUT 以批清单所在目录
+    解析（绝对 OUTPUT 原样使用）。预检阶段逐项解析其 manifest（沿用
+    _load_trendstats_manifest 契约），将批清单、OUTPUT、全部
+    manifest/config 以及各项清单内全部子趋势文件路径纳入同一全局集合，
+    绝对化后须两两不同，任一冲突即失败退出 1 且不触碰 OUTPUT。随后各项
+    在内存内执行 trendaudit（_trendaudit_compute），不落任何中间文件；
+    任一项读取/校验/计算失败即整体失败退出 1，OUTPUT 原样保留（全部项
+    完成后才一次性原子写盘）。
+
+    OUTPUT 原子写出紧凑 UTF-8 JSON（末尾 LF），顶层键依次为
+    audit_count（int）、passed_count（int）、results（list）、pass
+    （bool，各项 pass 之与）；results 保持输入顺序，每项键依次为
+    name（str）、stats、gate、pass（bool，同 gate.pass）；stats、gate
+    分别为该项单独 trendaudit 输出中同名对象的逐层等值副本（float 固定
+    12 位小数、负零归零）；合法但未全过仍照常写盘，退出码以顶层 pass 为
+    准。同一输入重复运行逐字节相同，标准输出为空。
+    """
+    overall = False
+    try:
+        manifest_abs = os.path.abspath(manifest_path)
+        manifest_dir = os.path.dirname(manifest_abs)
+        # 相对 OUTPUT 以批清单所在目录解析（绝对路径原样使用）。
+        out_abs = os.path.abspath(os.path.join(manifest_dir, output_path))
+
+        with open(manifest_path, "rb") as f:
+            manifest_raw = f.read()
+        items = _load_trendauditbatch_manifest(manifest_raw, manifest_dir)
+
+        # 全局路径集：批清单、OUTPUT、全部 manifest/config 及子趋势文件
+        # 绝对化后须两两不同。预检同时完成各 item manifest 的读取与清单
+        # 解析（contract 失败即整体失败，OUTPUT 不被触碰）。
+        all_paths = set()
+
+        def _claim(path, label):
+            if path in all_paths:
+                raise ValueError(
+                    "%s 与其他路径不能相同：%s" % (label, path)
+                )
+            all_paths.add(path)
+
+        _claim(manifest_abs, "批 MANIFEST")
+        _claim(out_abs, "OUTPUT")
+
+        entries = []
+        for name, item_manifest_abs, config_rel in items:
+            item_manifest_dir = os.path.dirname(item_manifest_abs)
+            config_abs = os.path.abspath(
+                os.path.join(item_manifest_dir, config_rel)
+            )
+            _claim(item_manifest_abs, "审计项 %r 的 manifest" % name)
+            _claim(config_abs, "审计项 %r 的 config" % name)
+
+            with open(item_manifest_abs, "rb") as f:
+                item_manifest_raw = f.read()
+            trend_paths = _load_trendstats_manifest(
+                item_manifest_raw, item_manifest_dir
+            )
+            for trend_path in trend_paths:
+                _claim(trend_path, "审计项 %r 的子趋势文件" % name)
+
+            entries.append(
+                (
+                    name,
+                    item_manifest_abs,
+                    config_abs,
+                    item_manifest_raw,
+                    trend_paths,
+                )
+            )
+
+        report = _trendauditbatch_compute(entries)
+        overall = report["pass"]
+        payload = (_dump_compact(report) + "\n").encode("utf-8")
+        _atomic_write_output(out_abs, payload)
+    except (ValueError, TypeError, OSError):
+        return 1
+    return 0 if overall else 3
+
+
 def main(argv):
     """命令行入口：接受 train/fitcnn/fitnorm/benchmark/benchmark_batches
     OUTPUT、evaluate/evalcnn/evalnorm WEIGHTS OUTPUT、fitdata DATA OUTPUT、
@@ -9237,8 +9462,9 @@ def main(argv):
     valgatebatch MANIFEST OUTPUT、
     valgatebatchdiff BASELINE CURRENT OUTPUT、
     valgatebatchtrend MANIFEST OUTPUT、trendstats MANIFEST OUTPUT、
-    trendgate STATS CONFIG OUTPUT 与
-    trendaudit MANIFEST CONFIG OUTPUT。
+    trendgate STATS CONFIG OUTPUT、
+    trendaudit MANIFEST CONFIG OUTPUT 与
+    trendauditbatch MANIFEST OUTPUT。
 
     成功 0、参数数目错 2、其余失败 1。
     """
@@ -9296,6 +9522,8 @@ def main(argv):
         return _cmd_trendgate(argv[2], argv[3], argv[4])
     if len(argv) == 5 and argv[1] == "trendaudit":
         return _cmd_trendaudit(argv[2], argv[3], argv[4])
+    if len(argv) == 4 and argv[1] == "trendauditbatch":
+        return _cmd_trendauditbatch(argv[2], argv[3])
     if len(argv) >= 2 and argv[1] in (
         "train",
         "evaluate",
@@ -9323,6 +9551,7 @@ def main(argv):
         "trendstats",
         "trendgate",
         "trendaudit",
+        "trendauditbatch",
     ):
         return 2
     # 其他入口保持现状（信息打印）。
