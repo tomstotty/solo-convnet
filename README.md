@@ -8,6 +8,7 @@
 - 多报告闸门趋势回归统计：`python convnet.py trendstats MANIFEST OUTPUT`。
 - 趋势汇总可配置质量门禁：`python convnet.py trendgate STATS CONFIG OUTPUT`（STATS 为 trendstats 严格产物；全通过退出 0、未通过退出 3、参数错退出 2、其他输入/计算/I-O 错退出 1 且不改 OUTPUT）。
 - 趋势审计（内存串联 trendstats + trendgate）：`python convnet.py trendaudit MANIFEST CONFIG OUTPUT`（MANIFEST 沿用 trendstats 输入契约、CONFIG 沿用 trendgate 配置契约，相对 CONFIG/OUTPUT 以 MANIFEST 目录解析；全程不落中间文件；全通过退出 0、未通过退出 3、参数错退出 2、其他输入/契约/路径/计算/I-O 错退出 1 且不改 OUTPUT）。
+- 批量趋势审计：`python convnet.py trendauditbatch MANIFEST OUTPUT`（MANIFEST 为紧凑 UTF-8 JSON，唯一键 `audits` 为长度≥2的列表，项键序仅 `name,manifest,config`，三值均为非空 str 且 name 唯一；相对 manifest 与 OUTPUT 以批清单目录解析，config 以对应 manifest 目录解析，解析后的批清单、OUTPUT、全部 manifest/config 及子趋势文件两两异；逐项在内存执行 trendaudit，不落中间文件；全通过退出 0、未全过退出 3、参数错退出 2、其他输入/契约/路径/计算/I-O 错退出 1 且不改 OUTPUT）。
 - 训练必须完全确定：相同种子、相同数据与超参数产生逐字节相同的权重与指标。
 - 数据集与权重全部来自仓库内的本地文件，不下载任何外部资源。
 
