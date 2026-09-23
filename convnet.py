@@ -332,15 +332,23 @@ def _check_stride2d(value):
 
 
 def _check_padding2d(value):
-    """校验 Conv2D 补边：非负 int 或恰含 (PT, PB, PL, PR) 的非负 int tuple。
+    """校验 Conv2D 补边：非负 int、恰含 (PT, PB, PL, PR) 的非负 int tuple，
+    或字符串 "same"/"valid"。
 
-    int 展开为 (P, P, P, P)；拒绝 bool。整体类型错抛 TypeError，tuple
-    长度错抛 ValueError，成员类型错（含 bool）抛 TypeError，成员为负
-    抛 ValueError。
+    int 展开为 (P, P, P, P)；拒绝 bool。str 但取值非法抛 ValueError，
+    其他整体类型错（含 bool）抛 TypeError，tuple 长度错抛 ValueError，
+    成员类型错（含 bool）抛 TypeError，成员为负抛 ValueError。字符串
+    原样返回，具体补边在每次 forward 按输入形状解析。
     """
+    if isinstance(value, str):
+        if value not in ("same", "valid"):
+            raise ValueError(
+                "padding 字符串必须是 'same' 或 'valid'，得到 %r" % value
+            )
+        return value
     if isinstance(value, bool) or not isinstance(value, (int, tuple)):
         raise TypeError(
-            "padding 必须是 int 或 tuple，得到 %s" % type(value).__name__
+            "padding 必须是 int、tuple 或 str，得到 %s" % type(value).__name__
         )
     if isinstance(value, int):
         if value < 0:
@@ -459,8 +467,16 @@ class Conv2D:
 
     weights: [O][C/G][KH][KW]，bias: [O]，输入 x: [N][C][H][W]。
     stride: 正 int（展开为 (S, S)）或恰含 (SH, SW) 的正 int tuple。
-    padding: 非负 int（展开为 (P, P, P, P)）或恰含
-    (PT, PB, PL, PR) 的非负 int tuple，分别为上/下/左/右补边。
+    padding: 非负 int（展开为 (P, P, P, P)）、恰含
+    (PT, PB, PL, PR) 的非负 int tuple（分别为上/下/左/右补边），或
+    字符串 "same"/"valid"；其他 str 抛 ValueError，其他类型（含
+    bool）抛 TypeError。记有效核 E=(K-1)*D+1。"valid" 每次 forward
+    取四边 0 补边，有效核大于输入任一轴时 forward 抛 ValueError；
+    "same" 每次 forward 按轴令 Q=ceil(L/S)、总补边
+    P=max((Q-1)*S+E-L, 0)，前侧补 P//2、后侧补 P-P//2，高宽分别
+    计算，输出该轴长度恰为 ceil(L/S)。字符串方式的补边依赖当次输入
+    形状，每次成功 forward 重新解析并缓存，backward 沿用最近一次
+    成功 forward 解析出的 (PT, PB, PL, PR)。
     dilation: 正 int（展开为 (D, D)）或恰含 (DH, DW) 的正 int tuple。
     groups: 正 int 分组数 G（拒绝 bool），默认 1。O 与 C 均须被 G
     整除；输出通道 o 属于组 g=o//(O/G)，仅与输入通道
@@ -481,7 +497,7 @@ class Conv2D:
     def __init__(self, weights, bias, stride=1, padding=0, dilation=1,
                  groups=1, padding_mode="zeros"):
         sh_, sw_ = _check_stride2d(stride)
-        pt_, pb_, pl_, pr_ = _check_padding2d(padding)
+        padding_ = _check_padding2d(padding)
         dh_, dw_ = _check_dilation2d(dilation)
         g_ = _check_groups(groups)
         mode_ = _check_padding_mode(padding_mode)
@@ -504,7 +520,7 @@ class Conv2D:
         self._weights = weights
         self._bias = bias
         self._stride = (sh_, sw_)
-        self._padding = (pt_, pb_, pl_, pr_)
+        self._padding = padding_  # (PT, PB, PL, PR) tuple 或 "same"/"valid"
         self._dilation = (dh_, dw_)
         self._groups = g_
         self._padding_mode = mode_
@@ -512,13 +528,21 @@ class Conv2D:
 
         self._x = None           # 最近一次成功 forward 的输入
         self._out_shape = None   # 最近一次成功 forward 的输出形状
+        # 最近一次成功 forward 解析出的 (PT, PB, PL, PR)：数值 padding
+        # 恒等于 self._padding；"same"/"valid" 在首次成功 forward 前为
+        # None，forward 失败时保留旧值。
+        self._resolved_padding = (
+            padding_ if isinstance(padding_, tuple) else None
+        )
 
     def forward(self, x):
         """对 x: [N][C][H][W] 按补边模式做互相关，返回嵌套 list 并缓存输入。
 
-        越界采样坐标按 padding_mode 映射（见类文档）；reflect 模式下
-        有补边的轴长度小于 2 时抛 ValueError。校验或计算失败不改变
-        实参与旧缓存。
+        padding 为 "same"/"valid" 时按当次输入形状解析 (PT, PB, PL, PR)
+        （规则见类文档）并随成功 forward 缓存。越界采样坐标按
+        padding_mode 映射（见类文档）；reflect 模式下有补边的轴长度
+        小于 2 时抛 ValueError。校验或计算失败不改变实参、旧解析补边
+        与旧缓存。
         """
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
@@ -533,16 +557,32 @@ class Conv2D:
                 "输入通道数 %d 与 weights 通道数 %d 不符" % (c_, w_c)
             )
         sh_, sw_ = self._stride
-        pt_, pb_, pl_, pr_ = self._padding
         dh_, dw_ = self._dilation
         mode = self._padding_mode
+        ekh_ = (kh_ - 1) * dh_ + 1
+        ekw_ = (kw_ - 1) * dw_ + 1
+        spec = self._padding
+        if isinstance(spec, str):
+            if spec == "valid":
+                pt_ = pb_ = pl_ = pr_ = 0
+            else:
+                # "same"：按轴令 Q=ceil(L/S)、P=max((Q-1)*S+E-L, 0)，
+                # 前侧 P//2、后侧 P-P//2，高宽分别计算。
+                qh_ = -(-h_ // sh_)
+                ph_ = max((qh_ - 1) * sh_ + ekh_ - h_, 0)
+                pt_ = ph_ // 2
+                pb_ = ph_ - pt_
+                qw_ = -(-w_ // sw_)
+                pw_ = max((qw_ - 1) * sw_ + ekw_ - w_, 0)
+                pl_ = pw_ // 2
+                pr_ = pw_ - pl_
+        else:
+            pt_, pb_, pl_, pr_ = spec
         if mode == "reflect":
             if (pt_ + pb_ > 0 and h_ < 2) or (pl_ + pr_ > 0 and w_ < 2):
                 raise ValueError(
                     "reflect 补边模式下，有补边的轴长度必须至少为 2"
                 )
-        ekh_ = (kh_ - 1) * dh_ + 1
-        ekw_ = (kw_ - 1) * dw_ + 1
         if ekh_ > h_ + pt_ + pb_ or ekw_ > w_ + pl_ + pr_:
             raise ValueError("核在补边后仍越界：核尺寸大于补边后的输入")
         oh_ = (h_ + pt_ + pb_ - ekh_) // sh_ + 1
@@ -585,12 +625,14 @@ class Conv2D:
 
         self._x = x
         self._out_shape = (n_, o_ch, oh_, ow_)
+        self._resolved_padding = (pt_, pb_, pl_, pr_)
         return out
 
     def backward(self, dy):
         """根据上游梯度 dy 返回 (dx, dweights, dbias)。
 
-        dy 的形状必须等于最近一次成功 forward 的输出形状。
+        dy 的形状必须等于最近一次成功 forward 的输出形状，补边取该次
+        forward 解析出的 (PT, PB, PL, PR)。
         未成功 forward 前调用一律抛 ValueError。越界采样坐标按
         padding_mode 映射：dweights 按映射坐标取 x 累加，dx 累加至
         映射坐标（多个核位置映射到同一输入坐标时梯度在此累加）；
@@ -619,7 +661,7 @@ class Conv2D:
         h_ = len(x[0][0])
         w_ = len(x[0][0][0])
         sh_, sw_ = self._stride
-        pt_, pb_, pl_, pr_ = self._padding
+        pt_, pb_, pl_, pr_ = self._resolved_padding
         dh_, dw_ = self._dilation
         mode = self._padding_mode
 
