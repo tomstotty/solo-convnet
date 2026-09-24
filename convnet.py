@@ -15,7 +15,9 @@
   dilation 可为正 int 或 (DH, DW) tuple（规则同 Conv2D 的 dilation），
   output_padding 可为非负 int 或 (OPH, OPW) tuple（OPH<SH、OPW<SW），
   groups 为正 int 分组数（默认 1，C 与 O 均须被其整除，输入通道 c
-  仅连接同组输出 (c//(C/G))*(O/G)+oi）；数值补边输出形状
+  仅连接同组输出 (c//(C/G))*(O/G)+oi）；forward 另接受 output_size=
+  (OH, OW) 按本次输出尺寸反推输出补边（0≤OH-BH<SH、0≤OW-BW<SW），
+  覆盖仅作用于本次调用；数值补边输出形状
   [(H-1)*SH-PT-PB+(KH-1)*DH+1+OPH]
   [(W-1)*SW-PL-PR+(KW-1)*DW+1+OPW]，"valid" 同此式（四边 0），
   "same" 输出形状 [N][O][H*SH][W*SW]。
@@ -582,6 +584,37 @@ def _check_groups(value):
     return value
 
 
+def _check_forward_output_size2d(value):
+    """校验 ConvTranspose2D.forward 的 output_size：None 或恰含 (OH, OW) 的
+    正 int tuple（拒绝 bool）。
+
+    None 原样返回，表示沿用构造时的 output_padding；整体类型错（含 bool、
+    int 等非 tuple）抛 TypeError，tuple 长度错或成员非正抛 ValueError，
+    成员类型错（含 bool）抛 TypeError。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, tuple):
+        raise TypeError(
+            "output_size 必须是 None 或 tuple，得到 %s"
+            % type(value).__name__
+        )
+    if len(value) != 2:
+        raise ValueError("output_size tuple 必须恰含 (OH, OW) 两个元素")
+    oh_, ow_ = value
+    for member_name, member in (("OH", oh_), ("OW", ow_)):
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError(
+                "output_size 的 %s 必须是 int，得到 %s"
+                % (member_name, type(member).__name__)
+            )
+        if member <= 0:
+            raise ValueError(
+                "output_size 的 %s 必须为正整数" % member_name
+            )
+    return (oh_, ow_)
+
+
 def _check_output_padding2d(value, sh_, sw_):
     """校验转置卷积输出补边：非负 int 或恰含 (OPH, OPW) 的非负 int tuple。
 
@@ -929,11 +962,22 @@ class ConvTranspose2D:
     的非负 int tuple；整体与成员均须为 int 且拒绝 bool；类型错（含
     bool）抛 TypeError，长度错、成员为负或 OPH≥SH、OPW≥SW 抛
     ValueError。
+    forward(x, output_size=None) 的 output_size 仅可为 None 或恰含
+    (OH, OW) 的正 int tuple；成员须为正 int 且拒绝 bool，整体或成员
+    类型错抛 TypeError，长度错或成员非正抛 ValueError。每次先按既有
+    规则解析四边补边，令
+    BH=(H-1)*SH-PT-PB+(KH-1)*DH+1、BW 同理（即不含输出补边的基础窗口）：
+    None 沿用构造时 OPH/OPW，输出为 BH+OPH、BW+OPW；tuple 令本次
+    OPH=OH-BH、OPW=OW-BW，任一不满足 0≤OPH<SH、0≤OPW<SW 抛
+    ValueError，输出为 OH、OW。该覆盖只作用于本次调用，不修改构造配置；
+    失败保留此前成功缓存及解析补边，不改实参。
     输出形状:
     数值补边（int/tuple）与 "valid" 为
     [N][O][(H-1)*SH-PT-PB+(KH-1)*DH+1+OPH]
           [(W-1)*SW-PL-PR+(KW-1)*DW+1+OPW]（"valid" 时四边皆 0），
-    "same" 为 [N][O][H*SH][W*SW]；输出高或宽非正抛 ValueError。每个
+    "same" 为 [N][O][H*SH][W*SW]；此处 OPH/OPW 为本次调用实际生效的
+    输出补边（output_size=None 即构造值，否则按 OH-BH、OW-BW 覆盖）；
+    输出高或宽非正抛 ValueError。每个
     输出从 bias[o] 起按组内 c→kh→kw 累加；仅当 (oh+PT-kh*DH) 可被
     SH 整除、(ow+PL-kw*DW) 可被 SW 整除，且其商 ih、iw 分别落在
     [0,H)、[0,W) 内时，加入
@@ -1012,17 +1056,23 @@ class ConvTranspose2D:
         self._x = None           # 最近一次成功 forward 的输入
         self._out_shape = None   # 最近一次成功 forward 的输出形状
 
-    def forward(self, x):
+    def forward(self, x, output_size=None):
         """按分组转置卷积规则计算输出并缓存输入，返回全新嵌套 list。
 
-        数值补边与 "valid" 的输出 [N][O][OH][OW] 为
-        OH=(H-1)*SH-PT-PB+(KH-1)*DH+1+OPH、
-        OW=(W-1)*SW-PL-PR+(KW-1)*DW+1+OPW；"same" 为 OH=H*SH、
-        OW=W*SW（四边补边见类文档）。每个输出从 bias[o] 起按组内
+        output_size 仅可为 None 或恰含 (OH, OW) 的正 int tuple（拒绝
+        bool）：整体或成员类型错抛 TypeError，长度错或成员非正抛
+        ValueError。每次先按既有规则解析本次四边补边 (PT, PB, PL, PR)，
+        再令基础窗口 BH=(H-1)*SH-PT-PB+(KH-1)*DH+1、
+        BW=(W-1)*SW-PL-PR+(KW-1)*DW+1（不含输出补边）：
+        output_size=None 时沿用构造时 OPH/OPW，输出为 BH+OPH、BW+OPW
+        （"same" 恰为 H*SH、W*SW）；output_size=(OH,OW) 时令本次
+        OPH=OH-BH、OPW=OW-BW，任一不满足 0≤OPH<SH、0≤OPW<SW 抛
+        ValueError，输出即为 OH、OW。覆盖只作用于本次调用，不修改构造
+        配置（self._output_padding 不变）。每个输出从 bias[o] 起按组内
         c→kh→kw 累加，仅当 (oh+PT-kh*DH)、(ow+PL-kw*DW) 分别可被 SH、
         SW 整除且商 ih、iw 有效时加入乘积（是否命中完全由上述坐标条件
-        决定，output_padding 仅扩大输出窗口）。输出高/宽非正或计算出现
-        非有限值抛 ValueError。padding 为 "same"/"valid" 时按本次
+        决定，输出补边仅扩大输出窗口）。None 路径输出高/宽非正或计算
+        出现非有限值抛 ValueError。padding 为 "same"/"valid" 时按本次
         forward 解析四边补边。校验或计算失败不改变实参、旧缓存与旧的
         解析补边；成功后才缓存输入、输出形状与本次解析的
         (PT, PB, PL, PR)。
@@ -1048,16 +1098,32 @@ class ConvTranspose2D:
             self._padding_spec, h_, w_, sh_, sw_,
             ekh_, ekw_, oph_, opw_,
         )
-        if self._padding_spec == "same":
-            oh_ = h_ * sh_
-            ow_ = w_ * sw_
+        # 不含输出补边的基础窗口；"same" 补边用构造 OP 解析，故
+        # BH+构造OPH=H*SH、BW+构造OPW=W*SW。
+        bh_ = (h_ - 1) * sh_ - pt_ - pb_ + ekh_
+        bw_ = (w_ - 1) * sw_ - pl_ - pr_ + ekw_
+        requested = _check_forward_output_size2d(output_size)
+        if requested is None:
+            eff_oph_, eff_opw_ = oph_, opw_
+            oh_ = bh_ + eff_oph_
+            ow_ = bw_ + eff_opw_
+            if oh_ <= 0 or ow_ <= 0:
+                raise ValueError(
+                    "转置卷积输出尺寸非正：OH=%d、OW=%d" % (oh_, ow_)
+                )
         else:
-            oh_ = (h_ - 1) * sh_ - pt_ - pb_ + ekh_ + oph_
-            ow_ = (w_ - 1) * sw_ - pl_ - pr_ + ekw_ + opw_
-        if oh_ <= 0 or ow_ <= 0:
-            raise ValueError(
-                "转置卷积输出尺寸非正：OH=%d、OW=%d" % (oh_, ow_)
-            )
+            req_oh_, req_ow_ = requested
+            eff_oph_ = req_oh_ - bh_
+            eff_opw_ = req_ow_ - bw_
+            if not (0 <= eff_oph_ < sh_ and 0 <= eff_opw_ < sw_):
+                raise ValueError(
+                    "output_size 推得的输出补边越界：OPH=%d（须满足"
+                    " 0≤OPH<SH=%d）、OPW=%d（须满足 0≤OPW<SW=%d），"
+                    "BH=%d、BW=%d、OH=%d、OW=%d"
+                    % (eff_oph_, sh_, eff_opw_, sw_,
+                       bh_, bw_, req_oh_, req_ow_)
+                )
+            oh_, ow_ = req_oh_, req_ow_
 
         weights = self._weights
         bias = self._bias
