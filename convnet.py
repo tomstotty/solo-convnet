@@ -1290,6 +1290,23 @@ class ConvTranspose2D:
         return dx, dw, db
 
 
+def _maxpool_out_size(length, pad_lo, pad_hi, eff, stride, ceil_mode):
+    """计算最大池化单轴输出长度。
+
+    记 A=length+pad_lo+pad_hi-eff（eff 为有效核长 (K-1)*D+1）。
+    ceil_mode 为假时取 A//stride+1；为真时取 (A+stride-1)//stride+1，
+    但若末窗口起点越出补边后输入（(out-1)*stride >= length+pad_lo）
+    则该轴减 1。
+    """
+    a = length + pad_lo + pad_hi - eff
+    if not ceil_mode:
+        return a // stride + 1
+    out = (a + stride - 1) // stride + 1
+    if (out - 1) * stride >= length + pad_lo:
+        out -= 1
+    return out
+
+
 class MaxPool2D:
     """二维最大池化层（NCHW，嵌套 list，逐通道池化，支持膨胀采样）。
 
@@ -1302,18 +1319,22 @@ class MaxPool2D:
     PT、PB < KH，PL、PR < KW。补边位置不参与比较。
     dilation: 正 int（双轴同值，展开为 (D, D)）或恰含 (DH, DW) 的
     正 int tuple。
+    ceil_mode: 只能为 bool（默认 False），否则抛 TypeError。
     输入 x: [N][C][H][W]，输出: [N][C][OH][OW]。记有效核长
-    EH=(KH-1)*DH+1、EW=(KW-1)*DW+1，则
-    OH = (H + PT + PB - EH) // SH + 1，
-    OW = (W + PL + PR - EW) // SW + 1。
-    有效核长大于补边后输入抛 ValueError。不能整除时舍弃底部或右侧
-    余量。窗口采样坐标为 oh*SH-PT+kh*DH、ow*SW-PL+kw*DW（kh、kw 从
-    0 起），越界补边位置不参与比较；某窗口无真实采样点（膨胀可使
-    采样点全部落到补边区域）抛 ValueError。窗口内按 kh→kw 扫描，
-    并列最大只取首个真实坐标。
+    EH=(KH-1)*DH+1、EW=(KW-1)*DW+1，A=H+PT+PB-EH、B=W+PL+PR-EW，
+    则 ceil_mode 为假时 OH = A//SH+1、OW = B//SW+1，不能整除时舍弃
+    底部或右侧余量；为真时 OH = (A+SH-1)//SH+1、
+    OW = (B+SW-1)//SW+1，但末窗口起点满足 (OH-1)*SH >= H+PT（宽轴为
+    (OW-1)*SW >= W+PL）时该轴减 1。
+    有效核长大于补边后输入抛 ValueError。窗口采样坐标为
+    oh*SH-PT+kh*DH、ow*SW-PL+kw*DW（kh、kw 从 0 起），越界补边位置
+    不参与比较；某窗口无真实采样点（膨胀或 ceil 末窗口可使采样点全部
+    落到补边区域）抛 ValueError。窗口内按 kh→kw 扫描，并列最大只取
+    首个真实坐标。
     """
 
-    def __init__(self, kernel_size, stride=None, padding=0, dilation=1):
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1,
+                 ceil_mode=False):
         kh_, kw_ = _check_kernel2d(kernel_size, "kernel_size")
         if stride is None:
             sh_, sw_ = kh_, kw_
@@ -1325,11 +1346,17 @@ class MaxPool2D:
         if pl_ >= kw_ or pr_ >= kw_:
             raise ValueError("padding 的 PL、PR 必须小于 KW")
         dh_, dw_ = _check_dilation2d(dilation)
+        if not isinstance(ceil_mode, bool):
+            raise TypeError(
+                "ceil_mode 必须是 bool，得到 %s"
+                % type(ceil_mode).__name__
+            )
 
         self._kernel_size = (kh_, kw_)
         self._stride = (sh_, sw_)
         self._padding = (pt_, pb_, pl_, pr_)
         self._dilation = (dh_, dw_)
+        self._ceil_mode = ceil_mode
 
         self._x_shape = None   # 最近一次成功 forward 的输入形状
         self._out_shape = None  # 最近一次成功 forward 的输出形状
@@ -1351,8 +1378,8 @@ class MaxPool2D:
         ew_ = (kw_ - 1) * dw_ + 1
         if eh_ > h_ + pt_ + pb_ or ew_ > w_ + pl_ + pr_:
             raise ValueError("池化窗口在补边后仍越界：有效核大于补边后的输入")
-        oh_ = (h_ + pt_ + pb_ - eh_) // sh_ + 1
-        ow_ = (w_ + pl_ + pr_ - ew_) // sw_ + 1
+        oh_ = _maxpool_out_size(h_, pt_, pb_, eh_, sh_, self._ceil_mode)
+        ow_ = _maxpool_out_size(w_, pl_, pr_, ew_, sw_, self._ceil_mode)
 
         out = []
         winners = []
@@ -2703,9 +2730,9 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
 def _check_pool_window_ties(pool, inp):
     """扫描 MaxPool2D 对 inp 的全部有效窗口，任一窗口并列最大即抛 ValueError。
 
-    窗口/步长/补边/膨胀规则与 MaxPool2D.forward 完全一致（采样坐标
-    oh*SH-PT+kh*DH、ow*SW-PL+kw*DW，补边位置不参与比较）：窗口内同一
-    最大值出现两次及以上即视为并列。inp 须为池化层合法四维输入。
+    窗口/步长/补边/膨胀/ceil_mode 规则与 MaxPool2D.forward 完全一致
+    （采样坐标 oh*SH-PT+kh*DH、ow*SW-PL+kw*DW，补边位置不参与比较）：
+    窗口内同一最大值出现两次及以上即视为并列。inp 须为池化层合法四维输入。
     """
     kh_, kw_ = pool._kernel_size
     sh_, sw_ = pool._stride
@@ -2717,8 +2744,8 @@ def _check_pool_window_ties(pool, inp):
     c_ = len(inp[0])
     h_ = len(inp[0][0])
     w_ = len(inp[0][0][0])
-    oh_ = (h_ + pt_ + pb_ - eh_) // sh_ + 1
-    ow_ = (w_ + pl_ + pr_ - ew_) // sw_ + 1
+    oh_ = _maxpool_out_size(h_, pt_, pb_, eh_, sh_, pool._ceil_mode)
+    ow_ = _maxpool_out_size(w_, pl_, pr_, ew_, sw_, pool._ceil_mode)
     for n in range(n_):
         x_n = inp[n]
         for c in range(c_):
