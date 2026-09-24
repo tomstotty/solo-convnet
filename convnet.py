@@ -70,8 +70,8 @@
   批顺序排列、长度 epochs*ceil(N/batch_size) 的各批更新前批均损失
   新 list[float]；任何异常都把七层整体恢复到函数入口状态。
 - train_deep_step(layers, x, labels, lr=0.1)：对
-  Conv2D→BatchNorm2D→Dropout→(MaxPool2D 或
-  AdaptiveAvgPool2D)→Flatten→Linear→ReLU→Linear→SoftmaxCrossEntropy
+  Conv2D→BatchNorm2D→Dropout→(MaxPool2D、AdaptiveAvgPool2D 或
+  AdaptiveMaxPool2D)→Flatten→Linear→ReLU→Linear→SoftmaxCrossEntropy
   九层（双层分类头）按序前向、自损失层起逆序反传，以新 list 同步
   更新 conv 权重/偏置、BN gamma/beta 及两个 Linear 权重/偏置（损失
   梯度已批均，不再除 N），返回更新前 float 批均损失；容器/成员类型
@@ -125,7 +125,9 @@
 - check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6,
   rtol=1e-4)：以中心差分依次检验 x 与上述八组参数的数值梯度，损失、
   误差、容差判定与 (ok, max_e, max_r) 返回沿用 check_train_gradients；
-  结束时（含异常路径）九层入口状态与参数引用整体恢复，结果确定。
+  池化位另接受 AdaptiveMaxPool2D，其任一次前向中任一分箱并列最大
+  均抛 ValueError；结束时（含异常路径）九层入口状态与参数引用整体
+  恢复，结果确定。
 
 命令行子命令（仅标准库）：
 - `python convnet.py train OUTPUT`：在 data/tiny.csv 上训练“展平 + Linear”，
@@ -6922,12 +6924,30 @@ _DEEP_LAYER_NAMES = (
     "Flatten", "Linear", "ReLU", "Linear", "SoftmaxCrossEntropy",
 )
 
+# train_deep_step / check_deep_gradients 专用的九层类型契约：第 4 层
+# （索引 3）额外接受 AdaptiveMaxPool2D。三个 deep 批训练接口
+# （train_deep_batches / train_deep_momentum_batches /
+# train_deep_adam_batches）仍沿用上面的 _DEEP_LAYER_TYPES，不支持该层。
+_DEEP_STEP_LAYER_TYPES = (
+    Conv2D, BatchNorm2D, Dropout,
+    (MaxPool2D, AdaptiveAvgPool2D, AdaptiveMaxPool2D),
+    Flatten, Linear, ReLU, Linear, SoftmaxCrossEntropy,
+)
+_DEEP_STEP_LAYER_NAMES = (
+    "Conv2D", "BatchNorm2D", "Dropout",
+    "MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D",
+    "Flatten", "Linear", "ReLU", "Linear", "SoftmaxCrossEntropy",
+)
 
-def _check_deep_layer_types(layers):
+
+def _check_deep_layer_types(
+    layers, types=_DEEP_LAYER_TYPES, names=_DEEP_LAYER_NAMES
+):
     """九层结构的容器/长度/类型校验（不含训练态检查）。
 
     容器或成员类型错抛 TypeError，长度错抛 ValueError；校验次序沿用
-    check_train_gradients：先容器与长度，再逐层类型。
+    check_train_gradients：先容器与长度，再逐层类型。types/names
+    指定逐层接受的类型集合与报错名称（默认不含 AdaptiveMaxPool2D）。
     """
     if not isinstance(layers, list):
         raise TypeError(
@@ -6937,9 +6957,7 @@ def _check_deep_layer_types(layers):
         raise ValueError(
             "layers 必须恰含 9 层，得到 %d 层" % len(layers)
         )
-    for idx, (layer, cls, name) in enumerate(
-        zip(layers, _DEEP_LAYER_TYPES, _DEEP_LAYER_NAMES)
-    ):
+    for idx, (layer, cls, name) in enumerate(zip(layers, types, names)):
         if not isinstance(layer, cls):
             raise TypeError(
                 "layers[%d] 必须是 %s 实例，得到 %s"
@@ -6947,16 +6965,21 @@ def _check_deep_layer_types(layers):
             )
 
 
-def _validate_deep_layers(layers):
+def _validate_deep_layers(
+    layers, types=_DEEP_LAYER_TYPES, names=_DEEP_LAYER_NAMES
+):
     """严格九层结构校验（双层分类头契约）。
 
-    layers 必须是恰含 Conv2D/BatchNorm2D/Dropout/(MaxPool2D 或
-    AdaptiveAvgPool2D)/Flatten/Linear/ReLU/Linear/SoftmaxCrossEntropy
-    九层实例（类型与顺序均固定）的 list：容器或成员类型错抛 TypeError，
-    长度错抛 ValueError。另要求 BatchNorm2D 与 Dropout 均处于训练态，
+    layers 必须是恰含 Conv2D/BatchNorm2D/Dropout/池化层/Flatten/
+    Linear/ReLU/Linear/SoftmaxCrossEntropy 九层实例（类型与顺序均
+    固定）的 list：容器或成员类型错抛 TypeError，长度错抛 ValueError。
+    池化位（索引 3）接受的类型由 types/names 决定：默认仅 MaxPool2D
+    或 AdaptiveAvgPool2D（三个 deep 批训练接口沿用），
+    train_deep_step 传入 _DEEP_STEP_LAYER_TYPES 时还接受
+    AdaptiveMaxPool2D。另要求 BatchNorm2D 与 Dropout 均处于训练态，
     否则抛 ValueError。
     """
-    _check_deep_layer_types(layers)
+    _check_deep_layer_types(layers, types, names)
     if not layers[1]._training:
         raise ValueError("BatchNorm2D 必须处于训练态")
     if not layers[2]._training:
@@ -6987,8 +7010,8 @@ def _check_deep_scalar(value, name):
 
 
 def train_deep_step(layers, x, labels, lr=0.1):
-    """九层网络（Conv2D/BN/Dropout/(MaxPool 或
-    AdaptiveAvgPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头）
+    """九层网络（Conv2D/BN/Dropout/(MaxPool、AdaptiveAvgPool 或
+    AdaptiveMaxPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头）
     的一步训练：按列表顺序前向，自损失层 backward() 起逆序反传，以新
     list 同步把 conv 的 weights/bias、BN 的 gamma/beta、两个 Linear 的
     weights/bias 各减去 lr 乘对应梯度，返回更新前 float 批均损失。
@@ -7007,7 +7030,9 @@ def train_deep_step(layers, x, labels, lr=0.1):
     （含参数引用、随机状态、运行统计与旧缓存），如同本次调用从未发生。
     相同入口状态结果完全确定。
     """
-    _validate_deep_layers(layers)
+    _validate_deep_layers(
+        layers, _DEEP_STEP_LAYER_TYPES, _DEEP_STEP_LAYER_NAMES
+    )
     _check_deep_scalar(lr, "lr")
     if lr <= 0:
         raise ValueError("lr 必须为正数")
@@ -7094,8 +7119,9 @@ def train_deep_step(layers, x, labels, lr=0.1):
 def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验九层双层分类头训练链。
 
-    layers 须为恰含 Conv2D/BatchNorm2D/Dropout/(MaxPool2D 或
-    AdaptiveAvgPool2D)/Flatten/Linear/ReLU/Linear/SoftmaxCrossEntropy
+    layers 须为恰含 Conv2D/BatchNorm2D/Dropout/(MaxPool2D、
+    AdaptiveAvgPool2D 或 AdaptiveMaxPool2D)/Flatten/Linear/ReLU/Linear/
+    SoftmaxCrossEntropy
     九层实例的 list：容器/成员类型错抛 TypeError，长度错或 BN/Dropout
     非训练态抛 ValueError。前向按 conv→bn→dropout→pool→flatten→
     linear1→relu→linear2 执行得 logits，标量损失 L = loss.forward(
@@ -7111,6 +7137,8 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
     BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D
     时，任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）
     一律抛 ValueError——max 在并列点梯度无定义；pool 为
+    AdaptiveMaxPool2D 时，任一次前向（含解析梯度前向与每次正、负扰动
+    前向）中任一分箱并列最大同样一律抛 ValueError；pool 为
     AdaptiveAvgPool2D 时不做并列检测。
 
     损失、误差、容差判定与返回 (ok, max_e, max_r) 的类型、顺序均沿用
@@ -7126,7 +7154,9 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
     SoftmaxCrossEntropy 缓存）在所有成功或异常路径均原样恢复（含参数
     引用），重复调用结果一致。
     """
-    _check_deep_layer_types(layers)
+    _check_deep_layer_types(
+        layers, _DEEP_STEP_LAYER_TYPES, _DEEP_STEP_LAYER_NAMES
+    )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
         _check_deep_scalar(val, name)
     if eps <= 0:
@@ -7152,6 +7182,8 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
             drop_out = dropout.forward(bn_out)
             if isinstance(pool, MaxPool2D):
                 _check_pool_window_ties(pool, drop_out)
+            elif isinstance(pool, AdaptiveMaxPool2D):
+                _check_adaptive_maxpool_ties(pool, drop_out)
             pool_out = pool.forward(drop_out)
             flat = flatten.forward(pool_out)
             hidden = linear1.forward(flat)
