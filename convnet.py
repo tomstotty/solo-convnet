@@ -41,7 +41,7 @@
 - BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并更新
   running_mean/running_var，推理态使用运行统计仿射。
 - SoftmaxCrossEntropy 层：二维 logits [N][K] 与 labels [N] 的批均
-  softmax 交叉熵损失，反向返回对 logits 的梯度。
+  softmax 交叉熵损失（可选 label_smoothing），反向返回对 logits 的梯度。
 
 - 公开推理 API（仅标准库）：
 - load_model(path)：严格校验 train 产物后返回键序为 values、bias 的新 dict。
@@ -2662,20 +2662,40 @@ class BatchNorm2D:
 class SoftmaxCrossEntropy:
     """Softmax + 交叉熵损失层（限二维 logits [N][K]，labels [N]）。
 
+    SoftmaxCrossEntropy(label_smoothing=0.0)：label_smoothing 须为
+    [0, 1) 内的有限 int/float（拒绝 bool），类型错抛 TypeError，非有限
+    或越界抛 ValueError；默认 0.0 等价于普通 one-hot 交叉熵。
+
     forward(logits, labels)：logits 为非空规则嵌套 list[N][K]（N、K ≥ 1），
     元素为有限 int/float（拒绝 bool）；labels 为长度 N 的 list，元素为
     [0, K) 内的 int（拒绝 bool）。逐行取 m = max(row)，按 k 递增求
-    e[k] = exp(row[k] - m)、s = Σe、p[k] = e[k]/s，再按 n 递增累计
-    m + log(s) - row[label] 并除以 N，返回 float 批均损失。
+    e[k] = exp(row[k] - m)、z = Σe、p[k] = e[k]/z；令 s = label_smoothing、
+    q[k] = (1 - s) * I(k == label) + s / K，按 n→k 递增累计
+    q[k] * (m + log(z) - row[k]) 并除以 N，返回 float 批均损失。
     仅成功时以新 list 缓存 p 与 labels 并覆盖旧缓存，失败保留旧缓存。
 
     backward()：返回新 list[N][K]，元素为
-    (p[n][k] - (k == label[n] ? 1 : 0)) / N，均为 float。
+    (p[n][k] - q[n][k]) / N，均为 float。
     未成功 forward 前调用一律抛 ValueError；重复调用返回等值独立列表。
     两个方法均不修改实参。
     """
 
-    def __init__(self):
+    def __init__(self, label_smoothing=0.0):
+        if isinstance(label_smoothing, bool) or not isinstance(
+            label_smoothing, (int, float)
+        ):
+            raise TypeError(
+                "label_smoothing 必须是 int/float（拒绝 bool），得到 %s"
+                % type(label_smoothing).__name__
+            )
+        if not math.isfinite(label_smoothing):
+            raise ValueError("label_smoothing 必须是有限值（拒绝 NaN/inf）")
+        if label_smoothing < 0 or label_smoothing >= 1:
+            raise ValueError(
+                "label_smoothing 必须在 [0, 1) 内，得到 %r"
+                % (label_smoothing,)
+            )
+        self._label_smoothing = float(label_smoothing)
         self._probs = None     # 最近一次成功 forward 的 softmax 概率
         self._labels = None    # 最近一次成功 forward 的标签副本
         self._out_shape = None  # 最近一次成功 forward 的 (N, K)
@@ -2704,6 +2724,7 @@ class SoftmaxCrossEntropy:
                     "labels[%d] = %d 超出 [0, %d) 范围" % (n, label, k_)
                 )
 
+        smooth = self._label_smoothing
         probs = []
         loss_sum = 0.0
         for n in range(n_):
@@ -2713,14 +2734,19 @@ class SoftmaxCrossEntropy:
                 if row[k] > m:
                     m = row[k]
             exps = []
-            s = 0.0
+            z = 0.0
             for k in range(k_):
                 e = math.exp(row[k] - m)
                 exps.append(e)
-                s += e
-            p = [e / s for e in exps]
+                z += e
+            p = [e / z for e in exps]
             probs.append(p)
-            loss_sum += m + math.log(s) - row[labels[n]]
+            log_z = math.log(z)
+            label = labels[n]
+            for k in range(k_):
+                q = (1.0 - smooth) * (1.0 if k == label else 0.0) \
+                    + smooth / k_
+                loss_sum += q * (m + log_z - row[k])
         loss = loss_sum / n_
 
         for n in range(n_):
@@ -2738,8 +2764,9 @@ class SoftmaxCrossEntropy:
     def backward(self):
         """返回 logits 的梯度新 list[N][K]，元素均为 float。
 
-        元素为 (p[n][k] - (k 等于 label[n] 时为 1，否则为 0)) / N；
-        未成功 forward 前调用一律抛 ValueError。
+        元素为 (p[n][k] - q[n][k]) / N，其中
+        q[n][k] = (1 - s) * I(k == label[n]) + s / K，s 为
+        label_smoothing；未成功 forward 前调用一律抛 ValueError。
         """
         if self._probs is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -2747,15 +2774,16 @@ class SoftmaxCrossEntropy:
         n_, k_ = self._out_shape
         probs = self._probs
         labels = self._labels
+        smooth = self._label_smoothing
         dx = []
         for n in range(n_):
             p_row = probs[n]
             label = labels[n]
             row = []
             for k in range(k_):
-                row.append(
-                    (p_row[k] - (1.0 if k == label else 0.0)) / n_
-                )
+                q = (1.0 - smooth) * (1.0 if k == label else 0.0) \
+                    + smooth / k_
+                row.append((p_row[k] - q) / n_)
             dx.append(row)
 
         for n in range(n_):
