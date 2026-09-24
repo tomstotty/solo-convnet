@@ -7,12 +7,15 @@
   （默认 1，O 与 C 均须被其整除，weights 形状 [O][C/G][KH][KW]），
   padding_mode 为 "zeros"/"replicate"/"circular"/"reflect" 之一
   （默认 "zeros"，越界采样坐标的映射规则见 Conv2D 文档）。
-- ConvTranspose2D 层：NCHW 嵌套 list 的转置卷积，weights
-  [C][O][KH][KW]、bias [O]；stride 可为正 int 或 (SH, SW) tuple，
+- ConvTranspose2D 层：NCHW 嵌套 list 的分组转置卷积，weights
+  [C][O/G][KH][KW]、bias [O]；stride 可为正 int 或 (SH, SW) tuple，
   padding 可为非负 int 或 (PT,PB,PL,PR) tuple（规则同 Conv2D 的
   stride/padding），dilation 可为正 int 或 (DH, DW) tuple（规则同
-  Conv2D 的 dilation），输出形状
-  [(H-1)*SH-PT-PB+(KH-1)*DH+1][(W-1)*SW-PL-PR+(KW-1)*DW+1]。
+  Conv2D 的 dilation），groups 为正 int 分组数（默认 1，C 与 O 均须
+  被其整除，weights 第二维须为 O/G，输入通道仅连接同组输出），
+  output_padding 可为非负 int 或 (OPH,OPW) tuple（须 OPH<SH、OPW<SW），
+  输出形状
+  [(H-1)*SH-PT-PB+(KH-1)*DH+1+OPH][(W-1)*SW-PL-PR+(KW-1)*DW+1+OPW]。
 - MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较。
 - AdaptiveAvgPool2D 层：NCHW 嵌套 list、逐通道自适应平均池化，输出尺寸
   为正 int 或 (OH, OW) tuple，分箱区间 [floor(oh*H/OH), ceil((oh+1)*H/OH))，
@@ -494,6 +497,53 @@ def _check_dilation2d(value):
     return (dh_, dw_)
 
 
+def _check_output_padding2d(value, sh_, sw_):
+    """校验转置卷积输出补边：非负 int 或恰含 (OPH, OPW) 的非负 int tuple。
+
+    int 展开为 (OPH, OPH)（双轴同值）；拒绝 bool。整体类型错（含 bool）
+    抛 TypeError，tuple 长度错抛 ValueError，成员类型错（含 bool）抛
+    TypeError，成员为负抛 ValueError，且必须 OPH < SH、OPW < SW，否则
+    抛 ValueError。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, tuple)):
+        raise TypeError(
+            "output_padding 必须是 int 或 tuple，得到 %s"
+            % type(value).__name__
+        )
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("output_padding 必须为非负整数")
+        op_ = (value, value)
+    else:
+        if len(value) != 2:
+            raise ValueError(
+                "output_padding tuple 必须恰含 (OPH, OPW) 两个元素"
+            )
+        op_ = value
+        for member_name, member in (("OPH", op_[0]), ("OPW", op_[1])):
+            if isinstance(member, bool) or not isinstance(member, int):
+                raise TypeError(
+                    "output_padding 的 %s 必须是 int，得到 %s"
+                    % (member_name, type(member).__name__)
+                )
+            if member < 0:
+                raise ValueError(
+                    "output_padding 的 %s 必须为非负整数" % member_name
+                )
+    oph_, opw_ = op_
+    if oph_ >= sh_:
+        raise ValueError(
+            "output_padding 的 OPH %d 必须小于 stride 的 SH %d"
+            % (oph_, sh_)
+        )
+    if opw_ >= sw_:
+        raise ValueError(
+            "output_padding 的 OPW %d 必须小于 stride 的 SW %d"
+            % (opw_, sw_)
+        )
+    return (oph_, opw_)
+
+
 def _check_groups(value):
     """校验 Conv2D 分组数：正 int（拒绝 bool）。
 
@@ -790,10 +840,10 @@ class Conv2D:
 
 
 class ConvTranspose2D:
-    """二维转置卷积层（NCHW，嵌套 list，非对称步幅、四边补边、膨胀核）。
+    """二维转置卷积层（NCHW，嵌套 list，非对称步幅、四边补边、膨胀核、分组）。
 
-    weights: [C][O][KH][KW]（第一维输入通道 C、第二维输出通道 O），
-    bias: [O]，输入 x: [N][C][H][W]。
+    weights: [C][O/G][KH][KW]（第一维输入通道 C、第二维为每组输出通道
+    O/G），bias: [O]，输入 x: [N][C][H][W]。
     stride: 正 int（展开为 (S, S)）或恰含 (SH, SW) 的正 int tuple，
     整体与成员均须为 int 且拒绝 bool；类型错抛 TypeError，长度错或
     成员非正抛 ValueError。
@@ -805,34 +855,57 @@ class ConvTranspose2D:
     整体与成员均须为 int 且拒绝 bool；类型错抛 TypeError，长度错或
     成员非正抛 ValueError。令有效核高宽 EKH=(KH-1)*DH+1、
     EKW=(KW-1)*DW+1。
+    output_padding: 非负 int（展开为 (OPH, OPH)）或恰含 (OPH, OPW)
+    的非负 int tuple，分别在高/宽轴尾部追加输出补边；整体与成员均须为
+    int 且拒绝 bool；类型错（含 bool）抛 TypeError，长度错或成员为负
+    抛 ValueError，且须 OPH < SH、OPW < SW，否则抛 ValueError。
+    groups: 正 int 分组数 G（默认 1，拒绝 bool）；类型错（含 bool）
+    抛 TypeError，非正抛 ValueError。C 与 O 均须被 G 整除，且 weights
+    第二维须恰为 O/G，否则抛 ValueError。输入通道 c 仅连接同组输出
+    通道 [g*O/G, (g+1)*O/G)（g=c//(C/G)），weights[c][oi] 对应输出
+    (c//(C/G))*(O/G)+oi，组间无连接。
     输出形状:
-    [N][O][(H-1)*SH-PT-PB+EKH][(W-1)*SW-PL-PR+EKW]，
-    输出高或宽非正抛 ValueError。每个输出从 bias[o] 起按 c→kh→kw 累加；
-    仅当 (oh+PT-kh*DH) 可被 SH 整除、(ow+PL-kw*DW) 可被 SW 整除，且其商
-    ih、iw 分别落在 [0,H)、[0,W) 内时，加入
-    x[n][c][ih][iw]*weights[c][o][kh][kw]。
+    [N][O][(H-1)*SH-PT-PB+EKH+OPH][(W-1)*SW-PL-PR+EKW+OPW]，
+    输出高或宽非正抛 ValueError。每个输出从 bias[o] 起按组内 c→kh→kw
+    累加；仅当 (oh+PT-kh*DH) 可被 SH 整除、(ow+PL-kw*DW) 可被 SW
+    整除，且其商 ih、iw 分别落在 [0,H)、[0,W) 内时，加入
+    x[n][c][ih][iw]*weights[c][oi][kh][kw]（oi 为 o 在其组内的序号）。
     backward(dy) 返回 (dx, dweights, dbias)，形状依次同 x、weights、
-    bias，均为全新嵌套 list 且不修改任何实参。dx 各元素按 o→kh→kw、
-    dweights 各元素按 n→ih→iw、dbias 各元素按 n→oh→ow 累加，累加
-    坐标与前向完全一致。未成功 forward 前调用 backward、dy 与最近一次
-    成功 forward 的输出不同形，或反向计算产生非有限值，均抛 ValueError。
-    forward 失败时旧缓存原样保留，仅成功 forward 才更新缓存。
+    bias，均为全新嵌套 list 且不修改任何实参，累加严格按组进行、不串组。
+    dx 各元素按组内 o→kh→kw、dweights 各元素按 n→ih→iw、dbias 各元素
+    按 n→oh→ow 累加，累加坐标与前向完全一致。未成功 forward 前调用
+    backward、dy 与最近一次成功 forward 的输出不同形，或反向计算产生
+    非有限值，均抛 ValueError。forward 失败时旧缓存原样保留，仅成功
+    forward 才更新缓存。
     """
 
-    def __init__(self, weights, bias, stride=1, padding=0, dilation=1):
+    def __init__(self, weights, bias, stride=1, padding=0, dilation=1,
+                 output_padding=0, groups=1):
         sh_, sw_ = _check_stride2d(stride)
         pt_, pb_, pl_, pr_ = _check_padding2d(padding)
         dh_, dw_ = _check_dilation2d(dilation)
+        oph_, opw_ = _check_output_padding2d(output_padding, sh_, sw_)
+        g_ = _check_groups(groups)
 
         _require_list(weights, "weights")
         _require_list(bias, "bias")
         w_shape = _shape_of(weights, 4, "weights")
         b_shape = _shape_of(bias, 1, "bias")
-        c_in_, o_ch_, kh_, kw_ = w_shape
-        if b_shape[0] != o_ch_:
+        c_in_, o_per_g_, kh_, kw_ = w_shape
+        o_ch_ = b_shape[0]
+        if o_ch_ % g_ != 0:
             raise ValueError(
-                "bias 长度 %d 与 weights 输出通道数 %d 不符"
-                % (b_shape[0], o_ch_)
+                "bias 输出通道数 %d 不能被 groups %d 整除" % (o_ch_, g_)
+            )
+        if c_in_ % g_ != 0:
+            raise ValueError(
+                "weights 输入通道数 %d 不能被 groups %d 整除"
+                % (c_in_, g_)
+            )
+        if o_per_g_ != o_ch_ // g_:
+            raise ValueError(
+                "weights 第二维 %d 不等于 O/G=%d（O=%d、G=%d）"
+                % (o_per_g_, o_ch_ // g_, o_ch_, g_)
             )
 
         self._weights = weights
@@ -840,24 +913,30 @@ class ConvTranspose2D:
         self._stride = (sh_, sw_)
         self._padding = (pt_, pb_, pl_, pr_)
         self._dilation = (dh_, dw_)
-        self._w_shape = w_shape  # (C, O, KH, KW)
+        self._output_padding = (oph_, opw_)
+        self._groups = g_
+        self._w_shape = w_shape  # (C, O/G, KH, KW)
 
         self._x = None           # 最近一次成功 forward 的输入
         self._out_shape = None   # 最近一次成功 forward 的输出形状
 
     def forward(self, x):
-        """按转置卷积规则计算输出并缓存输入，返回全新嵌套 list。
+        """按分组转置卷积规则计算输出并缓存输入，返回全新嵌套 list。
 
-        输出 [N][O][OH][OW]，OH=(H-1)*SH-PT-PB+EKH、
-        OW=(W-1)*SW-PL-PR+EKW（EKH/EKW 为有效核高宽）；每个输出从
-        bias[o] 起按 c→kh→kw 累加，仅当 (oh+PT-kh*DH)、(ow+PL-kw*DW)
-        分别可被 SH、SW 整除且商 ih、iw 有效时加入乘积。输出高/宽非正
-        或计算出现非有限值抛 ValueError。校验或计算失败不改变实参与
-        旧缓存；成功后才缓存输入与输出形状。
+        输出 [N][O][OH][OW]，
+        OH=(H-1)*SH-PT-PB+EKH+OPH、OW=(W-1)*SW-PL-PR+EKW+OPW
+        （EKH/EKW 为有效核高宽）；每个输出从 bias[o] 起按组内 c→kh→kw
+        累加，仅当 (oh+PT-kh*DH)、(ow+PL-kw*DW) 分别可被 SH、SW 整除
+        且商 ih、iw 有效时加入 x[n][c][ih][iw]*weights[c][oi][kh][kw]
+        （oi 为 o 在其组内的序号），组间无连接。输入通道数与 weights
+        不符、输出高/宽非正或计算出现非有限值抛 ValueError。校验或计算
+        失败不改变实参与旧缓存；成功后才缓存输入与输出形状。
         """
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
-        c_in_, o_ch_, kh_, kw_ = self._w_shape
+        c_in_, o_per_g_, kh_, kw_ = self._w_shape
+        g_ = self._groups
+        o_ch_ = o_per_g_ * g_
         if c_ != c_in_:
             raise ValueError(
                 "输入通道数 %d 与 weights 输入通道数 %d 不符"
@@ -866,10 +945,11 @@ class ConvTranspose2D:
         sh_, sw_ = self._stride
         pt_, pb_, pl_, pr_ = self._padding
         dh_, dw_ = self._dilation
+        oph_, opw_ = self._output_padding
         ekh_ = (kh_ - 1) * dh_ + 1
         ekw_ = (kw_ - 1) * dw_ + 1
-        oh_ = (h_ - 1) * sh_ - pt_ - pb_ + ekh_
-        ow_ = (w_ - 1) * sw_ - pl_ - pr_ + ekw_
+        oh_ = (h_ - 1) * sh_ - pt_ - pb_ + ekh_ + oph_
+        ow_ = (w_ - 1) * sw_ - pl_ - pr_ + ekw_ + opw_
         if oh_ <= 0 or ow_ <= 0:
             raise ValueError(
                 "转置卷积输出尺寸非正：OH=%d、OW=%d" % (oh_, ow_)
@@ -877,18 +957,23 @@ class ConvTranspose2D:
 
         weights = self._weights
         bias = self._bias
+        c_per_g_ = c_in_ // g_
         out = []
         for n in range(n_):
             out_n = []
             x_n = x[n]
             for o in range(o_ch_):
+                g_id = o // o_per_g_
+                oi = o - g_id * o_per_g_
+                c_base = g_id * c_per_g_
                 out_o = []
                 for oh in range(oh_):
                     row = []
                     for ow in range(ow_):
                         acc = bias[o]
-                        for c in range(c_in_):
-                            w_c_o = weights[c][o]
+                        for ci in range(c_per_g_):
+                            c = c_base + ci
+                            w_c_oi = weights[c][oi]
                             x_c = x_n[c]
                             for kh in range(kh_):
                                 num_h = oh + pt_ - kh * dh_
@@ -898,7 +983,7 @@ class ConvTranspose2D:
                                 if ih < 0 or ih >= h_:
                                     continue
                                 x_row = x_c[ih]
-                                w_row = w_c_o[kh]
+                                w_row = w_c_oi[kh]
                                 for kw in range(kw_):
                                     num_w = ow + pl_ - kw * dw_
                                     if num_w % sw_ != 0:
@@ -925,10 +1010,13 @@ class ConvTranspose2D:
 
         dy 的形状必须等于最近一次成功 forward 的输出形状。未成功
         forward 前调用一律抛 ValueError。dx 形状同 x、dweights 形状同
-        weights、dbias 形状同 bias；dx 各元素按 o→kh→kw、dweights
+        weights、dbias 形状同 bias；严格按组累加、不串组：输入通道 c 仅
+        累加同组输出通道的梯度。dx 各元素按组内 o→kh→kw、dweights
         各元素按 n→ih→iw、dbias 各元素按 n→oh→ow 累加，累加坐标
-        oh=ih*SH-PT+kh*DH、ow=iw*SW-PL+kw*DW 与前向完全一致；结果均为
-        全新嵌套 list，不修改实参。计算产生非有限值抛 ValueError。
+        oh=ih*SH-PT+kh*DH、ow=iw*SW-PL+kw*DW 与前向完全一致（输出补边
+        带来的额外输出位置无对应输入坐标，不参与 dx/dweights 累加）；
+        结果均为全新嵌套 list，不修改实参。计算产生非有限值抛
+        ValueError。
         """
         if self._x is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -943,7 +1031,9 @@ class ConvTranspose2D:
         x = self._x
         weights = self._weights
         n_, o_ch_, oh_, ow_ = self._out_shape
-        c_in_, _, kh_, kw_ = self._w_shape
+        c_in_, o_per_g_, kh_, kw_ = self._w_shape
+        g_ = self._groups
+        c_per_g_ = c_in_ // g_
         h_ = len(x[0][0])
         w_ = len(x[0][0][0])
         sh_, sw_ = self._stride
@@ -954,23 +1044,26 @@ class ConvTranspose2D:
         dw = _zeros(self._w_shape)
         db = _zeros((o_ch_,))
 
-        # dx：每个元素按 o→kh→kw 累加；oh=ih*SH-PT+kh*DH、
+        # dx：每个元素按组内 o→kh→kw 累加；oh=ih*SH-PT+kh*DH、
         # ow=iw*SW-PL+kw*DW 落在输出范围内的 (kh,kw) 才有贡献。
         for n in range(n_):
             for c in range(c_in_):
+                g_id = c // c_per_g_
+                o_base = g_id * o_per_g_
                 for ih in range(h_):
                     dx_row = dx[n][c][ih]
                     for iw in range(w_):
                         cell = 0
-                        for o in range(o_ch_):
-                            w_c_o = weights[c][o]
+                        for oi in range(o_per_g_):
+                            o = o_base + oi
+                            w_c_oi = weights[c][oi]
                             dy_o = dy[n][o]
                             for kh in range(kh_):
                                 coh = ih * sh_ - pt_ + kh * dh_
                                 if coh < 0 or coh >= oh_:
                                     continue
                                 dy_row = dy_o[coh]
-                                w_row = w_c_o[kh]
+                                w_row = w_c_oi[kh]
                                 for kw in range(kw_):
                                     cow = iw * sw_ - pl_ + kw * dw_
                                     if 0 <= cow < ow_:
@@ -981,9 +1074,12 @@ class ConvTranspose2D:
                             )
                         dx_row[iw] = cell
 
-        # dweights：每个元素按 n→ih→iw 累加。
+        # dweights：每个元素按 n→ih→iw 累加，只取同组输出 o 的梯度。
         for c in range(c_in_):
-            for o in range(o_ch_):
+            g_id = c // c_per_g_
+            o_base = g_id * o_per_g_
+            for oi in range(o_per_g_):
+                o = o_base + oi
                 for kh in range(kh_):
                     for kw in range(kw_):
                         cell = 0
@@ -1004,7 +1100,7 @@ class ConvTranspose2D:
                                 "转置卷积反向 dweights 计算产生非有限值"
                                 "（NaN/inf）"
                             )
-                        dw[c][o][kh][kw] = cell
+                        dw[c][oi][kh][kw] = cell
 
         # dbias：每个元素按 n→oh→ow 累加。
         for o in range(o_ch_):
