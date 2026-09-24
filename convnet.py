@@ -43,6 +43,8 @@
   0 或 1/(1-p) 通道掩码；推理态原样复制、不推进随机状态、缓存全 1。
 - BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并更新
   running_mean/running_var，推理态使用运行统计仿射。
+- GroupNorm2D 层：NCHW 嵌套 list，按样本分组归一化；每组含 (C/G)*H*W
+  项，无训练/推理之分，不维护运行统计。
 - SoftmaxCrossEntropy 层：二维 logits [N][K] 与 labels [N] 的加权
   softmax 交叉熵损失（可选 label_smoothing、class_weights、
   ignore_index），反向返回对 logits 的梯度（被忽略标签行为全 0）。
@@ -2864,6 +2866,254 @@ class BatchNorm2D:
         return dx, dgamma, dbeta
 
 
+class GroupNorm2D:
+    """二维组归一化层（NCHW，嵌套 list，无训练/推理之分）。
+
+    num_groups: 正 int 分组数 G（拒绝 bool），须整除通道数 C。
+    gamma、beta: 等长非空一维 list，元素为有限 int/float（拒绝 bool）；
+    长度 C 即通道数。eps: 正的有限 int/float（拒绝 bool），默认 1e-5。
+
+    每个样本的每组含 M=(C/G)*H*W 项，按 c→h→w 顺序求
+    μ = Σx/M，v = Σ(x-μ)^2/M（总体方差），z = (x-μ)/sqrt(v+eps)，
+    输出 y = gamma[c]*z + beta[c]；仅成功时缓存 z、v 与输出形状。
+    backward 返回 (dx, dgamma, dbeta)，使用最近一次成功 forward 的缓存：
+    令 u = dy*gamma，在每个样本组内求 A = Σu、B = Σ(u*z)，
+    dx = (u - (A + z*B)/M) / sqrt(v+eps)，
+    dgamma、dbeta 按 n→h→w 逐通道累加 dy*z、dy，
+    形状依次同 x、gamma、beta。
+    """
+
+    def __init__(self, num_groups, gamma, beta, eps=1e-5):
+        if isinstance(num_groups, bool) or not isinstance(num_groups, int):
+            raise TypeError(
+                "num_groups 必须是 int，得到 %s" % type(num_groups).__name__
+            )
+        if num_groups <= 0:
+            raise ValueError("num_groups 必须为正整数")
+        _require_list(gamma, "gamma")
+        _require_list(beta, "beta")
+        g_shape = _shape_of_strict(gamma, 1, "gamma")
+        b_shape = _shape_of_strict(beta, 1, "beta")
+        if b_shape[0] != g_shape[0]:
+            raise ValueError(
+                "beta 长度 %d 与 gamma 长度 %d 不符"
+                % (b_shape[0], g_shape[0])
+            )
+        if g_shape[0] % num_groups != 0:
+            raise ValueError(
+                "num_groups %d 不能整除通道数 %d"
+                % (num_groups, g_shape[0])
+            )
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+            raise TypeError(
+                "eps 必须是 int/float（拒绝 bool），得到 %s"
+                % type(eps).__name__
+            )
+        if not math.isfinite(eps):
+            raise ValueError("eps 必须是有限值（拒绝 NaN/inf）")
+        if eps <= 0:
+            raise ValueError("eps 必须为正数")
+
+        self._num_groups = num_groups
+        self._gamma = gamma
+        self._beta = beta
+        self._eps = eps
+
+        self._z = None           # 最近一次成功 forward 缓存的归一化值 z
+        self._var = None         # 最近一次成功 forward 缓存的每组方差 v
+        self._out_shape = None   # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 按样本分组归一化，返回同形新 list。
+
+        仅成功时缓存 z、v 与输出形状；校验或计算失败不改变实参与旧缓存。
+        """
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of_strict(x, 4, "x")
+        if c_ != len(self._gamma):
+            raise ValueError(
+                "输入通道数 %d 与 gamma/beta 长度 %d 不符"
+                % (c_, len(self._gamma))
+            )
+
+        gamma = self._gamma
+        beta = self._beta
+        eps = self._eps
+        g_ = self._num_groups
+        cpg = c_ // g_
+        m_ = cpg * h_ * w_
+
+        out = []
+        z_cache = []
+        var_cache = []
+        for n in range(n_):
+            x_n = x[n]
+            out_n = []
+            z_n = []
+            var_n = []
+            for g in range(g_):
+                acc = 0.0
+                for ci in range(cpg):
+                    x_c = x_n[g * cpg + ci]
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        for ww in range(w_):
+                            acc += x_row[ww]
+                mu = acc / m_
+                sq = 0.0
+                for ci in range(cpg):
+                    x_c = x_n[g * cpg + ci]
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        for ww in range(w_):
+                            d = x_row[ww] - mu
+                            sq += d * d
+                v = sq / m_
+                inv = 1.0 / math.sqrt(v + eps)
+                var_n.append(v)
+                for ci in range(cpg):
+                    c = g * cpg + ci
+                    gc = gamma[c]
+                    bc = beta[c]
+                    x_c = x_n[c]
+                    out_c = []
+                    z_c = []
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        out_row = []
+                        z_row = []
+                        for ww in range(w_):
+                            zval = (x_row[ww] - mu) * inv
+                            z_row.append(zval)
+                            out_row.append(gc * zval + bc)
+                        z_c.append(z_row)
+                        out_c.append(out_row)
+                    z_n.append(z_c)
+                    out_n.append(out_c)
+            out.append(out_n)
+            z_cache.append(z_n)
+            var_cache.append(var_n)
+
+        for n in range(n_):
+            for g in range(g_):
+                if not math.isfinite(var_cache[n][g]):
+                    raise ValueError("前向计算产生非有限值（NaN/inf）")
+        for n in range(n_):
+            for c in range(c_):
+                for hh in range(h_):
+                    for ww in range(w_):
+                        yval = out[n][c][hh][ww]
+                        zval = z_cache[n][c][hh][ww]
+                        if not (math.isfinite(yval) and math.isfinite(zval)):
+                            raise ValueError("前向计算产生非有限值（NaN/inf）")
+
+        self._z = z_cache
+        self._var = var_cache
+        self._out_shape = (n_, c_, h_, w_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回 (dx, dgamma, dbeta)。
+
+        形状依次同 x、gamma、beta；使用最近一次成功 forward 的缓存，
+        dy 的形状必须等于该次 forward 的输出形状。
+        尚无成功 forward 缓存时调用一律抛 ValueError。
+        """
+        if self._z is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of_strict(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, h_, w_ = self._out_shape
+        gamma = self._gamma
+        eps = self._eps
+        z_cache = self._z
+        var_cache = self._var
+        g_ = self._num_groups
+        cpg = c_ // g_
+        m_ = cpg * h_ * w_
+
+        dgamma = [0.0] * c_
+        dbeta = [0.0] * c_
+        u_cache = []
+        for n in range(n_):
+            dy_n = dy[n]
+            z_n = z_cache[n]
+            u_n = []
+            for c in range(c_):
+                gc = gamma[c]
+                dy_c = dy_n[c]
+                z_c = z_n[c]
+                sg = 0.0
+                sb = 0.0
+                u_c = []
+                for hh in range(h_):
+                    dy_row = dy_c[hh]
+                    z_row = z_c[hh]
+                    u_row = []
+                    for ww in range(w_):
+                        g = dy_row[ww]
+                        sb += g
+                        sg += g * z_row[ww]
+                        u_row.append(g * gc)
+                    u_c.append(u_row)
+                dgamma[c] += sg
+                dbeta[c] += sb
+                u_n.append(u_c)
+            u_cache.append(u_n)
+
+        dx = []
+        inv_m = 1.0 / m_
+        for n in range(n_):
+            u_n = u_cache[n]
+            z_n = z_cache[n]
+            dx_n = []
+            for g in range(g_):
+                a_sum = 0.0
+                b_sum = 0.0
+                for ci in range(cpg):
+                    u_c = u_n[g * cpg + ci]
+                    z_c = z_n[g * cpg + ci]
+                    for hh in range(h_):
+                        u_row = u_c[hh]
+                        z_row = z_c[hh]
+                        for ww in range(w_):
+                            uval = u_row[ww]
+                            a_sum += uval
+                            b_sum += uval * z_row[ww]
+                inv = 1.0 / math.sqrt(var_cache[n][g] + eps)
+                for ci in range(cpg):
+                    u_c = u_n[g * cpg + ci]
+                    z_c = z_n[g * cpg + ci]
+                    dx_c = []
+                    for hh in range(h_):
+                        u_row = u_c[hh]
+                        z_row = z_c[hh]
+                        dx_row = []
+                        for ww in range(w_):
+                            corr = (a_sum + z_row[ww] * b_sum) * inv_m
+                            dx_row.append((u_row[ww] - corr) * inv)
+                        dx_c.append(dx_row)
+                    dx_n.append(dx_c)
+            dx.append(dx_n)
+
+        for c in range(c_):
+            if not (math.isfinite(dgamma[c]) and math.isfinite(dbeta[c])):
+                raise ValueError("反向计算产生非有限值（NaN/inf）")
+        for n in range(n_):
+            for c in range(c_):
+                for hh in range(h_):
+                    for ww in range(w_):
+                        if not math.isfinite(dx[n][c][hh][ww]):
+                            raise ValueError("反向计算产生非有限值（NaN/inf）")
+        return dx, dgamma, dbeta
+
+
 class SoftmaxCrossEntropy:
     """Softmax + 交叉熵损失层（限二维 logits [N][K]，labels [N]）。
 
@@ -3128,11 +3378,12 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验层的前向/反向实现。
 
     layer 限 Conv2D/ConvTranspose2D/MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/
-    AdaptiveMaxPool2D/Flatten/Linear/ReLU/Dropout/Dropout2D/BatchNorm2D
+    AdaptiveMaxPool2D/Flatten/Linear/ReLU/Dropout/Dropout2D/BatchNorm2D/
+    GroupNorm2D
     实例，其余抛 TypeError。解析梯度 a 取自原值 forward(x) 后 backward(dy)
     的对应返回：Conv2D/ConvTranspose2D/Linear 还包含 dweights、dbias，按
-    x、weights、bias 顺序检查 dx、dweights、dbias；BatchNorm2D 按 x、
-    gamma、beta 顺序检查 dx、dgamma、dbeta；MaxPool2D/AvgPool2D/
+    x、weights、bias 顺序检查 dx、dweights、dbias；BatchNorm2D/GroupNorm2D
+    按 x、gamma、beta 顺序检查 dx、dgamma、dbeta；MaxPool2D/AvgPool2D/
     AdaptiveAvgPool2D/AdaptiveMaxPool2D/Flatten/ReLU/Dropout/Dropout2D
     只检查 x。
     AdaptiveMaxPool2D 的任一次前向中任一分箱并列最大一律抛 ValueError
@@ -3143,6 +3394,8 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
 
     BatchNorm2D 仅在训练态检查，推理态一律抛 ValueError；每次数值前向都
     重新按当前批次统计（gamma/beta 扰动不影响归一化值 z）。
+    GroupNorm2D 无训练/推理之分，每次数值前向都重新按当前样本分组统计
+    （gamma/beta 扰动不影响归一化值 z）。
     Dropout/Dropout2D 训练态以入口随机状态 _s 为基准：解析梯度前向及每次
     正、负扰动前向之前都把 _s 恢复为入口值，使各次前向重放同一掩码
     （Dropout2D 的通道掩码按 n→c 推进），故同一入口状态结果确定；推理态
@@ -3158,19 +3411,19 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     完全沿用对应层的 forward/backward（容器/标量类型错抛 TypeError，
     形状、层级、空维、不规则或非有限错误抛 ValueError）；
     计算产生非有限值抛 ValueError。x、dy、参数、训练/推理模式、Dropout/
-    Dropout2D 随机状态与掩码、BatchNorm2D 运行统计与旧缓存在所有成功或
-    异常路径均原样恢复，实参内容不变。
+    Dropout2D 随机状态与掩码、BatchNorm2D 运行统计、BatchNorm2D/
+    GroupNorm2D 旧缓存在所有成功或异常路径均原样恢复，实参内容不变。
     """
     if not isinstance(
         layer,
         (Conv2D, ConvTranspose2D, MaxPool2D, AvgPool2D, AdaptiveAvgPool2D,
          AdaptiveMaxPool2D, Flatten, Linear, ReLU, Dropout, Dropout2D,
-         BatchNorm2D),
+         BatchNorm2D, GroupNorm2D),
     ):
         raise TypeError(
             "layer 必须是 Conv2D/ConvTranspose2D/MaxPool2D/AvgPool2D/"
             "AdaptiveAvgPool2D/AdaptiveMaxPool2D/Flatten/Linear/ReLU/"
-            "Dropout/Dropout2D/BatchNorm2D 实例，得到 %s"
+            "Dropout/Dropout2D/BatchNorm2D/GroupNorm2D 实例，得到 %s"
             % type(layer).__name__
         )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
@@ -3189,6 +3442,7 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
         raise ValueError("rtol 必须为非负数")
 
     is_batchnorm = isinstance(layer, BatchNorm2D)
+    is_groupnorm = isinstance(layer, GroupNorm2D)
     is_dropout = isinstance(layer, (Dropout, Dropout2D))
     is_adaptive_maxpool = isinstance(layer, AdaptiveMaxPool2D)
     if is_batchnorm and not layer._training:
@@ -3212,7 +3466,7 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
                 ("weights", layer._weights, dw),
                 ("bias", layer._bias, db),
             )
-        elif is_batchnorm:
+        elif is_batchnorm or is_groupnorm:
             dx, dgamma, dbeta = grad
             targets = (
                 ("x", x, dx),
