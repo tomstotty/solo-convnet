@@ -38,6 +38,9 @@
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
 - Dropout 层：NCHW 嵌套 list，训练态按概率 p 置零并放大保留项，推理态原样复制。
+- Dropout2D 层：NCHW 嵌套 list 的整通道 dropout，训练态按 n→c 每通道一次
+  LCG 抽样，u<p 时整通道置 0、否则整通道除以 (1-p)，缓存 [N][C] 的
+  0 或 1/(1-p) 通道掩码；推理态原样复制、不推进随机状态、缓存全 1。
 - BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并更新
   running_mean/running_var，推理态使用运行统计仿射。
 - SoftmaxCrossEntropy 层：二维 logits [N][K] 与 labels [N] 的加权
@@ -365,6 +368,31 @@ def _shape_of(node, depth, name):
     sub = _shape_of(node[0], depth - 1, name)
     for child in node[1:]:
         if _shape_of(child, depth - 1, name) != sub:
+            raise ValueError("%s 的形状不规则（各子列表长度必须一致）" % name)
+    return (len(node),) + sub
+
+
+def _shape_of_strict(node, depth, name):
+    """校验嵌套 list 张量并返回形状 tuple（容器类型错误一律 TypeError）。
+
+    与 _shape_of 同样要求各维非空、形状规则（矩形）、叶值为有限
+    int/float（拒绝 bool）；区别在于任一层级期望 list 却得到其他容器或
+    标量时抛 TypeError（而非 ValueError）：层级不足、空维、形状不规则、
+    标量位置出现 list（层级过深）或非有限值仍抛 ValueError，标量类型错
+    （如 str/bool）抛 TypeError。
+    """
+    if depth == 0:
+        _check_element(node, name)
+        return ()
+    if not isinstance(node, list):
+        raise TypeError(
+            "%s 必须是嵌套 list，得到 %s" % (name, type(node).__name__)
+        )
+    if len(node) == 0:
+        raise ValueError("%s 存在空维度" % name)
+    sub = _shape_of_strict(node[0], depth - 1, name)
+    for child in node[1:]:
+        if _shape_of_strict(child, depth - 1, name) != sub:
             raise ValueError("%s 的形状不规则（各子列表长度必须一致）" % name)
     return (len(node),) + sub
 
@@ -2370,6 +2398,174 @@ class Dropout:
         return dx
 
 
+class Dropout2D:
+    """二维通道 Dropout 层（NCHW，嵌套 list）：训练态整通道置零并放大保留通道。
+
+    p: 丢弃概率，[0, 1) 的有限 int/float（拒绝 bool）。
+    seed: 随机种子，[0, 2^32-1] 的 int（拒绝 bool）；随机状态 s 初始为 seed。
+    默认训练态；train(mode) 切换模式，mode 仅接收 bool 并返回 None。
+
+    训练前向按 n→c 顺序【每个通道一次】推进线性同余发生器：
+    s = (1664525*s + 1013904223) % 2^32，u = s / 2^32；
+    u < p 时该 (n, c) 整通道全部置 0，否则整通道每个元素除以 (1-p)；
+    同时缓存形状 [N][C] 的逐通道掩码，取 0 或 1/(1-p)。
+    推理前向返回 x 的新副本，不推进 s，缓存 [N][C] 的全 1 掩码。
+    backward 要求 dy 与最近一次成功 forward 的输出同形（并沿用 x 的校验
+    规则），返回 dy 与按通道广播的掩码逐元素相乘的新 list。
+    未成功执行 forward 前调用 backward 一律抛 ValueError。
+    不读写全局 random 状态；相同 seed、输入与调用序列结果完全相同。
+    校验或计算失败不改变实参、随机状态 s 与旧缓存。
+    """
+
+    def __init__(self, p=0.5, seed=0):
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise TypeError(
+                "p 必须是 int/float（拒绝 bool），得到 %s" % type(p).__name__
+            )
+        # 先按类型分支：超大整数 math.isfinite 会抛 OverflowError，而范围
+        # 比较为精确整数运算，故 int 先查范围（[0,1) 内仅 0，必有限），
+        # float 先查有限性再查范围，统一不外泄 OverflowError。
+        if isinstance(p, int):
+            if p < 0 or p >= 1:
+                raise ValueError("p 必须满足 0 <= p < 1")
+        else:
+            if not math.isfinite(p):
+                raise ValueError("p 必须是有限值（拒绝 NaN/inf）")
+            if p < 0 or p >= 1:
+                raise ValueError("p 必须满足 0 <= p < 1")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(
+                "seed 必须是 int（拒绝 bool），得到 %s" % type(seed).__name__
+            )
+        if seed < 0 or seed > 0xFFFFFFFF:
+            raise ValueError("seed 必须满足 0 <= seed <= 2^32-1")
+
+        self._p = p
+        self._seed = seed
+        self._s = seed          # 当前随机状态
+        self._training = True   # 默认训练态
+
+        self._mask = None       # 最近一次成功 forward 的 [N][C] 通道掩码
+        self._out_shape = None  # 最近一次成功 forward 的输出形状
+
+    def train(self, mode=True):
+        """切换训练/推理模式并返回 None；mode 仅接收 bool，否则抛 TypeError。"""
+        if not isinstance(mode, bool):
+            raise TypeError(
+                "mode 必须是 bool，得到 %s" % type(mode).__name__
+            )
+        self._training = mode
+        return None
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 逐通道施加 dropout，返回新 list 并缓存掩码。
+
+        训练态按 n→c 逐通道推进内部随机状态；推理态返回 x 的新副本且不
+        推进随机状态。校验或计算失败不改变实参、随机状态与旧缓存。
+        """
+        n_, c_, h_, w_ = _shape_of_strict(x, 4, "x")
+
+        p = self._p
+        if self._training:
+            scale = 1 / (1 - p)
+            s = self._s
+            out = []
+            mask = []
+            try:
+                for n in range(n_):
+                    out_n = []
+                    mask_n = []
+                    for c in range(c_):
+                        s = (1664525 * s + 1013904223) % 4294967296
+                        u = s / 4294967296
+                        if u < p:
+                            m = 0
+                        else:
+                            m = scale
+                        mask_n.append(m)
+                        x_c = x[n][c]
+                        out_c = []
+                        for hh in range(h_):
+                            x_row = x_c[hh]
+                            if m == 0:
+                                out_c.append([0] * w_)
+                            else:
+                                out_c.append(
+                                    [x_row[w] / (1 - p) for w in range(w_)]
+                                )
+                        out_n.append(out_c)
+                    out.append(out_n)
+                    mask.append(mask_n)
+            except OverflowError:
+                # 超大整数除以浮点 (1-p) 会抛 OverflowError，统一按非有限
+                # 计算以 ValueError 拒绝，不向上泄漏 OverflowError。
+                raise ValueError("前向计算产生非有限值（超大整数）")
+            for n in range(n_):
+                for c in range(c_):
+                    if not math.isfinite(mask[n][c]):
+                        raise ValueError("前向计算产生非有限值（NaN/inf）")
+                    for hh in range(h_):
+                        for w in range(w_):
+                            if not math.isfinite(out[n][c][hh][w]):
+                                raise ValueError(
+                                    "前向计算产生非有限值（NaN/inf）"
+                                )
+            # 全部校验与计算成功后才提交随机状态与缓存。
+            self._s = s
+        else:
+            out = _deep_copy(x)
+            mask = [[1] * c_ for _ in range(n_)]
+
+        self._mask = mask
+        self._out_shape = (n_, c_, h_, w_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回与按通道广播的掩码逐元素相乘的新 list。
+
+        dy 必须为与最近一次成功 forward 的输出同形的非空规则嵌套
+        list[N][C][H][W]（容器/标量类型、层级、空维、不规则与非有限校验
+        与 forward 的 x 完全一致）；未成功 forward 前调用或形状不符一律
+        抛 ValueError。
+        """
+        if self._mask is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        n_, c_, h_, w_ = _shape_of_strict(dy, 4, "dy")
+        if (n_, c_, h_, w_) != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % ((n_, c_, h_, w_), self._out_shape)
+            )
+
+        mask = self._mask
+        dx = []
+        try:
+            for n in range(n_):
+                dx_n = []
+                for c in range(c_):
+                    m = mask[n][c]
+                    dy_c = dy[n][c]
+                    dx_c = []
+                    for hh in range(h_):
+                        dy_row = dy_c[hh]
+                        dx_row = []
+                        for w in range(w_):
+                            val = dy_row[w] * m
+                            if not math.isfinite(val):
+                                raise ValueError(
+                                    "反向计算产生非有限值（NaN/inf）"
+                                )
+                            dx_row.append(val)
+                        dx_c.append(dx_row)
+                    dx_n.append(dx_c)
+                dx.append(dx_n)
+        except OverflowError:
+            # 超大整数乘浮点掩码或经 math.isfinite 转换会抛 OverflowError，
+            # 统一按非有限计算以 ValueError 拒绝，不向上泄漏 OverflowError。
+            raise ValueError("反向计算产生非有限值（超大整数）")
+        return dx
+
+
 class BatchNorm2D:
     """二维批归一化层（NCHW，嵌套 list，训练/推理两态）。
 
@@ -2784,8 +2980,6 @@ class SoftmaxCrossEntropy:
         valid_count = 0
         for n in range(n_):
             label = labels[n]
-            if isinstance(label, list):
-                raise ValueError("labels 的层级过深：标量位置出现了 list")
             if isinstance(label, bool) or not isinstance(label, int):
                 raise TypeError(
                     "labels 的元素必须是 int（拒绝 bool），得到 %s"
@@ -2926,12 +3120,13 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验层的前向/反向实现。
 
     layer 限 Conv2D/ConvTranspose2D/MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/
-    AdaptiveMaxPool2D/Flatten/Linear/ReLU/Dropout/BatchNorm2D 实例，其余抛
-    TypeError。解析梯度 a 取自原值 forward(x) 后 backward(dy) 的对应返回：
-    Conv2D/ConvTranspose2D/Linear 还包含 dweights、dbias，按 x、
-    weights、bias 顺序检查 dx、dweights、dbias；BatchNorm2D 按 x、
+    AdaptiveMaxPool2D/Flatten/Linear/ReLU/Dropout/Dropout2D/BatchNorm2D
+    实例，其余抛 TypeError。解析梯度 a 取自原值 forward(x) 后 backward(dy)
+    的对应返回：Conv2D/ConvTranspose2D/Linear 还包含 dweights、dbias，按
+    x、weights、bias 顺序检查 dx、dweights、dbias；BatchNorm2D 按 x、
     gamma、beta 顺序检查 dx、dgamma、dbeta；MaxPool2D/AvgPool2D/
-    AdaptiveAvgPool2D/AdaptiveMaxPool2D/Flatten/ReLU/Dropout 只检查 x。
+    AdaptiveAvgPool2D/AdaptiveMaxPool2D/Flatten/ReLU/Dropout/Dropout2D
+    只检查 x。
     AdaptiveMaxPool2D 的任一次前向中任一分箱并列最大一律抛 ValueError
     ——max 在并列点梯度无定义（解析梯度前向与每次正、负扰动前向均检测）。
     对每个标量 v，定义标量损失 L：acc=0.0，按输出嵌套索引从外到内递增
@@ -2940,9 +3135,10 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
 
     BatchNorm2D 仅在训练态检查，推理态一律抛 ValueError；每次数值前向都
     重新按当前批次统计（gamma/beta 扰动不影响归一化值 z）。
-    Dropout 训练态以入口随机状态 _s 为基准：解析梯度前向及每次正、负
-    扰动前向之前都把 _s 恢复为入口值，使各次前向重放同一掩码，故同一
-    入口状态结果确定；推理态不推进随机状态，按恒等映射检查。
+    Dropout/Dropout2D 训练态以入口随机状态 _s 为基准：解析梯度前向及每次
+    正、负扰动前向之前都把 _s 恢复为入口值，使各次前向重放同一掩码
+    （Dropout2D 的通道掩码按 n→c 推进），故同一入口状态结果确定；推理态
+    不推进随机状态，按恒等映射检查。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -2951,20 +3147,22 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     校验顺序固定为 layer、eps/atol/rtol、BatchNorm2D 模式、forward(x)、
     backward(dy)：layer 或数值参数类型错抛 TypeError；BatchNorm2D 推理态、
     eps 非正、容差为负或任一参数非有限抛 ValueError；x、dy 的校验及异常
-    完全沿用对应层的 forward/backward（形状或非有限错误抛 ValueError）；
-    计算产生非有限值抛 ValueError。x、dy、参数、训练/推理模式、Dropout
-    随机状态与掩码、BatchNorm2D 运行统计与旧缓存在所有成功或异常路径均
-    原样恢复，实参内容不变。
+    完全沿用对应层的 forward/backward（容器/标量类型错抛 TypeError，
+    形状、层级、空维、不规则或非有限错误抛 ValueError）；
+    计算产生非有限值抛 ValueError。x、dy、参数、训练/推理模式、Dropout/
+    Dropout2D 随机状态与掩码、BatchNorm2D 运行统计与旧缓存在所有成功或
+    异常路径均原样恢复，实参内容不变。
     """
     if not isinstance(
         layer,
         (Conv2D, ConvTranspose2D, MaxPool2D, AvgPool2D, AdaptiveAvgPool2D,
-         AdaptiveMaxPool2D, Flatten, Linear, ReLU, Dropout, BatchNorm2D),
+         AdaptiveMaxPool2D, Flatten, Linear, ReLU, Dropout, Dropout2D,
+         BatchNorm2D),
     ):
         raise TypeError(
             "layer 必须是 Conv2D/ConvTranspose2D/MaxPool2D/AvgPool2D/"
             "AdaptiveAvgPool2D/AdaptiveMaxPool2D/Flatten/Linear/ReLU/"
-            "Dropout/BatchNorm2D 实例，得到 %s"
+            "Dropout/Dropout2D/BatchNorm2D 实例，得到 %s"
             % type(layer).__name__
         )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
@@ -2983,7 +3181,7 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
         raise ValueError("rtol 必须为非负数")
 
     is_batchnorm = isinstance(layer, BatchNorm2D)
-    is_dropout = isinstance(layer, Dropout)
+    is_dropout = isinstance(layer, (Dropout, Dropout2D))
     is_adaptive_maxpool = isinstance(layer, AdaptiveMaxPool2D)
     if is_batchnorm and not layer._training:
         raise ValueError("BatchNorm2D 仅在训练态支持梯度检查")
@@ -2991,7 +3189,8 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     saved_state = dict(layer.__dict__)
     dropout_entry_s = layer._s if is_dropout else None
     try:
-        # Dropout 训练态：解析梯度前向先回到入口随机状态，掩码随后可重放。
+        # Dropout/Dropout2D 训练态：解析梯度前向先回到入口随机状态，
+        # 掩码随后可重放。
         if is_dropout and layer._training:
             layer._s = dropout_entry_s
         layer.forward(x)  # x 的校验沿用该层 forward
@@ -3014,7 +3213,7 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
             )
         else:
             # MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/AdaptiveMaxPool2D/
-            # Flatten/ReLU/Dropout（训练态与推理态）只检查 x。
+            # Flatten/ReLU/Dropout/Dropout2D（训练态与推理态）只检查 x。
             targets = (("x", x, grad),)
 
         def loss(x_arg):
@@ -15160,6 +15359,7 @@ def main(argv):
     print("              Linear(weights, bias)")
     print("              ReLU()")
     print("              Dropout(p=0.5, seed=0)")
+    print("              Dropout2D(p=0.5, seed=0)")
     print("              BatchNorm2D(gamma, beta, eps=1e-5, momentum=0.1)")
     return 0
 
