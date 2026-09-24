@@ -31,6 +31,9 @@
 - AdaptiveAvgPool2D 层：NCHW 嵌套 list、逐通道自适应平均池化，输出尺寸
   为正 int 或 (OH, OW) tuple，分箱区间 [floor(oh*H/OH), ceil((oh+1)*H/OH))，
   OH/OW 可大于 H/W。
+- AdaptiveMaxPool2D 层：NCHW 嵌套 list、逐通道自适应最大池化，输出尺寸
+  为正 int 或 (OH, OW) tuple，分箱区间同 AdaptiveAvgPool2D，箱内按
+  ih→iw 扫描取最大值（并列取首个坐标），OH/OW 可大于 H/W。
 - Flatten 层：NCHW 嵌套 list 展平为 [N][C*H*W]（按 c→h→w 顺序）。
 - Linear 层：全连接，weights [O][I]、bias [O]，输入 [N][I] 输出 [N][O]。
 - ReLU 层：逐元素 max(0, v)，限二维 [N][D]。
@@ -1850,6 +1853,128 @@ class AdaptiveAvgPool2D:
         return dx
 
 
+class AdaptiveMaxPool2D:
+    """二维自适应最大池化层（NCHW，嵌套 list，逐通道池化）。
+
+    output_size: 正 int（双轴同值，展开为 (O, O)）或恰含 (OH, OW) 的
+    正 int tuple（拒绝 bool）。整体类型错抛 TypeError，tuple 长度错或
+    成员非正抛 ValueError，成员类型错（含 bool）抛 TypeError。
+    输入 x: [N][C][H][W]，输出: [N][C][OH][OW]。输出位置 oh 的输入
+    区间为 [floor(oh*H/OH), ceil((oh+1)*H/OH))，ow 同理；每个区间至少
+    含一个元素，故 OH/OW 可以大于 H/W（此时部分区间长度为 1，且同一
+    输入坐标可被相邻区间重复覆盖）。分箱内按 ih→iw 扫描取最大值，
+    并列最大只取首个坐标。
+    """
+
+    def __init__(self, output_size):
+        oh_, ow_ = _check_output_size2d(output_size, "output_size")
+        self._output_size = (oh_, ow_)
+
+        self._x_shape = None    # 最近一次成功 forward 的输入形状
+        self._out_shape = None  # 最近一次成功 forward 的输出形状
+        self._winners = None    # 每个输出位置的最大值来源 (ih, iw)
+
+    def _bins(self, length, out_len):
+        """输出轴每个位置覆盖的输入 [起, 止) 区间。"""
+        return [
+            (
+                (i * length) // out_len,
+                -((-(i + 1) * length) // out_len),
+            )
+            for i in range(out_len)
+        ]
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 做自适应最大池化，返回新 list 并缓存获胜位置。
+
+        仅在全部分箱扫描完成后才更新缓存：任何失败都保留旧缓存，且不
+        修改实参 x。
+        """
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of(x, 4, "x")
+        oh_, ow_ = self._output_size
+        h_bins = self._bins(h_, oh_)
+        w_bins = self._bins(w_, ow_)
+
+        out = []
+        winners = []
+        for n in range(n_):
+            out_n = []
+            win_n = []
+            for c in range(c_):
+                x_c = x[n][c]
+                out_c = []
+                win_c = []
+                for ih0, ih1 in h_bins:
+                    row = []
+                    win_row = []
+                    for iw0, iw1 in w_bins:
+                        best = None
+                        best_pos = None
+                        for ih in range(ih0, ih1):
+                            x_row = x_c[ih]
+                            for iw in range(iw0, iw1):
+                                v = x_row[iw]
+                                if best is None or v > best:
+                                    best = v
+                                    best_pos = (ih, iw)
+                        row.append(best)
+                        win_row.append(best_pos)
+                    out_c.append(row)
+                    win_c.append(win_row)
+                out_n.append(out_c)
+                win_n.append(win_c)
+            out.append(out_n)
+            winners.append(win_n)
+
+        self._x_shape = (n_, c_, h_, w_)
+        self._out_shape = (n_, c_, oh_, ow_)
+        self._winners = winners
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回与输入同形状的新 list dx。
+
+        dy 的形状必须等于最近一次成功 forward 的输出形状；梯度按
+        n→c→oh→ow 顺序累加到 forward 记录的获胜坐标（分箱可重叠，
+        同一输入坐标可收到多份梯度）。未成功 forward 前调用、dy 形状
+        错或累加产生非有限值一律抛 ValueError。
+        """
+        if self._winners is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, oh_, ow_ = self._out_shape
+        dx = _zeros(self._x_shape)
+        winners = self._winners
+        for n in range(n_):
+            for c in range(c_):
+                dx_c = dx[n][c]
+                dy_c = dy[n][c]
+                win_c = winners[n][c]
+                for oh in range(oh_):
+                    dy_row = dy_c[oh]
+                    win_row = win_c[oh]
+                    for ow in range(ow_):
+                        ih, iw = win_row[ow]
+                        cell = dx_c[ih][iw] + dy_row[ow]
+                        if (
+                            isinstance(cell, float)
+                            and not math.isfinite(cell)
+                        ):
+                            raise ValueError(
+                                "池化反向梯度计算产生非有限值（NaN/inf）"
+                            )
+                        dx_c[ih][iw] = cell
+        return dx
+
+
 class Flatten:
     """展平层：将 [N][C][H][W] 按 c→h→w 顺序展平为 [N][C*H*W]。
 
@@ -2632,12 +2757,15 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验层的前向/反向实现。
 
     layer 限 Conv2D/ConvTranspose2D/MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/
-    Flatten/Linear/ReLU/Dropout/BatchNorm2D 实例，其余抛 TypeError。解析
+    AdaptiveMaxPool2D/Flatten/Linear/ReLU/Dropout/BatchNorm2D 实例，其余抛
+    TypeError。解析
     梯度 a 取自原值 forward(x) 后 backward(dy) 的对应返回：
     Conv2D/ConvTranspose2D/Linear 还包含 dweights、dbias，按 x、
     weights、bias 顺序检查 dx、dweights、dbias；BatchNorm2D 按 x、
     gamma、beta 顺序检查 dx、dgamma、dbeta；MaxPool2D/AvgPool2D/
-    AdaptiveAvgPool2D/Flatten/ReLU/Dropout 只检查 x。
+    AdaptiveAvgPool2D/AdaptiveMaxPool2D/Flatten/ReLU/Dropout 只检查 x。
+    AdaptiveMaxPool2D 任一分箱并列最大（max 梯度在该点无定义）一律抛
+    ValueError。
     对每个标量 v，定义标量损失 L：acc=0.0，按输出嵌套索引从外到内递增
     执行 acc += y*dy（y 为前向输出），数值梯度
     n = (L(v+eps) - L(v-eps)) / (2*eps)，各目标内部标量按嵌套序遍历。
@@ -2663,12 +2791,12 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     if not isinstance(
         layer,
         (Conv2D, ConvTranspose2D, MaxPool2D, AvgPool2D, AdaptiveAvgPool2D,
-         Flatten, Linear, ReLU, Dropout, BatchNorm2D),
+         AdaptiveMaxPool2D, Flatten, Linear, ReLU, Dropout, BatchNorm2D),
     ):
         raise TypeError(
             "layer 必须是 Conv2D/ConvTranspose2D/MaxPool2D/AvgPool2D/"
-            "AdaptiveAvgPool2D/Flatten/Linear/ReLU/Dropout/BatchNorm2D "
-            "实例，得到 %s"
+            "AdaptiveAvgPool2D/AdaptiveMaxPool2D/Flatten/Linear/ReLU/"
+            "Dropout/BatchNorm2D 实例，得到 %s"
             % type(layer).__name__
         )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
@@ -2688,6 +2816,7 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
 
     is_batchnorm = isinstance(layer, BatchNorm2D)
     is_dropout = isinstance(layer, Dropout)
+    is_adaptive_max = isinstance(layer, AdaptiveMaxPool2D)
     if is_batchnorm and not layer._training:
         raise ValueError("BatchNorm2D 仅在训练态支持梯度检查")
 
@@ -2698,6 +2827,9 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
         if is_dropout and layer._training:
             layer._s = dropout_entry_s
         layer.forward(x)  # x 的校验沿用该层 forward
+        if is_adaptive_max:
+            # 任一分箱并列最大时 max 梯度在该点无定义，拒绝数值检验。
+            _check_adaptive_maxpool_ties(layer, x)
         grad = layer.backward(dy)  # dy 的校验沿用该层 backward
         if isinstance(layer, (Conv2D, ConvTranspose2D, Linear)):
             dx, dw, db = grad
@@ -2714,12 +2846,14 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
                 ("beta", layer._beta, dbeta),
             )
         else:
-            # MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/Flatten/ReLU/Dropout
-            # （训练态与推理态）只检查 x。
+            # MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/AdaptiveMaxPool2D/
+            # Flatten/ReLU/Dropout（训练态与推理态）只检查 x。
             targets = (("x", x, grad),)
 
         def loss(x_arg):
             y = layer.forward(x_arg)
+            if is_adaptive_max:
+                _check_adaptive_maxpool_ties(layer, x_arg)
             acc = 0.0
 
             def rec(a, b):
@@ -2834,6 +2968,44 @@ def _check_pool_window_ties(pool, inp):
                     if tied:
                         raise ValueError(
                             "池化有效窗口存在并列最大值，max 梯度在该点无定义"
+                        )
+
+
+def _check_adaptive_maxpool_ties(pool, inp):
+    """扫描 AdaptiveMaxPool2D 对 inp 的全部分箱，任一分箱并列最大即抛 ValueError。
+
+    分箱区间与 AdaptiveMaxPool2D.forward 完全一致（高轴
+    [floor(oh*H/OH), ceil((oh+1)*H/OH))，宽轴同理，按 ih→iw 扫描）：
+    分箱内同一最大值出现两次及以上即视为并列。inp 须为该层合法四维输入。
+    """
+    oh_, ow_ = pool._output_size
+    n_ = len(inp)
+    c_ = len(inp[0])
+    h_ = len(inp[0][0])
+    w_ = len(inp[0][0][0])
+    h_bins = pool._bins(h_, oh_)
+    w_bins = pool._bins(w_, ow_)
+    for n in range(n_):
+        x_n = inp[n]
+        for c in range(c_):
+            x_c = x_n[c]
+            for ih0, ih1 in h_bins:
+                for iw0, iw1 in w_bins:
+                    best = None
+                    tied = False
+                    for ih in range(ih0, ih1):
+                        x_row = x_c[ih]
+                        for iw in range(iw0, iw1):
+                            v = x_row[iw]
+                            if best is None or v > best:
+                                best = v
+                                tied = False
+                            elif v == best:
+                                tied = True
+                    if tied:
+                        raise ValueError(
+                            "自适应最大池化分箱存在并列最大值，"
+                            "max 梯度在该点无定义"
                         )
 
 
