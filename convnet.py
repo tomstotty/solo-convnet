@@ -124,6 +124,22 @@
   （全部完成时为 (epochs, [], 0, rng)）；任何异常都把九层（含参数引用）
   与入参 m/v/state 原样恢复，任意批边界切分的两列表拼接、八组参数、两
   组矩、step 与层状态均与一次训练完成完全相同。
+- train_deep_accum_batches(layers, x, labels, microbatch_size=1,
+  accum_steps=2, epochs=1, lr=0.1, seed=0, shuffle=True, clip=None)：
+  九层结构、顺序与 x、labels 异常沿用 train_deep_step（第 4 层接受
+  MaxPool2D、AdaptiveAvgPool2D、AdaptiveMaxPool2D，AdaptiveMaxPool2D
+  反向按首个最大坐标传梯度并累加重叠分箱）；其余参数、异常与 LCG 洗牌
+  沿用 train_deep_batches（microbatch_size、accum_steps 为正 int 且
+  拒绝 bool，类型错 TypeError、非正 ValueError）。每轮切大小
+  microbatch_size 的微批（末批可短），逐微批按 train_deep_step 次序
+  前反向但不更新，把微批均值损失与八组梯度各乘微批样本数累加；满
+  accum_steps 个微批或轮末时除以组内累计样本数得样本加权均值，按既有
+  顺序展平八组均值梯度求裁剪前范数、可选裁剪并同步 SGD；余组不跨轮。
+  返回 (losses, grad_norms)，均为按更新记录的新 list[float]（长度
+  epochs*ceil(ceil(N/microbatch_size)/accum_steps)），loss 为样本加权
+  更新前均值、范数为裁剪前值；累计、求均值、范数或新参数非有限抛
+  ValueError；失败恢复入口状态与参数引用且不改 x、labels，成功保留 BN
+  统计与 Dropout 推进，相同入口确定。
 - check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6,
   rtol=1e-4)：以中心差分依次检验 x 与上述八组参数的数值梯度，损失、
   误差、容差判定与 (ok, max_e, max_r) 返回沿用 check_train_gradients；
@@ -8736,6 +8752,299 @@ def train_deep_adam_batches(
         out_v = tuple(v_trees)
         out_state = (epoch_idx, order, start, s)
         return losses, grad_norms, out_m, out_v, cur_step, out_state
+    except BaseException:
+        _restore_deep_layers(layers, snapshot)
+        raise
+
+
+def train_deep_accum_batches(
+    layers, x, labels, microbatch_size=1, accum_steps=2, epochs=1, lr=0.1,
+    seed=0, shuffle=True, clip=None,
+):
+    """九层网络（结构同 train_deep_step，第 4 层接受 MaxPool2D、
+    AdaptiveAvgPool2D 或 AdaptiveMaxPool2D）的微批梯度累积分轮训练：
+    每轮按 [0,…,N-1]（shuffle 为真时以 seed 起始、跨轮延续的 32 位
+    LCG 做 Fisher–Yates 洗牌）切分为大小 microbatch_size 的微批（末批
+    可短），逐微批按 train_deep_step 的次序前向、自损失层起逆序反传，
+    但不立即更新参数；将微批均值损失与八组梯度各乘微批样本数累加，
+    满 accum_steps 个微批或轮末（余组不跨轮）时除以组内累计样本数得
+    样本加权均值，随后按 train_deep_batches 的既有顺序展平八组均值
+    梯度、以 sqrt(math.fsum(g*g)) 求裁剪前全局范数、可选裁剪并同步
+    SGD 更新。返回 (losses, grad_norms)，均为按更新顺序记录的新
+    list[float]，长度均为 epochs*ceil(ceil(N/microbatch_size)/
+    accum_steps)：losses 为各次更新前的样本加权均值损失，grad_norms
+    为裁剪前范数。
+
+    layers 的九层类型/顺序与 BN/Dropout 训练态校验、lr 校验以及各微批
+    x、labels 的校验均沿用 train_deep_step（各微批仅切取 x、labels 的
+    新子 list 传入，不复制样本），另要求 labels 与 x 样本数相等，否则
+    抛 ValueError。pool 为 AdaptiveMaxPool2D 时反向把各分箱梯度累加到
+    forward 记录的首个最大坐标（分箱可重叠，同一输入坐标可收到多份
+    梯度）。epochs、seed、shuffle、clip 的校验沿用 train_deep_batches。
+    microbatch_size、accum_steps 必须是正 int（拒绝 bool）：类型错抛
+    TypeError，非正抛 ValueError；microbatch_size 大于 N 时每轮仅一个
+    含全部样本的短微批。
+
+    洗牌使用与 Dropout 相同的 32 位线性同余发生器
+    s=(1664525*s+1013904223) mod 2^32：每轮自 i=N-1 降至 1，先推进 s
+    再令 j=s%(i+1) 并交换 order[i]、order[j]；s 自 seed 起跨轮延续，
+    shuffle 为假时整轮不推进 s（seed 仍须合法）。该发生器独立于九层
+    自身状态。
+
+    累计、求均值、范数或更新后的参数含非有限值均抛 ValueError。任一
+    失败（含参数校验、x/labels 不匹配与各微批前反向、非有限值错误）
+    都把九层的参数引用、模式、缓存、BN 运行统计、Dropout 随机状态与
+    掩码整体恢复到函数入口状态，且不修改 x、labels 及构造参数所用的
+    原 list；成功时保留全部参数更新与各微批带来的 BN 统计、Dropout
+    随机推进。相同入口状态结果完全确定。
+    """
+    if isinstance(microbatch_size, bool) or not isinstance(
+        microbatch_size, int
+    ):
+        raise TypeError(
+            "microbatch_size 必须是 int（拒绝 bool），得到 %s"
+            % type(microbatch_size).__name__
+        )
+    if microbatch_size <= 0:
+        raise ValueError("microbatch_size 必须为正整数")
+    if isinstance(accum_steps, bool) or not isinstance(accum_steps, int):
+        raise TypeError(
+            "accum_steps 必须是 int（拒绝 bool），得到 %s"
+            % type(accum_steps).__name__
+        )
+    if accum_steps <= 0:
+        raise ValueError("accum_steps 必须为正整数")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int（拒绝 bool），得到 %s"
+            % type(epochs).__name__
+        )
+    if epochs <= 0:
+        raise ValueError("epochs 必须为正整数")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            "seed 必须是 int（拒绝 bool），得到 %s" % type(seed).__name__
+        )
+    if seed < 0 or seed > 0xFFFFFFFF:
+        raise ValueError("seed 必须满足 0 <= seed <= 2^32-1")
+    if not isinstance(shuffle, bool):
+        raise TypeError(
+            "shuffle 必须是 bool，得到 %s" % type(shuffle).__name__
+        )
+    _validate_deep_layers(layers)
+    _check_deep_scalar(lr, "lr")
+    if lr <= 0:
+        raise ValueError("lr 必须为正数")
+    if clip is not None:
+        if isinstance(clip, bool) or not isinstance(clip, (int, float)):
+            raise TypeError(
+                "clip 必须是 None 或 int/float（拒绝 bool），得到 %s"
+                % type(clip).__name__
+            )
+        if not math.isfinite(clip) or clip <= 0:
+            raise ValueError("clip 必须为正的有限值")
+    _require_list(x, "x")
+    x_shape = _shape_of(x, 4, "x")
+    n_ = x_shape[0]
+    _require_list(labels, "labels")
+    if len(labels) != n_:
+        raise ValueError(
+            "labels 长度 %d 与 x 样本数 %d 不符" % (len(labels), n_)
+        )
+
+    conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
+    snapshot = _snapshot_deep_layers(layers)
+    try:
+        losses = []
+        grad_norms = []
+        s = seed
+
+        # 把 grad 树乘 factor 累加进 acc 树（返回新树，不改原结构）。
+        def _add_scaled(acc, grad, factor):
+            if isinstance(grad, list):
+                return [
+                    _add_scaled(a, g, factor) for a, g in zip(acc, grad)
+                ]
+            value = acc + grad * factor
+            if not math.isfinite(value):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+            return value
+
+        # 累计树除以组内样本数得样本加权均值（返回新树）。
+        def _div_count(tree, count):
+            if isinstance(tree, list):
+                return [_div_count(v, count) for v in tree]
+            value = tree / count
+            if not math.isfinite(value):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+            return value
+
+        # 以新嵌套 list 承载裁剪后梯度，不改 backward 返回的原结构。
+        def _scaled(tree, factor):
+            if isinstance(tree, list):
+                return [_scaled(v, factor) for v in tree]
+            return tree * factor
+
+        # 全部新参数先在独立新 list 中算出并校验，再同步提交，保证
+        # 失败时层内参数与构造参数原 list 均不被改动。
+        def _step(param, grad):
+            if isinstance(param, list):
+                return [_step(v, g) for v, g in zip(param, grad)]
+            new_value = param - lr * grad
+            if not math.isfinite(new_value):
+                raise ValueError("训练计算产生非有限值（NaN/inf）")
+            return new_value
+
+        for _epoch in range(epochs):
+            # 轮界洗牌：自 N-1 降至 1，先推进 LCG，再以 j=s%(i+1) 交换；
+            # s 跨轮延续，shuffle 为假时整轮不推进。
+            order = list(range(n_))
+            if shuffle and n_ > 1:
+                for i in range(n_ - 1, 0, -1):
+                    s = (1664525 * s + 1013904223) % 4294967296
+                    j = s % (i + 1)
+                    order[i], order[j] = order[j], order[i]
+            start = 0
+            # 组内累计器：余组不跨轮，轮末必结算清空。
+            acc_count = 0      # 组内累计样本数
+            acc_loss = 0.0     # Σ 微批均值损失 × 微批样本数
+            acc_grads = None   # 八组 Σ 微批梯度 × 微批样本数
+            acc_micro = 0      # 组内已累计微批数
+            while start < n_:
+                idx = order[start:start + microbatch_size]
+                batch_x = [x[k] for k in idx]
+                batch_labels = [labels[k] for k in idx]
+
+                # 按列表顺序前向；各层输入错误由其 forward 原样抛出。
+                conv_out = conv.forward(batch_x)
+                bn_out = bn.forward(conv_out)
+                drop_out = dropout.forward(bn_out)
+                pool_out = pool.forward(drop_out)
+                flat = flatten.forward(pool_out)
+                hidden = linear1.forward(flat)
+                relu_out = relu.forward(hidden)
+                logits = linear2.forward(relu_out)
+                loss_value = loss.forward(logits, batch_labels)
+                if not math.isfinite(loss_value):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+                # 自损失层起逆序反传；损失梯度已批均，不再除批量。每层
+                # 返回后立即递归检查其全部输出梯度（含参数梯度与最终
+                # 输入梯度）。
+                grad_logits = loss.backward()
+                _require_finite_grads(grad_logits)
+                dx_relu, dl2w, dl2b = linear2.backward(grad_logits)
+                _require_finite_grads(dx_relu)
+                _require_finite_grads(dl2w)
+                _require_finite_grads(dl2b)
+                dx_hidden = relu.backward(dx_relu)
+                _require_finite_grads(dx_hidden)
+                dx_flat, dl1w, dl1b = linear1.backward(dx_hidden)
+                _require_finite_grads(dx_flat)
+                _require_finite_grads(dl1w)
+                _require_finite_grads(dl1b)
+                dx_pool = flatten.backward(dx_flat)
+                _require_finite_grads(dx_pool)
+                dx_drop = pool.backward(dx_pool)
+                _require_finite_grads(dx_drop)
+                dx_bn = dropout.backward(dx_drop)
+                _require_finite_grads(dx_bn)
+                dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+                _require_finite_grads(dx_conv)
+                _require_finite_grads(dgamma)
+                _require_finite_grads(dbeta)
+                dx_input, dcw, dcb = conv.backward(dx_conv)
+                _require_finite_grads(dx_input)
+                _require_finite_grads(dcw)
+                _require_finite_grads(dcb)
+
+                # 微批均值损失与八组梯度各乘微批样本数累加（不更新参数）。
+                m_ = len(idx)
+                acc_loss += loss_value * m_
+                if not math.isfinite(acc_loss):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+                micro_groups = (
+                    dcw, dcb, dgamma, dbeta,
+                    dl1w, dl1b, dl2w, dl2b,
+                )
+                if acc_grads is None:
+                    acc_grads = [
+                        _zeros_like_tree(g) for g in micro_groups
+                    ]
+                acc_grads = [
+                    _add_scaled(a, g, m_)
+                    for a, g in zip(acc_grads, micro_groups)
+                ]
+                acc_count += m_
+                acc_micro += 1
+                start += m_
+
+                # 满 accum_steps 个微批或轮末：余组不跨轮，轮末必结算。
+                if acc_micro < accum_steps and start < n_:
+                    continue
+
+                # 除以组内累计样本数得样本加权均值损失与八组均值梯度。
+                mean_loss = acc_loss / acc_count
+                if not math.isfinite(mean_loss):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+                dcw, dcb, dgamma, dbeta, dl1w, dl1b, dl2w, dl2b = (
+                    _div_count(a, acc_count) for a in acc_grads
+                )
+
+                # 更新前按既有顺序展平八组均值梯度，求裁剪前全局范数。
+                grad_groups = (
+                    dcw, dcb, dgamma, dbeta,
+                    dl1w, dl1b, dl2w, dl2b,
+                )
+                flat_grads = []
+                for group in grad_groups:
+                    _flatten_into(group, flat_grads)
+                grad_norm = math.sqrt(math.fsum(g * g for g in flat_grads))
+                if not math.isfinite(grad_norm):
+                    raise ValueError("训练计算产生非有限值（NaN/inf）")
+
+                # 可选全局范数裁剪：八组梯度同乘 clip/norm；范数不大于
+                # clip 或 clip 为 None 时保持原梯度。
+                if clip is not None and grad_norm > clip:
+                    factor = clip / grad_norm
+                    dcw, dcb, dgamma, dbeta = (
+                        _scaled(dcw, factor), _scaled(dcb, factor),
+                        _scaled(dgamma, factor), _scaled(dbeta, factor),
+                    )
+                    dl1w, dl1b, dl2w, dl2b = (
+                        _scaled(dl1w, factor), _scaled(dl1b, factor),
+                        _scaled(dl2w, factor), _scaled(dl2b, factor),
+                    )
+
+                new_conv_w = _step(conv._weights, dcw)
+                new_conv_b = _step(conv._bias, dcb)
+                new_gamma = _step(bn._gamma, dgamma)
+                new_beta = _step(bn._beta, dbeta)
+                new_l1_w = _step(linear1._weights, dl1w)
+                new_l1_b = _step(linear1._bias, dl1b)
+                new_l2_w = _step(linear2._weights, dl2w)
+                new_l2_b = _step(linear2._bias, dl2b)
+
+                # 同步替换层内参数；其余缓存、BN 统计、Dropout 随机状态
+                # 保留。
+                conv._weights = new_conv_w
+                conv._bias = new_conv_b
+                bn._gamma = new_gamma
+                bn._beta = new_beta
+                linear1._weights = new_l1_w
+                linear1._bias = new_l1_b
+                linear2._weights = new_l2_w
+                linear2._bias = new_l2_b
+
+                losses.append(float(mean_loss))
+                grad_norms.append(float(grad_norm))
+
+                # 结算后清空组内累计器；余组不跨轮。
+                acc_count = 0
+                acc_loss = 0.0
+                acc_grads = None
+                acc_micro = 0
+        return losses, grad_norms
     except BaseException:
         _restore_deep_layers(layers, snapshot)
         raise
