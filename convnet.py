@@ -81,9 +81,9 @@
   seed=0, shuffle=True, clip=None, state=None, max_batches=None)：每轮按
   [0,…,N-1]（shuffle 为真时以 seed 起始、跨轮延续的 32 位 LCG 做
   Fisher–Yates 洗牌）切分为大小 batch_size 的批（末批可短），逐批按
-  train_deep_step 次序前反向（九层结构同 train_deep_step，但第 4 层
-  本次仅接受 MaxPool2D 或 AdaptiveAvgPool2D，不接受
-  AdaptiveMaxPool2D），并在同步 SGD 更新前依次展平 conv
+  train_deep_step 次序前反向（九层结构同 train_deep_step，第 4 层接受
+  MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D，后者反向按首个
+  最大坐标传梯度并累加重叠分箱），并在同步 SGD 更新前依次展平 conv
   权重/偏置、BN gamma/beta、两个 Linear 权重/偏置八组梯度，以
   sqrt(fsum(g*g)) 求裁剪前全局范数；clip 非 None 且范数大于 clip 时八组
   梯度同乘 clip/norm，更新不额外除批量。state 与 max_batches 均为 None
@@ -3040,8 +3040,9 @@ def check_cnn_gradients(
 ):
     """用中心差分数值梯度检验 Conv2D→Pool2D→Flatten→Linear 整链。
 
-    conv/pool/flatten/linear 须依次为 Conv2D/MaxPool2D、AvgPool2D 或
-    AdaptiveAvgPool2D/Flatten/Linear 实例，其余抛 TypeError。前向按
+    conv/pool/flatten/linear 须依次为 Conv2D/MaxPool2D、AvgPool2D、
+    AdaptiveAvgPool2D 或 AdaptiveMaxPool2D/Flatten/Linear 实例，其余抛
+    TypeError。前向按
     conv→pool→flatten→linear 执行，解析梯度按
     linear→flatten→pool→conv 逆序取各层 backward 结果。
     标量损失 L：acc=0.0，按线性层输出的嵌套索引从外到内递增执行
@@ -3051,7 +3052,9 @@ def check_cnn_gradients(
     （各张量内部按嵌套序），n = (L(v+eps) - L(v-eps)) / (2*eps)。
     pool 为 MaxPool2D 时，任一次前向中任一池化有效窗口并列最大（补边
     位置不参与比较）一律抛 ValueError——max 在并列点梯度无定义；
-    pool 为 AvgPool2D 或 AdaptiveAvgPool2D 时不做并列检测。
+    pool 为 AdaptiveMaxPool2D 时，任一次前向中任一自适应分箱并列最大
+    一律抛 ValueError；pool 为 AvgPool2D 或 AdaptiveAvgPool2D 时不做
+    并列检测。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -3066,10 +3069,12 @@ def check_cnn_gradients(
         raise TypeError(
             "conv 必须是 Conv2D 实例，得到 %s" % type(conv).__name__
         )
-    if not isinstance(pool, (MaxPool2D, AvgPool2D, AdaptiveAvgPool2D)):
+    if not isinstance(
+        pool, (MaxPool2D, AvgPool2D, AdaptiveAvgPool2D, AdaptiveMaxPool2D)
+    ):
         raise TypeError(
-            "pool 必须是 MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D 实例，得到 %s"
-            % type(pool).__name__
+            "pool 必须是 MaxPool2D、AvgPool2D、AdaptiveAvgPool2D 或"
+            " AdaptiveMaxPool2D 实例，得到 %s" % type(pool).__name__
         )
     if not isinstance(flatten, Flatten):
         raise TypeError(
@@ -3105,6 +3110,8 @@ def check_cnn_gradients(
             conv_out = conv.forward(x_arg)
             if isinstance(pool, MaxPool2D):
                 _check_pool_window_ties(pool, conv_out)
+            elif isinstance(pool, AdaptiveMaxPool2D):
+                _check_adaptive_maxpool_ties(pool, conv_out)
             pool_out = pool.forward(conv_out)
             flat = flatten.forward(pool_out)
             return linear.forward(flat)
@@ -3125,7 +3132,7 @@ def check_cnn_gradients(
             return acc
 
         # 前向按 conv→pool→flatten→linear；x 的校验沿各层 forward，
-        # MaxPool2D 并列最大在此一并检出。
+        # MaxPool2D/AdaptiveMaxPool2D 并列最大在此一并检出。
         chain_forward(x)
 
         # 解析梯度按 linear→flatten→pool→conv 逆序；dy 校验沿 linear.backward。
@@ -3199,7 +3206,8 @@ def check_norm_gradients(
     """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→Pool2D→Flatten→Linear 训练链。
 
     conv/bn/dropout/pool/flatten/linear 须依次为 Conv2D/BatchNorm2D/Dropout/
-    MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D/Flatten/Linear 实例，其余抛
+    MaxPool2D、AvgPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D/Flatten/
+    Linear 实例，其余抛
     TypeError；bn 或 dropout 非训练态抛 ValueError。前向按
     conv→bn→dropout→pool→flatten→linear 执行，解析梯度按
     linear→flatten→pool→dropout→bn→conv 逆序取各层 backward 结果。标量损失 L：acc=0.0，按线性层输出的嵌套索引从外
@@ -3211,8 +3219,9 @@ def check_norm_gradients(
     状态 _s 恢复为入口值，使各次前向重放同一掩码，故同一入口状态结果确定。
     BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D 时，
     任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）一律抛
-    ValueError——max 在并列点梯度无定义；pool 为 AvgPool2D 或
-    AdaptiveAvgPool2D 时不做并列检测。
+    ValueError——max 在并列点梯度无定义；pool 为 AdaptiveMaxPool2D 时，
+    任一次前向中任一自适应分箱并列最大一律抛 ValueError；pool 为
+    AvgPool2D 或 AdaptiveAvgPool2D 时不做并列检测。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -3236,10 +3245,12 @@ def check_norm_gradients(
         raise TypeError(
             "dropout 必须是 Dropout 实例，得到 %s" % type(dropout).__name__
         )
-    if not isinstance(pool, (MaxPool2D, AvgPool2D, AdaptiveAvgPool2D)):
+    if not isinstance(
+        pool, (MaxPool2D, AvgPool2D, AdaptiveAvgPool2D, AdaptiveMaxPool2D)
+    ):
         raise TypeError(
-            "pool 必须是 MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D 实例，得到 %s"
-            % type(pool).__name__
+            "pool 必须是 MaxPool2D、AvgPool2D、AdaptiveAvgPool2D 或"
+            " AdaptiveMaxPool2D 实例，得到 %s" % type(pool).__name__
         )
     if not isinstance(flatten, Flatten):
         raise TypeError(
@@ -3286,6 +3297,8 @@ def check_norm_gradients(
             drop_out = dropout.forward(bn_out)
             if isinstance(pool, MaxPool2D):
                 _check_pool_window_ties(pool, drop_out)
+            elif isinstance(pool, AdaptiveMaxPool2D):
+                _check_adaptive_maxpool_ties(pool, drop_out)
             pool_out = pool.forward(drop_out)
             flat = flatten.forward(pool_out)
             return linear.forward(flat)
@@ -3306,7 +3319,7 @@ def check_norm_gradients(
             return acc
 
         # 前向按 conv→bn→dropout→pool→flatten→linear；x 的校验沿各层
-        # forward，MaxPool2D 并列最大在此一并检出。
+        # forward，MaxPool2D/AdaptiveMaxPool2D 并列最大在此一并检出。
         chain_forward(x)
 
         # 解析梯度按 linear→flatten→pool→dropout→bn→conv 逆序；
@@ -3389,7 +3402,8 @@ def check_train_gradients(
     """用中心差分数值梯度检验 Conv2D→BatchNorm2D→Dropout→Pool2D→Flatten→Linear→SoftmaxCrossEntropy 训练链。
 
     conv/bn/dropout/pool/flatten/linear 须依次为 Conv2D/BatchNorm2D/Dropout/
-    MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D/Flatten/Linear 实例，loss 须为
+    MaxPool2D、AvgPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D/Flatten/
+    Linear 实例，loss 须为
     SoftmaxCrossEntropy 实例，其余抛 TypeError；bn 或 dropout 非训练态抛
     ValueError。前向按 conv→bn→dropout→pool→flatten→linear 执行得
     logits，标量损失 L = loss.forward(logits, labels) 返回的 float 批均
@@ -3402,8 +3416,9 @@ def check_train_gradients(
     状态 _s 恢复为入口值，使各次前向重放同一掩码，故同一入口状态结果确定。
     BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D 时，
     任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）一律抛
-    ValueError——max 在并列点梯度无定义；pool 为 AvgPool2D 或
-    AdaptiveAvgPool2D 时不做并列检测。
+    ValueError——max 在并列点梯度无定义；pool 为 AdaptiveMaxPool2D 时，
+    任一次前向中任一自适应分箱并列最大一律抛 ValueError；pool 为
+    AvgPool2D 或 AdaptiveAvgPool2D 时不做并列检测。
 
     令 e = abs(a - n)、r = e / max(abs(a), abs(n), 1e-12)，返回
     (ok, max(e), max(r))，类型固定 (bool, float, float)，不舍入；
@@ -3428,10 +3443,12 @@ def check_train_gradients(
         raise TypeError(
             "dropout 必须是 Dropout 实例，得到 %s" % type(dropout).__name__
         )
-    if not isinstance(pool, (MaxPool2D, AvgPool2D, AdaptiveAvgPool2D)):
+    if not isinstance(
+        pool, (MaxPool2D, AvgPool2D, AdaptiveAvgPool2D, AdaptiveMaxPool2D)
+    ):
         raise TypeError(
-            "pool 必须是 MaxPool2D、AvgPool2D 或 AdaptiveAvgPool2D 实例，得到 %s"
-            % type(pool).__name__
+            "pool 必须是 MaxPool2D、AvgPool2D、AdaptiveAvgPool2D 或"
+            " AdaptiveMaxPool2D 实例，得到 %s" % type(pool).__name__
         )
     if not isinstance(flatten, Flatten):
         raise TypeError(
@@ -3484,6 +3501,8 @@ def check_train_gradients(
             drop_out = dropout.forward(bn_out)
             if isinstance(pool, MaxPool2D):
                 _check_pool_window_ties(pool, drop_out)
+            elif isinstance(pool, AdaptiveMaxPool2D):
+                _check_adaptive_maxpool_ties(pool, drop_out)
             pool_out = pool.forward(drop_out)
             flat = flatten.forward(pool_out)
             return linear.forward(flat)
@@ -6951,16 +6970,16 @@ _DEEP_LAYER_NAMES = (
 )
 
 # 三个 deep 批训练接口（train_deep_batches/train_deep_momentum_batches/
-# train_deep_adam_batches）本次不支持 AdaptiveMaxPool2D：第 4 层沿用原
-# 池化类型集（仅 MaxPool2D 或 AdaptiveAvgPool2D）。
+# train_deep_adam_batches）的第 4 层与一步训练同集：MaxPool2D、
+# AdaptiveAvgPool2D 或 AdaptiveMaxPool2D。
 _DEEP_BATCH_LAYER_TYPES = (
     Conv2D, BatchNorm2D, Dropout,
-    (MaxPool2D, AdaptiveAvgPool2D),
+    (MaxPool2D, AdaptiveAvgPool2D, AdaptiveMaxPool2D),
     Flatten, Linear, ReLU, Linear, SoftmaxCrossEntropy,
 )
 _DEEP_BATCH_LAYER_NAMES = (
     "Conv2D", "BatchNorm2D", "Dropout",
-    "MaxPool2D 或 AdaptiveAvgPool2D",
+    "MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D",
     "Flatten", "Linear", "ReLU", "Linear", "SoftmaxCrossEntropy",
 )
 
@@ -7008,10 +7027,12 @@ def _validate_deep_layers(layers):
 
 
 def _validate_deep_batch_layers(layers):
-    """三个 deep 批训练接口的九层结构校验（本次不支持 AdaptiveMaxPool2D）。
+    """严格九层结构校验（三个 deep 批训练接口契约）。
 
-    与 _validate_deep_layers 的唯一区别是第 4 层（索引 3）仅接受
-    MaxPool2D 或 AdaptiveAvgPool2D：容器或成员类型错抛 TypeError，
+    与 _validate_deep_layers 相同：layers 必须是恰含
+    Conv2D/BatchNorm2D/Dropout/(MaxPool2D、AdaptiveAvgPool2D 或
+    AdaptiveMaxPool2D)/Flatten/Linear/ReLU/Linear/SoftmaxCrossEntropy
+    九层实例（类型与顺序均固定）的 list：容器或成员类型错抛 TypeError，
     长度错或 BN/Dropout 非训练态抛 ValueError。
     """
     _check_deep_layer_types(
@@ -7435,10 +7456,10 @@ def train_deep_batches(
     layers, x, labels, batch_size=1, epochs=1, lr=0.1, seed=0,
     shuffle=True, clip=None, state=None, max_batches=None,
 ):
-    """九层网络（Conv2D/BN/Dropout/(MaxPool 或
-    AdaptiveAvgPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头；
-    第 4 层本次仅接受 MaxPool2D 或 AdaptiveAvgPool2D，不接受
-    AdaptiveMaxPool2D，类型错抛 TypeError）
+    """九层网络（Conv2D/BN/Dropout/(MaxPool、AdaptiveAvgPool 或
+    AdaptiveMaxPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头；
+    第 4 层接受 MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D，
+    其他类型抛 TypeError）
     的分轮分批训练：每轮按顺序 [0,…,N-1]（shuffle 为真时先做 Fisher–
     Yates 洗牌）切分若干批，逐批按 train_deep_step 的次序前向、自损失层
     起逆序反传，并在同步 SGD 更新前对全部八组参数梯度做可选全局范数裁剪；
@@ -7476,9 +7497,10 @@ def train_deep_batches(
 
     layers 的九层类型/顺序与 BN/Dropout 训练态校验、lr 校验以及各批 x、
     labels 的校验均沿用 train_deep_step（各批仅切取 x、labels 的新子
-    list 传入，不复制样本），仅第 4 层池化类型集更窄（不接受
-    AdaptiveMaxPool2D）；另要求 labels 与 x 样本数相等，否则抛
-    ValueError。batch_size、epochs 必须是正 int，seed 必须是
+    list 传入，不复制样本；pool 为 AdaptiveMaxPool2D 时反向把各分箱
+    梯度累加到 forward 记录的首个最大坐标，重叠分箱的梯度累加）；另要求
+    labels 与 x 样本数相等，否则抛 ValueError。batch_size、epochs 必须
+    是正 int，seed 必须是
     [0, 2^32-1] 内的 int，三者均拒绝 bool：类型错抛 TypeError，范围错抛
     ValueError；batch_size 大于 N 时每轮仅一个含全部样本的短批。shuffle
     必须是 bool，否则抛 TypeError。
@@ -7890,10 +7912,10 @@ def train_deep_momentum_batches(
     shuffle=True, clip=None, momentum=0.9, velocity=None, state=None,
     max_batches=None,
 ):
-    """九层网络（Conv2D/BN/Dropout/(MaxPool 或
-    AdaptiveAvgPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头；
-    第 4 层本次仅接受 MaxPool2D 或 AdaptiveAvgPool2D，不接受
-    AdaptiveMaxPool2D，类型错抛 TypeError）
+    """九层网络（Conv2D/BN/Dropout/(MaxPool、AdaptiveAvgPool 或
+    AdaptiveMaxPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头；
+    第 4 层接受 MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D，
+    其他类型抛 TypeError）
     的分轮分批带动量训练：批次切分、Fisher–Yates 洗牌、前反向次序、
     裁剪前全局梯度范数、可选全局范数裁剪、批边界暂停/续训及失败回滚均
     沿用 train_deep_batches，唯一区别在每批参数更新规则——先对八组梯度
