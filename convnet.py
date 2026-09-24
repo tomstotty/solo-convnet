@@ -22,7 +22,12 @@
   [(W-1)*SW-PL-PR+(KW-1)*DW+1+OPW]，"valid" 同此式（四边 0），
   "same" 输出形状 [N][O][H*SH][W*SW]。
 - MaxPool2D 层：NCHW 嵌套 list、逐通道最大池化、补边位置不参与比较，
+  dilation 支持膨胀采样（正 int 或 (DH, DW) tuple，默认 1），
   ceil_mode 可选末轴窗口向上取整（仅 bool，默认 False）。
+- AvgPool2D 层：NCHW 嵌套 list、逐通道平均池化，dilation 支持膨胀
+  采样（正 int 或 (DH, DW) tuple，默认 1），有效核长 EH/EW 决定窗口
+  布局，count_include_pad 控制除数是否计入声明补边矩形内采样点，
+  ceil_mode 同 MaxPool2D。
 - AdaptiveAvgPool2D 层：NCHW 嵌套 list、逐通道自适应平均池化，输出尺寸
   为正 int 或 (OH, OW) tuple，分箱区间 [floor(oh*H/OH), ceil((oh+1)*H/OH))，
   OH/OW 可大于 H/W。
@@ -1481,24 +1486,54 @@ def _avgpool_out_size(length, pad_lo, pad_hi, kernel, stride, ceil_mode):
 
 
 def _avgpool_window_count(base_h, base_w, h_, w_, kh_, kw_,
-                          pt_, pb_, pl_, pr_, include_pad):
+                          pt_, pb_, pl_, pr_, include_pad,
+                          dh_=1, dw_=1):
     """返回窗口除数：真实坐标数，或声明补边矩形内的坐标数。
 
-    真实坐标为窗口与 [0,H)×[0,W) 的交；include_pad 为真时除数改取窗口
-    与声明补边矩形 [-PT,H+PB)×[-PL,W+PR) 的交（含补边零值位置），ceil
-    产生的矩形外位置两种情形均不计入。
+    采样坐标为 (base_h+kh*DH, base_w+kw*DW)（kh∈[0,KH)、
+    kw∈[0,KW)），即按膨胀间距落在有效矩形 [base, base+(K-1)*D+1)
+    上的离散点。真实坐标为采样点中位于 [0,H)×[0,W) 的点数；
+    include_pad 为真时改取落在声明补边矩形 [-PT,H+PB)×[-PL,W+PR)
+    内的点数（含补边零值位置），ceil 产生的矩形外位置两种情形均
+    不计入。
     """
-    real_h = max(0, min(base_h + kh_, h_) - max(base_h, 0))
-    real_w = max(0, min(base_w + kw_, w_) - max(base_w, 0))
+    eh_ = (kh_ - 1) * dh_ + 1
+    ew_ = (kw_ - 1) * dw_ + 1
+    real_lo_h = max(base_h, 0)
+    real_hi_h = min(base_h + eh_, h_)
+    real_lo_w = max(base_w, 0)
+    real_hi_w = min(base_w + ew_, w_)
     if not include_pad:
-        return real_h * real_w
-    decl_h = max(0, min(base_h + kh_, h_ + pb_) - max(base_h, -pt_))
-    decl_w = max(0, min(base_w + kw_, w_ + pr_) - max(base_w, -pl_))
-    return decl_h * decl_w
+        cnt_h = _dilated_span_count(base_h, real_lo_h, real_hi_h, dh_)
+        cnt_w = _dilated_span_count(base_w, real_lo_w, real_hi_w, dw_)
+        return cnt_h * cnt_w
+    decl_lo_h = max(base_h, -pt_)
+    decl_hi_h = min(base_h + eh_, h_ + pb_)
+    decl_lo_w = max(base_w, -pl_)
+    decl_hi_w = min(base_w + ew_, w_ + pr_)
+    cnt_h = _dilated_span_count(base_h, decl_lo_h, decl_hi_h, dh_)
+    cnt_w = _dilated_span_count(base_w, decl_lo_w, decl_hi_w, dw_)
+    return cnt_h * cnt_w
+
+
+def _dilated_span_count(base, lo, hi, d):
+    """统计采样点 base+k*D（k 为非负 int）落在半开区间 [lo, hi) 的个数。
+
+    调用方保证 hi <= base+(K-1)*D+1，故上界自动不超过 K-1。
+    """
+    if hi <= lo:
+        return 0
+    k_lo = -((-(lo - base)) // d)  # ceil((lo-base)/D)
+    if k_lo < 0:
+        k_lo = 0
+    k_hi = (hi - 1 - base) // d    # floor((hi-1-base)/D)
+    if k_hi < k_lo:
+        return 0
+    return k_hi - k_lo + 1
 
 
 class AvgPool2D:
-    """二维平均池化层（NCHW，嵌套 list，逐通道池化）。
+    """二维平均池化层（NCHW，嵌套 list，逐通道池化，支持膨胀采样）。
 
     参数展开与 TypeError/ValueError 分类与 MaxPool2D 完全一致：
     kernel_size: 正 int（双轴同值，展开为 (K, K)）或恰含 (KH, KW) 的
@@ -1510,18 +1545,25 @@ class AvgPool2D:
     PT、PB < KH，PL、PR < KW。
     count_include_pad、ceil_mode 只能为 bool（默认均为 False），否则
     抛 TypeError。
-    记 A=H+PT+PB-KH、B=W+PL+PR-KW：ceil_mode 为假时
+    dilation: 正 int（双轴同值，展开为 (D, D)）或恰含 (DH, DW) 的
+    正 int tuple（默认 1）。
+    记有效核长 EH=(KH-1)*DH+1、EW=(KW-1)*DW+1，
+    A=H+PT+PB-EH、B=W+PL+PR-EW：ceil_mode 为假时
     OH=A//SH+1、OW=B//SW+1；为真时 OH=(A+SH-1)//SH+1、
     OW=(B+SW-1)//SW+1，但若最后窗口起点满足 (OH-1)*SH>=H+PT（宽轴为
-    (OW-1)*SW>=W+PL）则相应轴减 1。核大于补边后输入抛 ValueError。
-    窗口超出声明补边矩形的部分忽略；求和只含真实输入坐标。
-    count_include_pad 为假时除数为真实坐标数；为真时除数还计入声明补边
-    矩形内的零值补边位置，但不计 ceil 产生的矩形外位置。
+    (OW-1)*SW>=W+PL）则相应轴减 1。有效核长大于补边后输入抛
+    ValueError。ceil_mode 为假不能整除时舍弃底部或右侧余量。
+    窗口采样坐标为 oh*SH-PT+kh*DH、ow*SW-PL+kw*DW（kh、kw 从
+    0 起，按 kh→kw 扫描），仅真实坐标 [0,H)×[0,W) 参与求和，补边与
+    ceil 产生的矩形外位置忽略。
+    count_include_pad 为假时除数为真实采样点数；为真时除数还计入
+    声明补边矩形 [-PT,H+PB)×[-PL,W+PR) 内的采样点（含补边零值位置），
+    但不计 ceil 产生的矩形外点；除数为 0 抛 ValueError。
     输入 x: [N][C][H][W]，输出: [N][C][OH][OW]。
     """
 
     def __init__(self, kernel_size, stride=None, padding=0,
-                 count_include_pad=False, ceil_mode=False):
+                 count_include_pad=False, ceil_mode=False, dilation=1):
         kh_, kw_ = _check_kernel2d(kernel_size, "kernel_size")
         if stride is None:
             sh_, sw_ = kh_, kw_
@@ -1542,30 +1584,39 @@ class AvgPool2D:
                 "ceil_mode 必须是 bool，得到 %s"
                 % type(ceil_mode).__name__
             )
+        dh_, dw_ = _check_dilation2d(dilation)
 
         self._kernel_size = (kh_, kw_)
         self._stride = (sh_, sw_)
         self._padding = (pt_, pb_, pl_, pr_)
         self._count_include_pad = count_include_pad
         self._ceil_mode = ceil_mode
+        self._dilation = (dh_, dw_)
 
         self._x_shape = None    # 最近一次成功 forward 的输入形状
         self._out_shape = None  # 最近一次成功 forward 的输出形状
 
     def forward(self, x):
-        """对 x: [N][C][H][W] 做平均池化，返回新 float list 并缓存形状。"""
+        """对 x: [N][C][H][W] 做平均池化，返回新 float list 并缓存形状。
+
+        仅在全部窗口计算完成后才更新缓存：任何失败都保留旧缓存，且不
+        修改实参 x。
+        """
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
         kh_, kw_ = self._kernel_size
         sh_, sw_ = self._stride
         pt_, pb_, pl_, pr_ = self._padding
-        if kh_ > h_ + pt_ + pb_ or kw_ > w_ + pl_ + pr_:
-            raise ValueError("池化窗口在补边后仍越界：kernel_size 大于补边后的输入")
+        dh_, dw_ = self._dilation
+        eh_ = (kh_ - 1) * dh_ + 1
+        ew_ = (kw_ - 1) * dw_ + 1
+        if eh_ > h_ + pt_ + pb_ or ew_ > w_ + pl_ + pr_:
+            raise ValueError("池化窗口在补边后仍越界：有效核大于补边后的输入")
         oh_ = _avgpool_out_size(
-            h_, pt_, pb_, kh_, sh_, self._ceil_mode
+            h_, pt_, pb_, eh_, sh_, self._ceil_mode
         )
         ow_ = _avgpool_out_size(
-            w_, pl_, pr_, kw_, sw_, self._ceil_mode
+            w_, pl_, pr_, ew_, sw_, self._ceil_mode
         )
 
         out = []
@@ -1581,18 +1632,25 @@ class AvgPool2D:
                         base_w = ow * sw_ - pl_
                         total = 0.0
                         for kh in range(kh_):
-                            ih = base_h + kh
+                            ih = base_h + kh * dh_
                             if ih < 0 or ih >= h_:
                                 continue
                             x_row = x_c[ih]
                             for kw in range(kw_):
-                                iw = base_w + kw
+                                iw = base_w + kw * dw_
                                 if 0 <= iw < w_:
                                     total += x_row[iw]
                         count = _avgpool_window_count(
                             base_h, base_w, h_, w_, kh_, kw_,
                             pt_, pb_, pl_, pr_, self._count_include_pad,
+                            dh_, dw_,
                         )
+                        if count == 0:
+                            raise ValueError(
+                                "平均池化窗口 (%d, %d) 除数为 0："
+                                "膨胀采样点全部落在补边矩形之外"
+                                % (oh, ow)
+                            )
                         avg = total / count
                         if not math.isfinite(avg):
                             raise ValueError("平均池化计算产生非有限值（NaN/inf）")
@@ -1606,13 +1664,15 @@ class AvgPool2D:
         return out
 
     def backward(self, dy):
-        """根据上游梯度 dy 返回与输入同形状的 dx。
+        """根据上游梯度 dy 返回与输入同形状的新 list dx。
 
         dy 的形状必须等于最近一次成功 forward 的输出形状；每个窗口把
-        dy / 该窗口除数（forward 同一除数：默认仅真实坐标数，
-        count_include_pad 时含声明补边内的零值位置）按 n→c→oh→ow、
-        kh→kw 仅累加至各真实输入坐标（补边位置不分摊）。未成功 forward
-        前调用一律抛 ValueError。
+        dy / 该窗口除数（forward 同一除数：默认仅真实采样点数，
+        count_include_pad 时含声明补边矩形内的采样位置）按
+        n→c→oh→ow、kh→kw 的膨胀采样坐标
+        oh*SH-PT+kh*DH、ow*SW-PL+kw*DW 仅累加至各真实输入坐标
+        （补边位置不分摊）。未成功 forward 前调用、dy 形状错、除数为 0
+        或累加产生非有限值一律抛 ValueError；失败时不改动缓存与实参。
         """
         if self._out_shape is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -1629,6 +1689,7 @@ class AvgPool2D:
         kh_, kw_ = self._kernel_size
         sh_, sw_ = self._stride
         pt_, pb_, pl_, pr_ = self._padding
+        dh_, dw_ = self._dilation
 
         dx = _zeros(self._x_shape)
         for n in range(n_):
@@ -1645,17 +1706,24 @@ class AvgPool2D:
                         count = _avgpool_window_count(
                             base_h, base_w, h_, w_, kh_, kw_,
                             pt_, pb_, pl_, pr_, self._count_include_pad,
+                            dh_, dw_,
                         )
+                        if count == 0:
+                            raise ValueError(
+                                "平均池化窗口 (%d, %d) 除数为 0："
+                                "膨胀采样点全部落在补边矩形之外"
+                                % (oh, ow)
+                            )
                         share = dy_row[ow] / count
                         if not math.isfinite(share):
                             raise ValueError("平均池化反向计算产生非有限值（NaN/inf）")
                         for kh in range(kh_):
-                            ih = base_h + kh
+                            ih = base_h + kh * dh_
                             if ih < 0 or ih >= h_:
                                 continue
                             dx_row = dx_c[ih]
                             for kw in range(kw_):
-                                iw = base_w + kw
+                                iw = base_w + kw * dw_
                                 if 0 <= iw < w_:
                                     dx_row[iw] += share
                                     if not math.isfinite(dx_row[iw]):
