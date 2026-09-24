@@ -1291,7 +1291,7 @@ class ConvTranspose2D:
 
 
 class MaxPool2D:
-    """二维最大池化层（NCHW，嵌套 list，逐通道池化）。
+    """二维最大池化层（NCHW，嵌套 list，逐通道池化，支持膨胀采样）。
 
     kernel_size: 正 int（双轴同值，展开为 (K, K)）或恰含 (KH, KW) 的
     正 int tuple。
@@ -1300,14 +1300,20 @@ class MaxPool2D:
     padding: 非负 int（四边同值，展开为 (P, P, P, P)）或恰含
     (PT, PB, PL, PR) 的非负 int tuple，分别为上/下/左/右补边；且
     PT、PB < KH，PL、PR < KW。补边位置不参与比较。
-    输入 x: [N][C][H][W]，输出: [N][C][OH][OW]，
-    OH = (H + PT + PB - KH) // SH + 1，
-    OW = (W + PL + PR - KW) // SW + 1。
-    不能整除时舍弃底部或右侧余量。窗口内按 kh→kw 扫描，并列最大只取
-    首个真实坐标（补边不计入扫描）。
+    dilation: 正 int（双轴同值，展开为 (D, D)）或恰含 (DH, DW) 的
+    正 int tuple。
+    输入 x: [N][C][H][W]，输出: [N][C][OH][OW]。记有效核长
+    EH=(KH-1)*DH+1、EW=(KW-1)*DW+1，则
+    OH = (H + PT + PB - EH) // SH + 1，
+    OW = (W + PL + PR - EW) // SW + 1。
+    有效核长大于补边后输入抛 ValueError。不能整除时舍弃底部或右侧
+    余量。窗口采样坐标为 oh*SH-PT+kh*DH、ow*SW-PL+kw*DW（kh、kw 从
+    0 起），越界补边位置不参与比较；某窗口无真实采样点（膨胀可使
+    采样点全部落到补边区域）抛 ValueError。窗口内按 kh→kw 扫描，
+    并列最大只取首个真实坐标。
     """
 
-    def __init__(self, kernel_size, stride=None, padding=0):
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1):
         kh_, kw_ = _check_kernel2d(kernel_size, "kernel_size")
         if stride is None:
             sh_, sw_ = kh_, kw_
@@ -1318,26 +1324,35 @@ class MaxPool2D:
             raise ValueError("padding 的 PT、PB 必须小于 KH")
         if pl_ >= kw_ or pr_ >= kw_:
             raise ValueError("padding 的 PL、PR 必须小于 KW")
+        dh_, dw_ = _check_dilation2d(dilation)
 
         self._kernel_size = (kh_, kw_)
         self._stride = (sh_, sw_)
         self._padding = (pt_, pb_, pl_, pr_)
+        self._dilation = (dh_, dw_)
 
         self._x_shape = None   # 最近一次成功 forward 的输入形状
         self._out_shape = None  # 最近一次成功 forward 的输出形状
         self._winners = None   # 每个输出位置的最大值来源 (ih, iw)
 
     def forward(self, x):
-        """对 x: [N][C][H][W] 做最大池化，返回新 list 并缓存获胜位置。"""
+        """对 x: [N][C][H][W] 做最大池化，返回新 list 并缓存获胜位置。
+
+        仅在全部窗口采样完成后才更新缓存：任何失败都保留旧缓存，且不
+        修改实参 x。
+        """
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
         kh_, kw_ = self._kernel_size
         sh_, sw_ = self._stride
         pt_, pb_, pl_, pr_ = self._padding
-        if kh_ > h_ + pt_ + pb_ or kw_ > w_ + pl_ + pr_:
-            raise ValueError("池化窗口在补边后仍越界：kernel_size 大于补边后的输入")
-        oh_ = (h_ + pt_ + pb_ - kh_) // sh_ + 1
-        ow_ = (w_ + pl_ + pr_ - kw_) // sw_ + 1
+        dh_, dw_ = self._dilation
+        eh_ = (kh_ - 1) * dh_ + 1
+        ew_ = (kw_ - 1) * dw_ + 1
+        if eh_ > h_ + pt_ + pb_ or ew_ > w_ + pl_ + pr_:
+            raise ValueError("池化窗口在补边后仍越界：有效核大于补边后的输入")
+        oh_ = (h_ + pt_ + pb_ - eh_) // sh_ + 1
+        ow_ = (w_ + pl_ + pr_ - ew_) // sw_ + 1
 
         out = []
         winners = []
@@ -1357,17 +1372,23 @@ class MaxPool2D:
                         best = None
                         best_pos = None
                         for kh in range(kh_):
-                            ih = base_h + kh
+                            ih = base_h + kh * dh_
                             if ih < 0 or ih >= h_:
                                 continue
                             x_row = x_c[ih]
                             for kw in range(kw_):
-                                iw = base_w + kw
+                                iw = base_w + kw * dw_
                                 if 0 <= iw < w_:
                                     v = x_row[iw]
                                     if best is None or v > best:
                                         best = v
                                         best_pos = (ih, iw)
+                        if best_pos is None:
+                            raise ValueError(
+                                "池化窗口 (%d, %d) 无真实采样点："
+                                "膨胀/补边使窗口完全落在补边区域"
+                                % (oh, ow)
+                            )
                         row.append(best)
                         win_row.append(best_pos)
                     out_c.append(row)
@@ -1383,11 +1404,11 @@ class MaxPool2D:
         return out
 
     def backward(self, dy):
-        """根据上游梯度 dy 返回与输入同形状的 dx。
+        """根据上游梯度 dy 返回与输入同形状的新 list dx。
 
-        dy 的形状必须等于最近一次成功 forward 的输出形状；
-        梯度按 n→c→oh→ow 顺序累加到 forward 记录的获胜位置。
-        未成功 forward 前调用一律抛 ValueError。
+        dy 的形状必须等于最近一次成功 forward 的输出形状；梯度按
+        n→c→oh→ow 顺序累加到 forward 记录的获胜位置。未成功 forward
+        前调用、dy 形状错或累加产生非有限值一律抛 ValueError。
         """
         if self._winners is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -1412,7 +1433,15 @@ class MaxPool2D:
                     win_row = win_c[oh]
                     for ow in range(ow_):
                         ih, iw = win_row[ow]
-                        dx_c[ih][iw] += dy_row[ow]
+                        cell = dx_c[ih][iw] + dy_row[ow]
+                        if (
+                            isinstance(cell, float)
+                            and not math.isfinite(cell)
+                        ):
+                            raise ValueError(
+                                "池化反向梯度计算产生非有限值（NaN/inf）"
+                            )
+                        dx_c[ih][iw] = cell
         return dx
 
 
@@ -2674,18 +2703,22 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
 def _check_pool_window_ties(pool, inp):
     """扫描 MaxPool2D 对 inp 的全部有效窗口，任一窗口并列最大即抛 ValueError。
 
-    窗口/步长/补边规则与 MaxPool2D.forward 完全一致（补边位置不参与比较）：
-    窗口内同一最大值出现两次及以上即视为并列。inp 须为池化层合法四维输入。
+    窗口/步长/补边/膨胀规则与 MaxPool2D.forward 完全一致（采样坐标
+    oh*SH-PT+kh*DH、ow*SW-PL+kw*DW，补边位置不参与比较）：窗口内同一
+    最大值出现两次及以上即视为并列。inp 须为池化层合法四维输入。
     """
     kh_, kw_ = pool._kernel_size
     sh_, sw_ = pool._stride
     pt_, pb_, pl_, pr_ = pool._padding
+    dh_, dw_ = pool._dilation
+    eh_ = (kh_ - 1) * dh_ + 1
+    ew_ = (kw_ - 1) * dw_ + 1
     n_ = len(inp)
     c_ = len(inp[0])
     h_ = len(inp[0][0])
     w_ = len(inp[0][0][0])
-    oh_ = (h_ + pt_ + pb_ - kh_) // sh_ + 1
-    ow_ = (w_ + pl_ + pr_ - kw_) // sw_ + 1
+    oh_ = (h_ + pt_ + pb_ - eh_) // sh_ + 1
+    ow_ = (w_ + pl_ + pr_ - ew_) // sw_ + 1
     for n in range(n_):
         x_n = inp[n]
         for c in range(c_):
@@ -2697,12 +2730,12 @@ def _check_pool_window_ties(pool, inp):
                     best = None
                     tied = False
                     for kh in range(kh_):
-                        ih = base_h + kh
+                        ih = base_h + kh * dh_
                         if ih < 0 or ih >= h_:
                             continue
                         x_row = x_c[ih]
                         for kw in range(kw_):
-                            iw = base_w + kw
+                            iw = base_w + kw * dw_
                             if 0 <= iw < w_:
                                 v = x_row[iw]
                                 if best is None or v > best:
