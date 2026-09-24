@@ -7663,7 +7663,9 @@ def _check_deep_layer_types(
             )
 
 
-def _validate_deep_layers(layers, allow_dropout2d=False):
+def _validate_deep_layers(
+    layers, allow_dropout2d=False, allow_groupnorm=False
+):
     """严格九层结构校验（双层分类头契约）。
 
     layers 必须是恰含 Conv2D/BatchNorm2D/Dropout/(MaxPool2D、
@@ -7674,16 +7676,37 @@ def _validate_deep_layers(layers, allow_dropout2d=False):
     接口启用；train_deep_step、check_deep_gradients 已改用 _GN 组合，
     索引 1 另接受 GroupNorm2D）索引 2 另接受 Dropout2D，
     为其他类型仍抛 TypeError；其余 deep 训练接口沿用仅 Dropout 的既有
-    契约。另要求 BatchNorm2D 与 Dropout（或 Dropout2D）均处于训练态，
-    否则抛 ValueError。
+    契约。allow_groupnorm 为真时（train_deep_adam_accum_batches 启用）
+    索引 1 另接受 GroupNorm2D（无训练/推理之分、无运行统计），此时不做
+    归一化层训练态检查；索引 2 是否另接受 Dropout2D 仍由
+    allow_dropout2d 决定。另要求 BatchNorm2D 与 Dropout（或 Dropout2D）
+    均处于训练态，否则抛 ValueError。
     """
-    if allow_dropout2d:
-        _check_deep_layer_types(
-            layers, _DEEP_LAYER_TYPES_D2, _DEEP_LAYER_NAMES_D2
-        )
+    if allow_groupnorm:
+        norm_cls = (BatchNorm2D, GroupNorm2D)
+        norm_name = "BatchNorm2D 或 GroupNorm2D"
     else:
-        _check_deep_layer_types(layers)
-    if not layers[1]._training:
+        norm_cls = BatchNorm2D
+        norm_name = "BatchNorm2D"
+    if allow_dropout2d:
+        dropout_cls = (Dropout, Dropout2D)
+        dropout_name = "Dropout 或 Dropout2D"
+    else:
+        dropout_cls = Dropout
+        dropout_name = "Dropout"
+    expected = (
+        Conv2D, norm_cls, dropout_cls,
+        (MaxPool2D, AdaptiveAvgPool2D, AdaptiveMaxPool2D),
+        Flatten, Linear, ReLU, Linear, SoftmaxCrossEntropy,
+    )
+    names = (
+        "Conv2D", norm_name, dropout_name,
+        "MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D",
+        "Flatten", "Linear", "ReLU", "Linear", "SoftmaxCrossEntropy",
+    )
+    _check_deep_layer_types(layers, expected, names)
+    # GroupNorm2D 无训练/推理模式（亦无 _training 属性），不做模式检查。
+    if not isinstance(layers[1], GroupNorm2D) and not layers[1]._training:
         raise ValueError("BatchNorm2D 必须处于训练态")
     if not layers[2]._training:
         if allow_dropout2d and isinstance(layers[2], Dropout2D):
@@ -10182,7 +10205,8 @@ def train_deep_adam_accum_batches(
     eps=1e-8, m=None, v=None, step=0, state=None, max_updates=None,
     max_microbatches=None,
 ):
-    """九层网络（结构同 train_deep_accum_batches）的微批梯度累积 Adam
+    """九层网络（结构同 train_deep_accum_batches，但索引 1 另接受
+    GroupNorm2D）的微批梯度累积 Adam
     分轮训练：微批切分、Fisher–Yates 洗牌、前反向次序、按样本数累计
     微批损失与八组梯度、满 accum_steps 或轮末结算求样本加权均值、
     裁剪前全局梯度范数、可选全局范数裁剪、微批/更新边界暂停续训及
@@ -10193,6 +10217,13 @@ def train_deep_adam_accum_batches(
         m = beta1*m + (1-beta1)*g
         v = beta2*v + (1-beta2)*g*g
         p = p - lr * (m/(1-beta1**t)) / (sqrt(v/(1-beta2**t)) + eps)
+
+    layers 的索引 1 可为 BatchNorm2D 或 GroupNorm2D（其余八层顺序、
+    类型与训练态契约沿用 train_deep_accum_batches）：为其他类型抛
+    TypeError。GroupNorm2D 无训练/推理模式也无运行统计，前向每次按
+    当前微批分组归一化、backward 返回 (dx, dgamma, dbeta)，八组参数中
+    的 gamma/beta 即 GroupNorm2D 的 _gamma/_beta；失败回滚与成功保留
+    语义对 GroupNorm2D 仅涉参数引用、缓存与随机状态，无 BN 运行统计。
 
     其中 m、v 为跨更新延续的一阶、二阶矩，初值由 m、v 指定。恒返回
     (losses, grad_norms, m, v, step, state)：losses、grad_norms 语义
@@ -10273,7 +10304,7 @@ def train_deep_adam_accum_batches(
         raise TypeError(
             "shuffle 必须是 bool，得到 %s" % type(shuffle).__name__
         )
-    _validate_deep_layers(layers)
+    _validate_deep_layers(layers, allow_groupnorm=True)
     _check_deep_scalar(lr, "lr")
     if lr <= 0:
         raise ValueError("lr 必须为正数")
@@ -12037,6 +12068,700 @@ def load_data_checkpoint(data, data_sha256):
 
     state = _parse_norm_checkpoint_state(doc)
     return _layers_from_checkpoint_state(state)
+
+
+# ---------------------------------------------------------------------------
+# 微批 Adam 续训检查点：
+# dump_deep_adam_checkpoint(layers, m, v, step, state)、
+# load_deep_adam_checkpoint(data)
+#
+# layers 为 benchmarkdeep 九层链把索引 1 的 BatchNorm2D 换成
+# GroupNorm2D(2, [1.0, 1.0], [0.0, 0.0]) 的版本；m/v/step/state 沿用
+# train_deep_adam_accum_batches 的契约。
+# ---------------------------------------------------------------------------
+
+_CKPT_DA_VERSION = 1
+_CKPT_DA_TOP_KEYS = [
+    "version", "model", "dropout_state", "m", "v", "step", "state",
+]
+_CKPT_DA_MODEL_KEYS = ["conv", "groupnorm", "linear1", "linear2"]
+_CKPT_DA_GN_KEYS = ["gamma", "beta"]
+# 八组参数同序：conv weights/bias、GroupNorm gamma/beta、第一个 Linear
+# weights/bias、第二个 Linear weights/bias。
+_CKPT_DA_PARAM_SHAPES = (
+    (2, 1, 1, 1), (2,), (2,), (2,),
+    (2, 2), (2,), (2, 2), (2,),
+)
+_CKPT_DA_PARAM_DEPTHS = (4, 1, 1, 1, 2, 1, 2, 1)
+_CKPT_DA_PARAM_NAMES = (
+    "conv weights", "conv bias",
+    "groupnorm gamma", "groupnorm beta",
+    "linear1 weights", "linear1 bias",
+    "linear2 weights", "linear2 bias",
+)
+_CKPT_DA_GROUP_GROUPS = 2
+
+
+def _ckpt_da_param_refs(layers):
+    """按八组参数同序取出 (layer, attr) 配对。"""
+    conv, gn, _dropout, _pool, _flatten, linear1, _relu, linear2, _loss = (
+        layers
+    )
+    return (
+        (conv, "_weights"), (conv, "_bias"),
+        (gn, "_gamma"), (gn, "_beta"),
+        (linear1, "_weights"), (linear1, "_bias"),
+        (linear2, "_weights"), (linear2, "_bias"),
+    )
+
+
+def _validate_deep_adam_checkpoint_layers(layers):
+    """Adam 微批检查点九层链合法性：benchmarkdeep 配置 + GroupNorm 替换。
+
+    layers 必须恰含 9 层且顺序为 Conv2D/GroupNorm2D/Dropout/MaxPool2D/
+    Flatten/Linear/ReLU/Linear/SoftmaxCrossEntropy（索引 1 仅接受
+    GroupNorm2D，BatchNorm2D 等其他类型抛 TypeError）。Conv2D、Dropout、
+    MaxPool2D 配置与 fitnorm/benchmarkdeep 一致（Conv 1×1 stride 1、
+    Dropout p=0.25 seed=7 训练态、MaxPool(2,2,0)）；GroupNorm2D 须为
+    num_groups=2、eps=1e-5、gamma/beta 形状 [2]；两个 Linear 权重
+    [2][2]、偏置 [2]；conv 权重 [2][1][1][1]、偏置 [2]。全部叶值有限且
+    为 int/float（拒绝 bool），Dropout 随机状态在 [0, 2^32-1] 内。
+    容器/成员类型错抛 TypeError；长度、配置、形状、模式或非有限错抛
+    ValueError。
+    """
+    if not isinstance(layers, list):
+        raise TypeError(
+            "layers 必须是 list，得到 %s" % type(layers).__name__
+        )
+    if len(layers) != 9:
+        raise ValueError(
+            "layers 必须恰含 9 层，得到 %d 层" % len(layers)
+        )
+    conv, gn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
+    if not isinstance(conv, Conv2D):
+        raise TypeError(
+            "layers[0] 必须是 Conv2D 实例，得到 %s"
+            % type(conv).__name__
+        )
+    # 该检查点固定承载 GroupNorm 链：BN 链无对应 model 字段，拒绝。
+    if not isinstance(gn, GroupNorm2D):
+        raise TypeError(
+            "layers[1] 必须是 GroupNorm2D 实例，得到 %s"
+            % type(gn).__name__
+        )
+    if not isinstance(dropout, Dropout):
+        raise TypeError(
+            "layers[2] 必须是 Dropout 实例，得到 %s"
+            % type(dropout).__name__
+        )
+    if not isinstance(pool, MaxPool2D):
+        raise TypeError(
+            "layers[3] 必须是 MaxPool2D 实例，得到 %s"
+            % type(pool).__name__
+        )
+    if not isinstance(flatten, Flatten):
+        raise TypeError(
+            "layers[4] 必须是 Flatten 实例，得到 %s"
+            % type(flatten).__name__
+        )
+    if not isinstance(linear1, Linear):
+        raise TypeError(
+            "layers[5] 必须是 Linear 实例，得到 %s"
+            % type(linear1).__name__
+        )
+    if not isinstance(relu, ReLU):
+        raise TypeError(
+            "layers[6] 必须是 ReLU 实例，得到 %s" % type(relu).__name__
+        )
+    if not isinstance(linear2, Linear):
+        raise TypeError(
+            "layers[7] 必须是 Linear 实例，得到 %s"
+            % type(linear2).__name__
+        )
+    if not isinstance(loss, SoftmaxCrossEntropy):
+        raise TypeError(
+            "layers[8] 必须是 SoftmaxCrossEntropy 实例，得到 %s"
+            % type(loss).__name__
+        )
+    if not dropout._training:
+        raise ValueError("Dropout 必须处于训练态")
+
+    if conv._w_shape != _CKPT_CONV_W_SHAPE:
+        raise ValueError(
+            "Conv2D weights 形状必须为 [2][1][1][1]，得到 %s"
+            % (conv._w_shape,)
+        )
+    if conv._stride != (1, 1):
+        raise ValueError("Conv2D stride 必须为 (1, 1)")
+    if conv._padding != (0, 0, 0, 0):
+        raise ValueError("Conv2D padding 必须为 0")
+    if conv._dilation != (1, 1):
+        raise ValueError("Conv2D dilation 必须为 1")
+    if conv._groups != 1:
+        raise ValueError("Conv2D groups 必须为 1")
+    if conv._padding_mode != "zeros":
+        raise ValueError(
+            "Conv2D padding_mode 必须为 zeros，得到 %r"
+            % conv._padding_mode
+        )
+
+    if gn._num_groups != _CKPT_DA_GROUP_GROUPS:
+        raise ValueError(
+            "GroupNorm2D num_groups 必须为 %d，得到 %d"
+            % (_CKPT_DA_GROUP_GROUPS, gn._num_groups)
+        )
+    if gn._eps != _NORM_EPS:
+        raise ValueError(
+            "GroupNorm2D eps 必须为 %r" % _NORM_EPS
+        )
+
+    if dropout._p != _NORM_DROPOUT_P:
+        raise ValueError(
+            "Dropout p 必须为 %r" % _NORM_DROPOUT_P
+        )
+    if dropout._seed != _NORM_DROPOUT_SEED:
+        raise ValueError(
+            "Dropout seed 必须为 %d" % _NORM_DROPOUT_SEED
+        )
+
+    if pool._kernel_size != (2, 2):
+        raise ValueError("MaxPool2D kernel_size 必须为 (2, 2)")
+    if pool._stride != (2, 2):
+        raise ValueError("MaxPool2D stride 必须为 (2, 2)")
+    if pool._padding != (0, 0, 0, 0):
+        raise ValueError("MaxPool2D padding 必须为 0")
+
+    if linear1._w_shape != _CKPT_LINEAR_W_SHAPE:
+        raise ValueError(
+            "linear1 weights 形状必须为 [2][2]，得到 %s"
+            % (linear1._w_shape,)
+        )
+    if linear2._w_shape != _CKPT_LINEAR_W_SHAPE:
+        raise ValueError(
+            "linear2 weights 形状必须为 [2][2]，得到 %s"
+            % (linear2._w_shape,)
+        )
+
+    # 形状校验同时保证全部叶值为有限 int/float（拒绝 bool）。
+    refs = [
+        getattr(owner, attr)
+        for owner, attr in _ckpt_da_param_refs(layers)
+    ]
+    for ref, shape, name in zip(
+        refs, _CKPT_DA_PARAM_SHAPES, _CKPT_DA_PARAM_NAMES
+    ):
+        if _shape_of(ref, len(shape), name) != shape:
+            raise ValueError(
+                "%s 的形状必须为 %s"
+                % (name, "".join("[%d]" % d for d in shape))
+            )
+
+    # Dropout 随机状态始终由 LCG 约束在 [0, 2^32-1]，此处仅做防御性校验。
+    if isinstance(dropout._s, bool) or not isinstance(dropout._s, int):
+        raise TypeError(
+            "Dropout 随机状态必须是 int，得到 %s"
+            % type(dropout._s).__name__
+        )
+    if dropout._s < 0 or dropout._s > 0xFFFFFFFF:
+        raise ValueError("Dropout 随机状态必须在 [0, 2^32-1] 内")
+
+
+def _ckpt_require_nonneg_int(value, name):
+    """检查点整数契约：非负 int（拒绝 bool）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            "%s 必须是 int（拒绝 bool），得到 %s"
+            % (name, type(value).__name__)
+        )
+    if value < 0:
+        raise ValueError("%s 必须为非负整数" % name)
+    return value
+
+
+def _ckpt_validate_moments(m, v, refs):
+    """校验 m/v 配对契约（沿用 train_deep_adam_accum_batches）。
+
+    须同为 None（八组矩全零，调用方另需保证 step 为 0）或同为恰含 8 项
+    的 tuple，逐项与八组参数同形、叶为有限 int/float。返回
+    (m_trees, v_trees)：均为不与入参别名的全新 list（None 配对展开为
+    八组全零）。配对/长度/形状/非有限错抛 ValueError，容器或叶类型错
+    抛 TypeError。
+    """
+    m_none, v_none = m is None, v is None
+    if m_none != v_none:
+        raise ValueError("m 与 v 必须同为 None 或同为 8 项 tuple")
+    if m_none:
+        return (
+            [_zeros_like_tree(ref) for ref in refs],
+            [_zeros_like_tree(ref) for ref in refs],
+        )
+    if not isinstance(m, tuple) or not isinstance(v, tuple):
+        raise TypeError("m、v 必须是 None 或各含 8 项的 tuple")
+    if len(m) != 8 or len(v) != 8:
+        raise ValueError("m、v 必须各恰含 8 项")
+    m_trees, v_trees = [], []
+    for idx, (m_tree, v_tree, ref, name) in enumerate(
+        zip(m, v, refs, _CKPT_DA_PARAM_NAMES)
+    ):
+        _check_velocity_tree(m_tree, ref, "m 的 %s" % name)
+        _check_velocity_tree(v_tree, ref, "v 的 %s" % name)
+        m_trees.append(_deep_copy(m_tree))
+        v_trees.append(_deep_copy(v_tree))
+    return m_trees, v_trees
+
+
+def _ckpt_validate_state_head(state):
+    """校验 state 前四元 (epoch, order, cursor, rng) 的无 x/epochs 依赖部分。
+
+    state 必须是 tuple；epoch 为非负 int（拒绝 bool），order 为 int
+    （拒绝 bool）list，cursor 为非负 int，rng 为 [0, 2^32-1] 内 int。
+    返回 (length, epoch, order, cursor, rng)。
+    """
+    if not isinstance(state, tuple):
+        raise TypeError(
+            "state 必须是四元或八元 tuple，得到 %s"
+            % type(state).__name__
+        )
+    if len(state) not in (4, 8):
+        raise ValueError(
+            "state 必须恰含 4 项（更新边界）或 8 项（微批边界），"
+            "得到 %d 项" % len(state)
+        )
+    epoch, order, cursor, rng = state[:4]
+    _ckpt_require_nonneg_int(epoch, "state 的 epoch")
+    if not isinstance(order, list):
+        raise TypeError(
+            "state 的 order 必须是 list，得到 %s"
+            % type(order).__name__
+        )
+    for idx, value in enumerate(order):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                "state 的 order[%d] 必须是 int（拒绝 bool），得到 %s"
+                % (idx, type(value).__name__)
+            )
+        if value < 0:
+            raise ValueError(
+                "state 的 order[%d] 必须为非负整数" % idx
+            )
+    _ckpt_require_nonneg_int(cursor, "state 的 cursor")
+    if isinstance(rng, bool) or not isinstance(rng, int):
+        raise TypeError(
+            "state 的 rng 必须是 int（拒绝 bool），得到 %s"
+            % type(rng).__name__
+        )
+    if rng < 0 or rng > 0xFFFFFFFF:
+        raise ValueError("state 的 rng 必须满足 0 <= rng <= 2^32-1")
+    return len(state), epoch, order, cursor, rng
+
+
+def _dump_deep_adam_state_text(state, refs):
+    """把四元/八元 state 序列化为紧凑 JSON 数组文本（tuple 写数组）。
+
+    前四元为 [epoch, order, cursor, rng]（order 为 int 数组）；八元态追加
+    [pending_samples, pending_microbatches, pending_loss, pending_grads]：
+    前两者为正 int，pending_loss 为规范 hex 字符串，pending_grads 为八组
+    同序同形张量数组（hex 叶）。校验规则与异常沿用训练函数契约的结构部分。
+    """
+    length, epoch, order, cursor, rng = _ckpt_validate_state_head(state)
+    head = (
+        "[" + str(int(epoch))
+        + ",[" + ",".join(str(int(value)) for value in order) + "]"
+        + "," + str(int(cursor))
+        + "," + str(int(rng))
+    )
+    if length == 4:
+        return head + "]"
+
+    pending_samples, pending_micro, pending_loss, pending_grads = state[4:]
+    if isinstance(pending_samples, bool) or not isinstance(
+        pending_samples, int
+    ):
+        raise TypeError(
+            "state 的 pending_samples 必须是 int（拒绝 bool），得到 %s"
+            % type(pending_samples).__name__
+        )
+    if pending_samples <= 0:
+        raise ValueError("state 的 pending_samples 必须是正整数")
+    if isinstance(pending_micro, bool) or not isinstance(pending_micro, int):
+        raise TypeError(
+            "state 的 pending_microbatches 必须是 int（拒绝 bool），得到 %s"
+            % type(pending_micro).__name__
+        )
+    if pending_micro <= 0:
+        raise ValueError(
+            "state 的 pending_microbatches 必须是正整数"
+        )
+    # pending_loss 契约同训练函数：须恰为 float（拒绝 bool 与 int）。
+    if isinstance(pending_loss, bool) or not isinstance(pending_loss, float):
+        raise TypeError(
+            "state 的 pending_loss 必须是 float（拒绝 bool），得到 %s"
+            % type(pending_loss).__name__
+        )
+    pending_loss_text = _dump_hex_tensor(
+        pending_loss, 0, "state 的 pending_loss"
+    )
+    if not isinstance(pending_grads, tuple):
+        raise TypeError(
+            "state 的 pending_grads 必须是恰含 8 项的 tuple，得到 %s"
+            % type(pending_grads).__name__
+        )
+    if len(pending_grads) != 8:
+        raise ValueError(
+            "state 的 pending_grads 必须恰含 8 项，得到 %d 项"
+            % len(pending_grads)
+        )
+    grad_texts = []
+    for grad, ref, shape, name in zip(
+        pending_grads, refs, _CKPT_DA_PARAM_SHAPES, _CKPT_DA_PARAM_NAMES
+    ):
+        _check_pending_grad_tree(grad, ref, name)
+        grad_texts.append(
+            _dump_hex_tensor(grad, len(shape), "state 的 %s" % name)
+        )
+    return (
+        head
+        + "," + str(int(pending_samples))
+        + "," + str(int(pending_micro))
+        + "," + pending_loss_text
+        + ",[" + ",".join(grad_texts) + "]]"
+    )
+
+
+def _dump_deep_adam_model_text(conv, gn, linear1, linear2):
+    """序列化 model：conv/groupnorm/linear1/linear2，tuple 形态逐层固定。"""
+    conv_values = _dump_hex_tensor(conv._weights, 4, "conv values")
+    conv_bias = _dump_hex_tensor(conv._bias, 1, "conv bias")
+    gamma = _dump_hex_tensor(gn._gamma, 1, "gamma")
+    beta = _dump_hex_tensor(gn._beta, 1, "beta")
+    lin1_values = _dump_hex_tensor(linear1._weights, 2, "linear1 values")
+    lin1_bias = _dump_hex_tensor(linear1._bias, 1, "linear1 bias")
+    lin2_values = _dump_hex_tensor(linear2._weights, 2, "linear2 values")
+    lin2_bias = _dump_hex_tensor(linear2._bias, 1, "linear2 bias")
+    return (
+        '"model":{"conv":{"values":' + conv_values
+        + ',"bias":' + conv_bias + '}'
+        + ',"groupnorm":{"gamma":' + gamma
+        + ',"beta":' + beta + '}'
+        + ',"linear1":{"values":' + lin1_values
+        + ',"bias":' + lin1_bias + '}'
+        + ',"linear2":{"values":' + lin2_values
+        + ',"bias":' + lin2_bias + "}}"
+    )
+
+
+def _dump_moments_text(trees):
+    """把八组矩序列化为八项数组文本（tuple 写数组，hex 叶）。"""
+    parts = []
+    for tree, depth, name in zip(
+        trees, _CKPT_DA_PARAM_DEPTHS, _CKPT_DA_PARAM_NAMES
+    ):
+        parts.append(_dump_hex_tensor(tree, depth, name))
+    return "[" + ",".join(parts) + "]"
+
+
+def dump_deep_adam_checkpoint(layers, m, v, step, state):
+    """序列化 GroupNorm 九层链与 Adam 微批续训状态，返回紧凑 JSON bytes。
+
+    layers 为 benchmarkdeep 九层链把索引 1 的 BatchNorm2D 换成
+    GroupNorm2D(2, [1.0, 1.0], [0.0, 0.0]) 的版本（校验见
+    _validate_deep_adam_checkpoint_layers），Dropout 必须处于训练态。
+    m、v、step、state 沿用 train_deep_adam_accum_batches 的契约：m、v
+    须同为 None（八组矩全零，此时 step 必须为 0）或同为恰含 8 项的
+    tuple（逐项与 conv weights/bias、GroupNorm gamma/beta、第一个 Linear
+    weights/bias、第二个 Linear weights/bias 同序同形，叶为有限数）；
+    step 为非负 int（拒绝 bool）；state 须为四元 tuple（更新边界）或
+    八元 tuple（微批边界，pending_grads 为八组同序同形张量）。
+
+    返回 UTF-8 编码的紧凑 JSON 加单个换行（LF），顶层键依次为 version、
+    model、dropout_state、m、v、step、state；version 固定为 int 1；model
+    键依次为 conv、groupnorm、linear1、linear2（conv/linear 各含 values、
+    bias，groupnorm 含 gamma、beta，tuple 写数组）；m、v 为八张同形张量
+    数组；state 为四元或八元数组。全部浮点叶写为 float.hex() 的规范小写
+    十六进制字符串（负零统一 "0x0.0p+0"），与
+    dump_norm_checkpoint 完全一致。只读不修改 layers、m、v、state；同一
+    状态重复调用产出逐字节相同的 bytes。类型错抛 TypeError；长度、配置、
+    形状、配对关系或非有限值错抛 ValueError。
+    """
+    _validate_deep_adam_checkpoint_layers(layers)
+    _ckpt_require_nonneg_int(step, "step")
+    conv, gn, dropout, _pool, _flatten, linear1, _relu, linear2, _loss = (
+        layers
+    )
+    refs = [getattr(owner, attr) for owner, attr in _ckpt_da_param_refs(layers)]
+    m_trees, v_trees = _ckpt_validate_moments(m, v, refs)
+    if m is None and v is None and step != 0:
+        raise ValueError("m、v 同为 None（初始态）时 step 必须为 0")
+
+    parts = []
+    parts.append('"version":' + str(int(_CKPT_DA_VERSION)))
+    parts.append(_dump_deep_adam_model_text(conv, gn, linear1, linear2))
+    parts.append('"dropout_state":' + str(int(dropout._s)))
+    parts.append('"m":' + _dump_moments_text(m_trees))
+    parts.append('"v":' + _dump_moments_text(v_trees))
+    parts.append('"step":' + str(int(step)))
+    parts.append('"state":' + _dump_deep_adam_state_text(state, refs))
+    text = "{" + ",".join(parts) + "}\n"
+    return text.encode("utf-8")
+
+
+def _parse_ckpt_moments(obj, key):
+    """解析 m/v：长度恰为 8 的数组，逐项按固定形状解析规范 hex 张量。"""
+    if not isinstance(obj, list):
+        raise TypeError(
+            "%s 必须是数组，得到 %s" % (key, type(obj).__name__)
+        )
+    if len(obj) != 8:
+        raise ValueError("%s 必须恰含 8 项，得到 %d 项" % (key, len(obj)))
+    trees = []
+    for idx, (node, shape, depth, name) in enumerate(
+        zip(
+            obj, _CKPT_DA_PARAM_SHAPES, _CKPT_DA_PARAM_DEPTHS,
+            _CKPT_DA_PARAM_NAMES,
+        )
+    ):
+        trees.append(
+            _parse_hex_tensor(
+                node, depth, shape, "%s 的 %s" % (key, name)
+            )
+        )
+    return tuple(trees)
+
+
+def _parse_ckpt_state(obj):
+    """解析 state 四元/八元数组为全新 tuple。
+
+    前四元为 [epoch, order, cursor, rng]：非负 int、非负 int 数组、
+    非负 int、[0, 2^32-1] 内 int；八元态另含正 int pending_samples、
+    正 int pending_microbatches、规范 hex float pending_loss 与八组
+    pending_grads（同 m/v 形状）。键序/长度/类型/形状/hex 非法分别抛
+    ValueError/TypeError。
+    """
+    if not isinstance(obj, list):
+        raise TypeError(
+            "state 必须是数组，得到 %s" % type(obj).__name__
+        )
+    if len(obj) not in (4, 8):
+        raise ValueError(
+            "state 必须恰含 4 项或 8 项，得到 %d 项" % len(obj)
+        )
+    epoch, order_node, cursor, rng = obj[:4]
+    _ckpt_require_nonneg_int(epoch, "state 的 epoch")
+    if not isinstance(order_node, list):
+        raise TypeError(
+            "state 的 order 必须是数组，得到 %s"
+            % type(order_node).__name__
+        )
+    order = []
+    for idx, value in enumerate(order_node):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                "state 的 order[%d] 必须是 int（拒绝 bool），得到 %s"
+                % (idx, type(value).__name__)
+            )
+        if value < 0:
+            raise ValueError(
+                "state 的 order[%d] 必须为非负整数" % idx
+            )
+        order.append(int(value))
+    _ckpt_require_nonneg_int(cursor, "state 的 cursor")
+    if isinstance(rng, bool) or not isinstance(rng, int):
+        raise TypeError(
+            "state 的 rng 必须是 int（拒绝 bool），得到 %s"
+            % type(rng).__name__
+        )
+    if rng < 0 or rng > 0xFFFFFFFF:
+        raise ValueError("state 的 rng 必须满足 0 <= rng <= 2^32-1")
+
+    if len(obj) == 4:
+        return (int(epoch), order, int(cursor), int(rng))
+
+    pending_samples, pending_micro, pending_loss_node, pending_grads = obj[4:]
+    if isinstance(pending_samples, bool) or not isinstance(
+        pending_samples, int
+    ):
+        raise TypeError(
+            "state 的 pending_samples 必须是 int（拒绝 bool），得到 %s"
+            % type(pending_samples).__name__
+        )
+    if pending_samples <= 0:
+        raise ValueError("state 的 pending_samples 必须是正整数")
+    if isinstance(pending_micro, bool) or not isinstance(pending_micro, int):
+        raise TypeError(
+            "state 的 pending_microbatches 必须是 int（拒绝 bool），得到 %s"
+            % type(pending_micro).__name__
+        )
+    if pending_micro <= 0:
+        raise ValueError("state 的 pending_microbatches 必须是正整数")
+    pending_loss = _parse_hex_tensor(
+        pending_loss_node, 0, (), "state 的 pending_loss"
+    )
+    if not isinstance(pending_grads, list):
+        raise TypeError(
+            "state 的 pending_grads 必须是数组，得到 %s"
+            % type(pending_grads).__name__
+        )
+    if len(pending_grads) != 8:
+        raise ValueError(
+            "state 的 pending_grads 必须恰含 8 项，得到 %d 项"
+            % len(pending_grads)
+        )
+    grads = []
+    for node, shape, depth, name in zip(
+        pending_grads, _CKPT_DA_PARAM_SHAPES, _CKPT_DA_PARAM_DEPTHS,
+        _CKPT_DA_PARAM_NAMES,
+    ):
+        grads.append(
+            _parse_hex_tensor(
+                node, depth, shape, "state 的 %s" % name
+            )
+        )
+    return (
+        int(epoch), order, int(cursor), int(rng),
+        int(pending_samples), int(pending_micro),
+        pending_loss, tuple(grads),
+    )
+
+
+def load_deep_adam_checkpoint(data):
+    """从 dump_deep_adam_checkpoint 的 bytes 重建无缓存训练态 GroupNorm
+    九层链与 Adam 微批续训状态。
+
+    data 必须是 bytes（其他类型一律 TypeError）。其内容须为 UTF-8 编码
+    的检查点 JSON：非法 UTF-8 抛 UnicodeDecodeError；JSON 语法错、
+    NaN/Infinity/-Infinity 常量、重复/缺失/额外/错序键、非法或非规范
+    hex（仅接受 dump 的规范小写串，负零仅 "0x0.0p+0"）、形状/范围错或
+    非有限值抛 ValueError，容器或字段类型错抛 TypeError（异常与编码
+    规则沿用 load_norm_checkpoint）。
+
+    返回 (layers, m, v, step, state)：layers 为九层新 list
+    （Conv2D/GroupNorm2D(2, gamma, beta, eps=1e-5)/Dropout(p=0.25,
+    seed=7，训练态)/MaxPool2D(2,2,0)/Flatten/Linear/ReLU/Linear/
+    SoftmaxCrossEntropy），全部层为全新对象、无任何前向缓存，Dropout 的
+    LCG 随机状态取 dropout_state；m、v 为各含八张新张量的 tuple，step
+    为非负 int，state 为四元或八元新 tuple（order 为新 list、矩/梯度
+    张量不与 JSON 解析中间结构别名）。加载后续训与不中断训练得到的损失、
+    梯度范数、八组参数、两矩、step 与最终 state 完全相同；不修改实参
+    data。
+    """
+    if not isinstance(data, bytes):
+        raise TypeError(
+            "data 必须是 bytes，得到 %s" % type(data).__name__
+        )
+    text = data.decode("utf-8")
+    _reject_json_constants(data)
+    doc = json.loads(
+        text, object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(doc, dict):
+        raise TypeError("检查点顶层必须是 JSON 对象")
+    if list(doc.keys()) != _CKPT_DA_TOP_KEYS:
+        raise ValueError(
+            "检查点顶层键必须依次为 version、model、dropout_state、"
+            "m、v、step、state"
+        )
+
+    version = doc["version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(
+            "version 必须是 int，得到 %s" % type(version).__name__
+        )
+    if version != _CKPT_DA_VERSION:
+        raise ValueError(
+            "version 必须为 %d，得到 %r" % (_CKPT_DA_VERSION, version)
+        )
+
+    model = doc["model"]
+    if not isinstance(model, dict):
+        raise TypeError(
+            "model 必须是 JSON 对象，得到 %s" % type(model).__name__
+        )
+    if list(model.keys()) != _CKPT_DA_MODEL_KEYS:
+        raise ValueError(
+            "model 的键必须依次为 conv、groupnorm、linear1、linear2"
+        )
+    conv_obj = model["conv"]
+    gn_obj = model["groupnorm"]
+    linear1_obj = model["linear1"]
+    linear2_obj = model["linear2"]
+    for obj_name, obj in (
+        ("conv", conv_obj),
+        ("groupnorm", gn_obj),
+        ("linear1", linear1_obj),
+        ("linear2", linear2_obj),
+    ):
+        if not isinstance(obj, dict):
+            raise TypeError(
+                "%s 必须是 JSON 对象，得到 %s"
+                % (obj_name, type(obj).__name__)
+            )
+    if list(conv_obj.keys()) != _CKPT_LAYER_KEYS:
+        raise ValueError("conv 的键必须依次为 values、bias")
+    if list(gn_obj.keys()) != _CKPT_DA_GN_KEYS:
+        raise ValueError("groupnorm 的键必须依次为 gamma、beta")
+    if list(linear1_obj.keys()) != _CKPT_LAYER_KEYS:
+        raise ValueError("linear1 的键必须依次为 values、bias")
+    if list(linear2_obj.keys()) != _CKPT_LAYER_KEYS:
+        raise ValueError("linear2 的键必须依次为 values、bias")
+
+    conv_w = _parse_hex_tensor(
+        conv_obj["values"], 4, _CKPT_CONV_W_SHAPE, "conv values"
+    )
+    conv_b = _parse_hex_tensor(
+        conv_obj["bias"], 1, _CKPT_BIAS_SHAPE, "conv bias"
+    )
+    gamma = _parse_hex_tensor(
+        gn_obj["gamma"], 1, _CKPT_BIAS_SHAPE, "gamma"
+    )
+    beta = _parse_hex_tensor(
+        gn_obj["beta"], 1, _CKPT_BIAS_SHAPE, "beta"
+    )
+    lin1_w = _parse_hex_tensor(
+        linear1_obj["values"], 2, _CKPT_LINEAR_W_SHAPE, "linear1 values"
+    )
+    lin1_b = _parse_hex_tensor(
+        linear1_obj["bias"], 1, _CKPT_BIAS_SHAPE, "linear1 bias"
+    )
+    lin2_w = _parse_hex_tensor(
+        linear2_obj["values"], 2, _CKPT_LINEAR_W_SHAPE, "linear2 values"
+    )
+    lin2_b = _parse_hex_tensor(
+        linear2_obj["bias"], 1, _CKPT_BIAS_SHAPE, "linear2 bias"
+    )
+
+    dropout_state = doc["dropout_state"]
+    if isinstance(dropout_state, bool) or not isinstance(dropout_state, int):
+        raise TypeError(
+            "dropout_state 必须是 int，得到 %s"
+            % type(dropout_state).__name__
+        )
+    if dropout_state < 0 or dropout_state > 0xFFFFFFFF:
+        raise ValueError("dropout_state 必须在 [0, 2^32-1] 内")
+
+    m = _parse_ckpt_moments(doc["m"], "m")
+    v = _parse_ckpt_moments(doc["v"], "v")
+
+    step = doc["step"]
+    _ckpt_require_nonneg_int(step, "step")
+    state = _parse_ckpt_state(doc["state"])
+
+    # 全部以解析出的新张量新建无缓存训练态九层链。
+    conv = Conv2D(conv_w, conv_b)
+    gn = GroupNorm2D(
+        _CKPT_DA_GROUP_GROUPS, gamma, beta, _NORM_EPS
+    )
+    dropout = Dropout(_NORM_DROPOUT_P, _NORM_DROPOUT_SEED)
+    dropout._s = int(dropout_state)
+    pool = MaxPool2D(2, 2, 0)
+    flatten = Flatten()
+    linear1 = Linear(lin1_w, lin1_b)
+    relu = ReLU()
+    linear2 = Linear(lin2_w, lin2_b)
+    loss = SoftmaxCrossEntropy()
+    layers = [
+        conv, gn, dropout, pool, flatten, linear1, relu, linear2, loss,
+    ]
+    return layers, m, v, int(step), state
 
 
 def _parse_resume_epochs(text):
