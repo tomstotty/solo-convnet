@@ -43,6 +43,8 @@
   0 或 1/(1-p) 通道掩码；推理态原样复制、不推进随机状态、缓存全 1。
 - BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并更新
   running_mean/running_var，推理态使用运行统计仿射。
+- GroupNorm2D 层：NCHW 嵌套 list，逐样本分组归一化；num_groups 为正 int
+  且整除通道数，每组跨通道与空间位置求 μ、总体方差 v，无训练/推理之分。
 - SoftmaxCrossEntropy 层：二维 logits [N][K] 与 labels [N] 的加权
   softmax 交叉熵损失（可选 label_smoothing、class_weights、
   ignore_index），反向返回对 logits 的梯度（被忽略标签行为全 0）。
@@ -2864,6 +2866,252 @@ class BatchNorm2D:
         return dx, dgamma, dbeta
 
 
+class GroupNorm2D:
+    """二维组归一化层（NCHW，嵌套 list，无训练/推理两态）。
+
+    GroupNorm2D(num_groups, gamma, beta, eps=1e-5)：
+    num_groups G 为正 int（拒绝 bool）；gamma、beta 为等长非空一维 list，
+    元素为有限 int/float（拒绝 bool），长度 C 即通道数，G 必须整除 C；
+    eps 为正的有限 int/float（拒绝 bool）。
+
+    forward(x)：x 为规则非空有限数嵌套 list[N][C][H][W]（拒绝 bool）。
+    每个样本 n 各自按组归一化：组 g 含通道 c∈[g*C/G,(g+1)*C/G)，
+    M = (C/G)*H*W，按 c→h→w 顺序求 μ = Σx/M、总体方差 v = Σ(x-μ)^2/M、
+    z = (x-μ)/sqrt(v+eps)，输出 y = gamma[c]*z + beta[c] 组成的同形新
+    list。仅成功时缓存 z、v（逐样本逐组）与形状，失败保留旧缓存、不改实参。
+
+    backward(dy)：dy 形状须同最近一次成功 forward 的输出；令
+    u = dy*gamma[c]，在每个样本组内按 c→h→w 求 A = Σu、B = Σ(u*z)，
+    dx = (u - (A + z*B)/M) / sqrt(v+eps)；dgamma、dbeta 按 n→h→w 跨样本
+    累加 dy*z、dy。返回 (dx, dgamma, dbeta)，形状依次同 x、gamma、beta。
+    尚无成功 forward 缓存时调用一律抛 ValueError。
+    """
+
+    def __init__(self, num_groups, gamma, beta, eps=1e-5):
+        _check_groups(num_groups)
+        _require_list(gamma, "gamma")
+        _require_list(beta, "beta")
+        g_shape = _shape_of(gamma, 1, "gamma")
+        b_shape = _shape_of(beta, 1, "beta")
+        if b_shape[0] != g_shape[0]:
+            raise ValueError(
+                "beta 长度 %d 与 gamma 长度 %d 不符"
+                % (b_shape[0], g_shape[0])
+            )
+        if g_shape[0] % num_groups != 0:
+            raise ValueError(
+                "num_groups %d 必须整除通道数 %d"
+                % (num_groups, g_shape[0])
+            )
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+            raise TypeError(
+                "eps 必须是 int/float（拒绝 bool），得到 %s"
+                % type(eps).__name__
+            )
+        if not math.isfinite(eps):
+            raise ValueError("eps 必须是有限值（拒绝 NaN/inf）")
+        if eps <= 0:
+            raise ValueError("eps 必须为正数")
+
+        self._num_groups = num_groups
+        self._gamma = gamma
+        self._beta = beta
+        self._eps = eps
+
+        self._z = None           # 最近一次成功 forward 缓存的归一化值 z
+        self._var = None         # 最近一次成功 forward 缓存的逐样本逐组方差 v
+        self._out_shape = None   # 最近一次成功 forward 的输出形状
+
+    def forward(self, x):
+        """对 x: [N][C][H][W] 逐样本分组归一化，返回同形新 list。
+
+        仅成功时缓存 z/v/形状；校验或计算失败不改变实参与旧缓存。
+        """
+        _require_list(x, "x")
+        n_, c_, h_, w_ = _shape_of_strict(x, 4, "x")
+        if c_ != len(self._gamma):
+            raise ValueError(
+                "输入通道数 %d 与 gamma/beta 长度 %d 不符"
+                % (c_, len(self._gamma))
+            )
+
+        groups = self._num_groups
+        channels_per_group = c_ // groups
+        m_ = channels_per_group * h_ * w_
+        gamma = self._gamma
+        beta = self._beta
+        eps = self._eps
+
+        means = [[0.0] * groups for _ in range(n_)]
+        variances = [[0.0] * groups for _ in range(n_)]
+        for n in range(n_):
+            for grp in range(groups):
+                c0 = grp * channels_per_group
+                acc = 0.0
+                for c in range(c0, c0 + channels_per_group):
+                    x_c = x[n][c]
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        for ww in range(w_):
+                            acc += x_row[ww]
+                mu = acc / m_
+                sq = 0.0
+                for c in range(c0, c0 + channels_per_group):
+                    x_c = x[n][c]
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        for ww in range(w_):
+                            d = x_row[ww] - mu
+                            sq += d * d
+                means[n][grp] = mu
+                variances[n][grp] = sq / m_
+
+        out = []
+        z_cache = []
+        for n in range(n_):
+            out_n = []
+            z_n = []
+            for grp in range(groups):
+                inv = 1.0 / math.sqrt(variances[n][grp] + eps)
+                mu = means[n][grp]
+                c0 = grp * channels_per_group
+                for c in range(c0, c0 + channels_per_group):
+                    gc = gamma[c]
+                    bc = beta[c]
+                    x_c = x[n][c]
+                    out_c = []
+                    z_c = []
+                    for hh in range(h_):
+                        x_row = x_c[hh]
+                        out_row = []
+                        z_row = []
+                        for ww in range(w_):
+                            zval = (x_row[ww] - mu) * inv
+                            z_row.append(zval)
+                            out_row.append(gc * zval + bc)
+                        z_c.append(z_row)
+                        out_c.append(out_row)
+                    z_n.append(z_c)
+                    out_n.append(out_c)
+            out.append(out_n)
+            z_cache.append(z_n)
+
+        for n in range(n_):
+            for grp in range(groups):
+                if not (
+                    math.isfinite(means[n][grp])
+                    and math.isfinite(variances[n][grp])
+                ):
+                    raise ValueError("前向计算产生非有限值（NaN/inf）")
+        for n in range(n_):
+            for c in range(c_):
+                for hh in range(h_):
+                    for ww in range(w_):
+                        if not (
+                            math.isfinite(out[n][c][hh][ww])
+                            and math.isfinite(z_cache[n][c][hh][ww])
+                        ):
+                            raise ValueError("前向计算产生非有限值（NaN/inf）")
+
+        self._z = z_cache
+        self._var = variances
+        self._out_shape = (n_, c_, h_, w_)
+        return out
+
+    def backward(self, dy):
+        """根据上游梯度 dy 返回 (dx, dgamma, dbeta)。
+
+        形状依次同 x、gamma、beta；使用最近一次成功 forward 的缓存，
+        dy 的形状必须等于该次 forward 的输出形状；尚无成功 forward 缓存
+        时调用一律抛 ValueError。失败不修改实参与缓存。
+        """
+        if self._z is None:
+            raise ValueError("尚未成功执行 forward，无法 backward")
+        _require_list(dy, "dy")
+        dy_shape = _shape_of_strict(dy, 4, "dy")
+        if dy_shape != self._out_shape:
+            raise ValueError(
+                "dy 形状 %s 与最近输出形状 %s 不符"
+                % (dy_shape, self._out_shape)
+            )
+
+        n_, c_, h_, w_ = self._out_shape
+        groups = self._num_groups
+        channels_per_group = c_ // groups
+        m_ = channels_per_group * h_ * w_
+        gamma = self._gamma
+        eps = self._eps
+        z_cache = self._z
+        variances = self._var
+
+        dgamma = [0.0] * c_
+        dbeta = [0.0] * c_
+        for c in range(c_):
+            sg = 0.0
+            sb = 0.0
+            for n in range(n_):
+                dy_c = dy[n][c]
+                z_c = z_cache[n][c]
+                for hh in range(h_):
+                    dy_row = dy_c[hh]
+                    z_row = z_c[hh]
+                    for ww in range(w_):
+                        g = dy_row[ww]
+                        sb += g
+                        sg += g * z_row[ww]
+            dgamma[c] = sg
+            dbeta[c] = sb
+
+        dx = []
+        inv_m = 1.0 / m_
+        for n in range(n_):
+            dx_n = []
+            for grp in range(groups):
+                c0 = grp * channels_per_group
+                inv = 1.0 / math.sqrt(variances[n][grp] + eps)
+                sum_u = 0.0
+                sum_uz = 0.0
+                for c in range(c0, c0 + channels_per_group):
+                    gc = gamma[c]
+                    dy_c = dy[n][c]
+                    z_c = z_cache[n][c]
+                    for hh in range(h_):
+                        dy_row = dy_c[hh]
+                        z_row = z_c[hh]
+                        for ww in range(w_):
+                            uval = dy_row[ww] * gc
+                            sum_u += uval
+                            sum_uz += uval * z_row[ww]
+                for c in range(c0, c0 + channels_per_group):
+                    dy_c = dy[n][c]
+                    z_c = z_cache[n][c]
+                    dx_c = []
+                    for hh in range(h_):
+                        dy_row = dy_c[hh]
+                        z_row = z_c[hh]
+                        dx_row = []
+                        for ww in range(w_):
+                            zval = z_row[ww]
+                            uval = dy_row[ww] * gamma[c]
+                            dx_row.append(
+                                (uval - (sum_u + zval * sum_uz) * inv_m) * inv
+                            )
+                        dx_c.append(dx_row)
+                    dx_n.append(dx_c)
+            dx.append(dx_n)
+
+        for c in range(c_):
+            if not (math.isfinite(dgamma[c]) and math.isfinite(dbeta[c])):
+                raise ValueError("反向计算产生非有限值（NaN/inf）")
+        for n in range(n_):
+            for c in range(c_):
+                for hh in range(h_):
+                    for ww in range(w_):
+                        if not math.isfinite(dx[n][c][hh][ww]):
+                            raise ValueError("反向计算产生非有限值（NaN/inf）")
+        return dx, dgamma, dbeta
+
+
 class SoftmaxCrossEntropy:
     """Softmax + 交叉熵损失层（限二维 logits [N][K]，labels [N]）。
 
@@ -3128,13 +3376,13 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验层的前向/反向实现。
 
     layer 限 Conv2D/ConvTranspose2D/MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/
-    AdaptiveMaxPool2D/Flatten/Linear/ReLU/Dropout/Dropout2D/BatchNorm2D
-    实例，其余抛 TypeError。解析梯度 a 取自原值 forward(x) 后 backward(dy)
-    的对应返回：Conv2D/ConvTranspose2D/Linear 还包含 dweights、dbias，按
-    x、weights、bias 顺序检查 dx、dweights、dbias；BatchNorm2D 按 x、
-    gamma、beta 顺序检查 dx、dgamma、dbeta；MaxPool2D/AvgPool2D/
-    AdaptiveAvgPool2D/AdaptiveMaxPool2D/Flatten/ReLU/Dropout/Dropout2D
-    只检查 x。
+    AdaptiveMaxPool2D/Flatten/Linear/ReLU/Dropout/Dropout2D/BatchNorm2D/
+    GroupNorm2D 实例，其余抛 TypeError。解析梯度 a 取自原值 forward(x) 后
+    backward(dy) 的对应返回：Conv2D/ConvTranspose2D/Linear 还包含 dweights、
+    dbias，按 x、weights、bias 顺序检查 dx、dweights、dbias；
+    BatchNorm2D/GroupNorm2D 按 x、gamma、beta 顺序检查 dx、dgamma、
+    dbeta；MaxPool2D/AvgPool2D/AdaptiveAvgPool2D/AdaptiveMaxPool2D/
+    Flatten/ReLU/Dropout/Dropout2D 只检查 x。
     AdaptiveMaxPool2D 的任一次前向中任一分箱并列最大一律抛 ValueError
     ——max 在并列点梯度无定义（解析梯度前向与每次正、负扰动前向均检测）。
     对每个标量 v，定义标量损失 L：acc=0.0，按输出嵌套索引从外到内递增
@@ -3142,7 +3390,9 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
     n = (L(v+eps) - L(v-eps)) / (2*eps)，各目标内部标量按嵌套序遍历。
 
     BatchNorm2D 仅在训练态检查，推理态一律抛 ValueError；每次数值前向都
-    重新按当前批次统计（gamma/beta 扰动不影响归一化值 z）。
+    重新按当前批次统计（gamma/beta 扰动不影响归一化值 z）。GroupNorm2D
+    无训练/推理之分，每次数值前向都重新按当前样本逐组统计（gamma/beta
+    扰动同样不影响 z）。
     Dropout/Dropout2D 训练态以入口随机状态 _s 为基准：解析梯度前向及每次
     正、负扰动前向之前都把 _s 恢复为入口值，使各次前向重放同一掩码
     （Dropout2D 的通道掩码按 n→c 推进），故同一入口状态结果确定；推理态
@@ -3165,12 +3415,12 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
         layer,
         (Conv2D, ConvTranspose2D, MaxPool2D, AvgPool2D, AdaptiveAvgPool2D,
          AdaptiveMaxPool2D, Flatten, Linear, ReLU, Dropout, Dropout2D,
-         BatchNorm2D),
+         BatchNorm2D, GroupNorm2D),
     ):
         raise TypeError(
             "layer 必须是 Conv2D/ConvTranspose2D/MaxPool2D/AvgPool2D/"
             "AdaptiveAvgPool2D/AdaptiveMaxPool2D/Flatten/Linear/ReLU/"
-            "Dropout/Dropout2D/BatchNorm2D 实例，得到 %s"
+            "Dropout/Dropout2D/BatchNorm2D/GroupNorm2D 实例，得到 %s"
             % type(layer).__name__
         )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
@@ -3189,6 +3439,7 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
         raise ValueError("rtol 必须为非负数")
 
     is_batchnorm = isinstance(layer, BatchNorm2D)
+    is_groupnorm = isinstance(layer, GroupNorm2D)
     is_dropout = isinstance(layer, (Dropout, Dropout2D))
     is_adaptive_maxpool = isinstance(layer, AdaptiveMaxPool2D)
     if is_batchnorm and not layer._training:
@@ -3212,7 +3463,7 @@ def check_gradients(layer, x, dy, eps=1e-6, atol=1e-6, rtol=1e-4):
                 ("weights", layer._weights, dw),
                 ("bias", layer._bias, db),
             )
-        elif is_batchnorm:
+        elif is_batchnorm or is_groupnorm:
             dx, dgamma, dbeta = grad
             targets = (
                 ("x", x, dx),
