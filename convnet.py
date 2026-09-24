@@ -76,14 +76,18 @@
   批顺序排列、长度 epochs*ceil(N/batch_size) 的各批更新前批均损失
   新 list[float]；任何异常都把七层整体恢复到函数入口状态。
 - train_deep_step(layers, x, labels, lr=0.1)：对
-  Conv2D→BatchNorm2D→(Dropout 或 Dropout2D)→(MaxPool2D、
+  Conv2D→(BatchNorm2D 或 GroupNorm2D)→(Dropout 或 Dropout2D)→
+  (MaxPool2D、
   AdaptiveAvgPool2D 或
   AdaptiveMaxPool2D)→Flatten→Linear→ReLU→Linear→SoftmaxCrossEntropy
   九层（双层分类头）按序前向、自损失层起逆序反传，以新 list 同步
-  更新 conv 权重/偏置、BN gamma/beta 及两个 Linear 权重/偏置（损失
-  梯度已批均，不再除 N），返回更新前 float 批均损失；容器/成员类型
-  错抛 TypeError（索引 2 为 Dropout/Dropout2D 以外类型同样抛
-  TypeError），长度错或 BN/Dropout/Dropout2D 非训练态抛 ValueError；
+  更新 conv 权重/偏置、归一化层 gamma/beta 及两个 Linear 权重/偏置
+  （损失梯度已批均，不再除 N），返回更新前 float 批均损失；索引 1
+  接受 BatchNorm2D 或 GroupNorm2D（GroupNorm2D 无训练/推理模式、不
+  维护运行统计，仅更新其 gamma/beta），九层顺序与其余各层类型不变；
+  容器/成员类型错抛 TypeError（索引 1 为两类归一化以外、索引 2 为
+  Dropout/Dropout2D 以外类型同样抛 TypeError），长度错或
+  BatchNorm2D/Dropout/Dropout2D 非训练态抛 ValueError；
   成功保留更新与状态推进，任何异常都把九层（含参数引用）恢复到入口状态。
   Dropout2D 训练态按 n→c 每通道一次 LCG 抽样生成 [N][C] 整通道掩码并
   广播前反向，成功一次前向仅推进一次随机状态。
@@ -173,7 +177,10 @@
 - check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6,
   rtol=1e-4)：以中心差分依次检验 x 与上述八组参数的数值梯度，损失、
   误差、容差判定与 (ok, max_e, max_r) 返回沿用 check_train_gradients；
-  索引 2 为 Dropout 或 Dropout2D 时均在解析前向与每次正、负扰动前
+  索引 1 接受 BatchNorm2D 或 GroupNorm2D（GroupNorm2D 无模式，按样本
+  分组重新统计、无运行统计），扰动顺序仍为 x、conv weights/bias、
+  归一化 gamma/beta、两个 Linear weights/bias；索引 2 为 Dropout 或
+  Dropout2D 时均在解析前向与每次正、负扰动前
   恢复入口随机状态以重放同一掩码（Dropout2D 重放按 n→c 生成的 [N][C]
   整通道掩码）；pool 为 AdaptiveMaxPool2D 时任一次前向中任一分箱并列
   最大抛 ValueError；结束时（含异常路径）九层入口状态与参数引用整体
@@ -7562,7 +7569,10 @@ def train_norm_step(layers, x, labels, lr=0.1):
 # SoftmaxCE。仅 train_deep_step/check_deep_gradients/train_deep_batches/
 # train_deep_accum_batches 四个接口把索引 2 扩展为 (Dropout, Dropout2D)；
 # 其余 deep 训练接口（动量/Adam 等）沿用仅 Dropout 的既有契约，故默认
-# 常量保持原样，扩展版以 _D2 后缀单独给出。
+# 常量保持原样，扩展版以 _D2 后缀单独给出。train_deep_step 与
+# check_deep_gradients 两个入口另把索引 1 扩展为 (BatchNorm2D,
+# GroupNorm2D)，该组合以 _GN 后缀单独给出；批训练接口仍仅接受
+# BatchNorm2D，GroupNorm2D 无训练/推理模式也无运行统计。
 # ---------------------------------------------------------------------------
 
 _DEEP_LAYER_TYPES = (
@@ -7582,6 +7592,19 @@ _DEEP_LAYER_TYPES_D2 = (
 )
 _DEEP_LAYER_NAMES_D2 = (
     "Conv2D", "BatchNorm2D", "Dropout 或 Dropout2D",
+    "MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D",
+    "Flatten", "Linear", "ReLU", "Linear", "SoftmaxCrossEntropy",
+)
+# train_deep_step / check_deep_gradients 的扩展契约：索引 1 另接受
+# GroupNorm2D（无训练/推理模式、无运行统计），索引 2 仍接受 Dropout 或
+# Dropout2D；其余七层顺序与类型不变。
+_DEEP_LAYER_TYPES_GN = (
+    Conv2D, (BatchNorm2D, GroupNorm2D), (Dropout, Dropout2D),
+    (MaxPool2D, AdaptiveAvgPool2D, AdaptiveMaxPool2D),
+    Flatten, Linear, ReLU, Linear, SoftmaxCrossEntropy,
+)
+_DEEP_LAYER_NAMES_GN = (
+    "Conv2D", "BatchNorm2D 或 GroupNorm2D", "Dropout 或 Dropout2D",
     "MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D",
     "Flatten", "Linear", "ReLU", "Linear", "SoftmaxCrossEntropy",
 )
@@ -7647,8 +7670,9 @@ def _validate_deep_layers(layers, allow_dropout2d=False):
     AdaptiveAvgPool2D 或 AdaptiveMaxPool2D)/Flatten/Linear/ReLU/Linear/
     SoftmaxCrossEntropy 九层实例（类型与顺序均固定）的 list：容器或成员
     类型错抛 TypeError，长度错抛 ValueError。allow_dropout2d 为真时
-    （仅 train_deep_step、check_deep_gradients、train_deep_batches、
-    train_deep_accum_batches 四个接口启用）索引 2 另接受 Dropout2D，
+    （train_deep_batches 与 train_deep_accum_batches 等微批/批训练
+    接口启用；train_deep_step、check_deep_gradients 已改用 _GN 组合，
+    索引 1 另接受 GroupNorm2D）索引 2 另接受 Dropout2D，
     为其他类型仍抛 TypeError；其余 deep 训练接口沿用仅 Dropout 的既有
     契约。另要求 BatchNorm2D 与 Dropout（或 Dropout2D）均处于训练态，
     否则抛 ValueError。
@@ -7719,17 +7743,20 @@ def _check_deep_scalar(value, name):
 
 
 def train_deep_step(layers, x, labels, lr=0.1):
-    """九层网络（Conv2D/BN/(Dropout 或 Dropout2D)/(MaxPool、
-    AdaptiveAvgPool 或 AdaptiveMaxPool)/Flatten/Linear/ReLU/Linear/
-    SoftmaxCE，双层分类头）
+    """九层网络（Conv2D/(BatchNorm2D 或 GroupNorm2D)/(Dropout 或
+    Dropout2D)/(MaxPool、AdaptiveAvgPool 或 AdaptiveMaxPool)/Flatten/
+    Linear/ReLU/Linear/SoftmaxCE，双层分类头）
     的一步训练：按列表顺序前向，自损失层 backward() 起逆序反传，以新
-    list 同步把 conv 的 weights/bias、BN 的 gamma/beta、两个 Linear 的
-    weights/bias 各减去 lr 乘对应梯度，返回更新前 float 批均损失。
+    list 同步把 conv 的 weights/bias、归一化层（索引 1）的 gamma/beta、
+    两个 Linear 的 weights/bias 各减去 lr 乘对应梯度，返回更新前 float
+    批均损失。
 
-    layers 必须是恰含上述九层实例的 list（索引 2 为 Dropout 或
-    Dropout2D，其余顺序、类型沿用既有契约）：容器/成员类型错抛
-    TypeError（索引 2 为其他类型时同样抛 TypeError），长度错或
-    BN/Dropout/Dropout2D 非训练态抛 ValueError。lr 必须是正的有限
+    layers 必须是恰含上述九层实例的 list（索引 1 为 BatchNorm2D 或
+    GroupNorm2D，索引 2 为 Dropout 或 Dropout2D，其余顺序、类型沿用
+    既有契约）：容器/成员类型错抛 TypeError（索引 1、2 为其他类型时
+    同样抛 TypeError），长度错或 BatchNorm2D/Dropout/Dropout2D 非训练
+    态抛 ValueError；GroupNorm2D 无训练/推理模式，不做模式检查，也不
+    维护运行统计，本步仅更新其 gamma/beta。lr 必须是正的有限
     int/float（拒绝 bool）：类型错抛 TypeError，非有限或非正抛
     ValueError。x 的校验沿各层 forward，labels 的校验沿损失层 forward；
     维度或标签不匹配等被调层错误原样传播（含展平维度与首个 Linear
@@ -7742,13 +7769,23 @@ def train_deep_step(layers, x, labels, lr=0.1):
     损失、任一传播梯度/参数梯度或更新后的参数含非有限值均抛
     ValueError。
 
-    成功时以新 list 同步替换层内参数，前向缓存、BN 运行统计与 Dropout/
-    Dropout2D 随机推进均保留；任何路径都不修改 x、labels 及构造参数
-    所用的原 list；一旦出错（含校验与非有限值），九层全部恢复到入口
-    状态（含参数引用、随机状态、运行统计与旧缓存），如同本次调用从未
-    发生。相同入口状态结果完全确定。
+    成功时以新 list 同步替换层内参数，前向缓存、BatchNorm2D 运行统计
+    与 Dropout/Dropout2D 随机推进均保留（GroupNorm2D 路径无运行统计
+    变更）；任何路径都不修改 x、labels 及构造参数所用的原 list；一旦
+    出错（含校验与非有限值），九层全部恢复到入口状态（含参数引用、
+    随机状态、运行统计与旧缓存），如同本次调用从未发生。相同入口状态
+    结果完全确定。
     """
-    _validate_deep_layers(layers, allow_dropout2d=True)
+    _check_deep_layer_types(
+        layers, _DEEP_LAYER_TYPES_GN, _DEEP_LAYER_NAMES_GN
+    )
+    norm = layers[1]
+    if isinstance(norm, BatchNorm2D) and not norm._training:
+        raise ValueError("BatchNorm2D 必须处于训练态")
+    if not layers[2]._training:
+        if isinstance(layers[2], Dropout2D):
+            raise ValueError("Dropout2D 必须处于训练态")
+        raise ValueError("Dropout 必须处于训练态")
     _check_deep_scalar(lr, "lr")
     if lr <= 0:
         raise ValueError("lr 必须为正数")
@@ -7758,8 +7795,8 @@ def train_deep_step(layers, x, labels, lr=0.1):
     try:
         # 按列表顺序前向；各层输入错误由其 forward 原样抛出。
         conv_out = conv.forward(x)
-        bn_out = bn.forward(conv_out)
-        drop_out = dropout.forward(bn_out)
+        norm_out = bn.forward(conv_out)
+        drop_out = dropout.forward(norm_out)
         pool_out = pool.forward(drop_out)
         flat = flatten.forward(pool_out)
         hidden = linear1.forward(flat)
@@ -7787,9 +7824,9 @@ def train_deep_step(layers, x, labels, lr=0.1):
         _require_finite_grads(dx_pool)
         dx_drop = pool.backward(dx_pool)
         _require_finite_grads(dx_drop)
-        dx_bn = dropout.backward(dx_drop)
-        _require_finite_grads(dx_bn)
-        dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+        dx_norm = dropout.backward(dx_drop)
+        _require_finite_grads(dx_norm)
+        dx_conv, dgamma, dbeta = bn.backward(dx_norm)
         _require_finite_grads(dx_conv)
         _require_finite_grads(dgamma)
         _require_finite_grads(dbeta)
@@ -7835,27 +7872,33 @@ def train_deep_step(layers, x, labels, lr=0.1):
 def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验九层双层分类头训练链。
 
-    layers 须为恰含 Conv2D/BatchNorm2D/(Dropout 或 Dropout2D)/
-    (MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D)/Flatten/Linear/
-    ReLU/Linear/SoftmaxCrossEntropy 九层实例的 list（索引 2 为
-    Dropout 或 Dropout2D，其余顺序、类型沿用既有契约）：容器/成员类型
-    错抛 TypeError（索引 2 为其他类型时同样抛 TypeError），长度错或
-    BN/Dropout/Dropout2D 非训练态抛 ValueError。前向按 conv→bn→
+    layers 须为恰含 Conv2D/(BatchNorm2D 或 GroupNorm2D)/(Dropout 或
+    Dropout2D)/(MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D)/
+    Flatten/Linear/ReLU/Linear/SoftmaxCrossEntropy 九层实例的 list
+    （索引 1 接受 BatchNorm2D 或 GroupNorm2D，索引 2 为 Dropout 或
+    Dropout2D，其余顺序、类型沿用既有契约）：容器/成员类型错抛
+    TypeError（索引 1、2 为其他类型时同样抛 TypeError），长度错或
+    BatchNorm2D/Dropout/Dropout2D 非训练态抛 ValueError；GroupNorm2D
+    无训练/推理模式，不做模式检查，其每次前向都按当前输入逐样本分组
+    重新统计、不涉及运行统计。前向按 conv→norm→
     dropout(Dropout2D)→pool→flatten→linear1→relu→linear2 执行得
     logits，标量损失 L = loss.forward(logits, labels) 为 float 批均
     损失；解析梯度自 loss.backward() 起按
-    linear2→relu→linear1→flatten→pool→dropout(Dropout2D)→bn→conv
+    linear2→relu→linear1→flatten→pool→dropout(Dropout2D)→norm→conv
     逆序取各层 backward 结果。pool 为 AdaptiveMaxPool2D 时反向按
     forward 记录的获胜坐标累加，重叠分箱的梯度正确累加。
 
-    数值梯度依次扰动 x、conv 的 weights/bias、bn 的 gamma/beta、第一个
-    Linear 的 weights/bias、第二个 Linear 的 weights/bias（各张量内部按
-    嵌套序），n = (L(v+eps) - L(v-eps)) / (2*eps)。每次前向（含解析
+    数值梯度按 x、conv 的 weights/bias、归一化层（索引 1）的
+    gamma/beta、第一个 Linear 的 weights/bias、第二个 Linear 的
+    weights/bias 顺序扰动（各张量内部按嵌套序），
+    n = (L(v+eps) - L(v-eps)) / (2*eps)；索引 1 为 GroupNorm2D 时
+    扰动的是其 gamma/beta。每次前向（含解析
     梯度前向与每次正、负扰动前向）之前都把索引 2 层的随机状态 _s 恢复
     为入口值，使各次前向重放同一掩码：索引 2 为 Dropout 时重放逐元素
     掩码，为 Dropout2D 时重放按 n→c 每通道一次 LCG 抽样生成的 [N][C]
     整通道掩码（广播到全部空间位置），故同一入口状态结果确定。
-    BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D
+    BatchNorm2D 每次数值前向都重新按当前批次统计；GroupNorm2D 每次
+    前向按样本分组重新统计，无运行统计。pool 为 MaxPool2D
     时，任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）
     一律抛 ValueError；pool 为 AdaptiveMaxPool2D 时，任一次前向中任一
     自适应分箱并列最大一律抛 ValueError——max 在并列点梯度无定义；
@@ -7869,13 +7912,13 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
     eps/atol/rtol 须为有限 int/float（拒绝 bool）：类型错抛 TypeError；
     eps 非正、容差为负或任一非有限抛 ValueError。x 的校验沿各层
     forward，labels 的校验沿 loss.forward；维度或标签不匹配、计算或
-    梯度非有限均抛 ValueError。x、labels、参数及九层实例状态（训练/
-    推理模式、缓存、Dropout/Dropout2D 随机状态与掩码、BatchNorm2D
-    运行统计、SoftmaxCrossEntropy 缓存）在所有成功或异常路径均原样
-    恢复（含参数引用），重复调用结果一致。
+    梯度非有限均抛 ValueError。x、labels、参数及九层实例状态（BatchNorm
+    训练/推理模式、缓存、Dropout/Dropout2D 随机状态与掩码、
+    BatchNorm2D 运行统计、GroupNorm2D 缓存、SoftmaxCrossEntropy 缓存）
+    在所有成功或异常路径均原样恢复（含参数引用），重复调用结果一致。
     """
     _check_deep_layer_types(
-        layers, _DEEP_LAYER_TYPES_D2, _DEEP_LAYER_NAMES_D2
+        layers, _DEEP_LAYER_TYPES_GN, _DEEP_LAYER_NAMES_GN
     )
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
         _check_deep_scalar(val, name)
@@ -7885,7 +7928,7 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
         raise ValueError("atol 必须为非负数")
     if rtol < 0:
         raise ValueError("rtol 必须为非负数")
-    if not layers[1]._training:
+    if isinstance(layers[1], BatchNorm2D) and not layers[1]._training:
         raise ValueError("BatchNorm2D 仅在训练态支持梯度检查")
     if not layers[2]._training:
         if isinstance(layers[2], Dropout2D):
@@ -7900,8 +7943,8 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
             # 每次前向前恢复入口随机状态，使训练前向重放同一掩码。
             dropout._s = dropout_entry_s
             conv_out = conv.forward(x_arg)
-            bn_out = bn.forward(conv_out)
-            drop_out = dropout.forward(bn_out)
+            norm_out = bn.forward(conv_out)
+            drop_out = dropout.forward(norm_out)
             if isinstance(pool, MaxPool2D):
                 _check_pool_window_ties(pool, drop_out)
             elif isinstance(pool, AdaptiveMaxPool2D):
@@ -7921,24 +7964,26 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
         loss_value(x)
 
         # 解析梯度自 loss.backward() 起按 linear2→relu→linear1→
-        # flatten→pool→dropout→bn→conv 逆序。
+        # flatten→pool→dropout→norm→conv 逆序。
         dlogits = loss.backward()
         dx_relu, dl2w, dl2b = linear2.backward(dlogits)
         dx_hidden = relu.backward(dx_relu)
         dx_flat, dl1w, dl1b = linear1.backward(dx_hidden)
         dx_pool = flatten.backward(dx_flat)
         dx_drop = pool.backward(dx_pool)
-        dx_bn = dropout.backward(dx_drop)
-        dx_conv, dgamma, dbeta = bn.backward(dx_bn)
+        dx_norm = dropout.backward(dx_drop)
+        dx_conv, dgamma, dbeta = bn.backward(dx_norm)
         dx, dcw, dcb = conv.backward(dx_conv)
 
-        # (层对象, 被替换参数的属性名)；x 不替换任何层属性。
+        # (层对象, 被替换参数的属性名)；x 不替换任何层属性。扰动顺序：
+        # x、conv weights/bias、归一化 gamma/beta、两个 Linear
+        # weights/bias（BatchNorm2D/GroupNorm2D 均暴露 _gamma/_beta）。
         targets = (
             ("x", None, None, x, dx),
             ("conv_weights", conv, "_weights", conv._weights, dcw),
             ("conv_bias", conv, "_bias", conv._bias, dcb),
-            ("bn_gamma", bn, "_gamma", bn._gamma, dgamma),
-            ("bn_beta", bn, "_beta", bn._beta, dbeta),
+            ("norm_gamma", bn, "_gamma", bn._gamma, dgamma),
+            ("norm_beta", bn, "_beta", bn._beta, dbeta),
             ("linear1_weights", linear1, "_weights", linear1._weights, dl1w),
             ("linear1_bias", linear1, "_bias", linear1._bias, dl1b),
             ("linear2_weights", linear2, "_weights", linear2._weights, dl2w),
