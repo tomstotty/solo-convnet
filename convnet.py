@@ -40,8 +40,9 @@
 - Dropout 层：NCHW 嵌套 list，训练态按概率 p 置零并放大保留项，推理态原样复制。
 - BatchNorm2D 层：NCHW 嵌套 list，逐通道批归一化；训练态按批次统计并更新
   running_mean/running_var，推理态使用运行统计仿射。
-- SoftmaxCrossEntropy 层：二维 logits [N][K] 与 labels [N] 的批均
-  softmax 交叉熵损失（可选 label_smoothing），反向返回对 logits 的梯度。
+- SoftmaxCrossEntropy 层：二维 logits [N][K] 与 labels [N] 的加权
+  softmax 交叉熵损失（可选 label_smoothing、class_weights、
+  ignore_index），反向返回对 logits 的梯度（被忽略标签行为全 0）。
 
 - 公开推理 API（仅标准库）：
 - load_model(path)：严格校验 train 产物后返回键序为 values、bias 的新 dict。
@@ -2662,25 +2663,35 @@ class BatchNorm2D:
 class SoftmaxCrossEntropy:
     """Softmax + 交叉熵损失层（限二维 logits [N][K]，labels [N]）。
 
-    SoftmaxCrossEntropy(label_smoothing=0.0)：label_smoothing 须为
-    [0, 1) 内的有限 int/float（拒绝 bool），类型错抛 TypeError，非有限
-    或越界抛 ValueError；默认 0.0 等价于普通 one-hot 交叉熵。
+    SoftmaxCrossEntropy(label_smoothing=0.0, class_weights=None,
+    ignore_index=None)：
+    - label_smoothing 须为 [0, 1) 内的有限 int/float（拒绝 bool）；类型错
+      抛 TypeError，非有限、越界或超大整数（转 float 溢出，不泄漏
+      OverflowError）抛 ValueError；默认 0.0 等价于普通 one-hot 交叉熵。
+    - class_weights 为 None 或非空 list：元素为有限非负 int/float（拒绝
+      bool，超大整数按非有限拒绝），且至少一项严格大于 0；类型错抛
+      TypeError，空表、负值或非有限权重抛 ValueError。
+    - ignore_index 为 None 或 int（拒绝 bool），否则抛 TypeError。
 
     forward(logits, labels)：logits 为非空规则嵌套 list[N][K]（N、K ≥ 1），
     元素为有限 int/float（拒绝 bool）；labels 为长度 N 的 list，元素为
-    [0, K) 内的 int（拒绝 bool）。逐行取 m = max(row)，按 k 递增求
+    int（拒绝 bool）。逐行取 m = max(row)，按 k 递增求
     e[k] = exp(row[k] - m)、z = Σe、p[k] = e[k]/z；令 s = label_smoothing、
-    q[k] = (1 - s) * I(k == label) + s / K，按 n→k 递增累计
-    q[k] * (m + log(z) - row[k]) 并除以 N，返回 float 批均损失。
-    仅成功时以新 list 缓存 p 与 labels 并覆盖旧缓存，失败保留旧缓存。
+    q[k] = (1 - s) * I(k == label) + s / K。标签等于 ignore_index 的样本
+    整体忽略，其余标签须在 [0, K) 内；class_weights 非 None 时其长度须
+    等于 K，有效样本权重 w 取该标签对应权重，否则 w 恒为 1.0。返回
+    Σ_n(w_n * Σ_k(-q[k] * log(p[k]))) / Σ_n w_n（float）；无有效样本、
+    分母非正或任一计算非有限一律抛 ValueError。仅成功时以新 list 缓存
+    p、标签副本、逐样本权重与分母并覆盖旧缓存，失败不修改实参与旧缓存。
 
-    backward()：返回新 list[N][K]，元素为
-    (p[n][k] - q[n][k]) / N，均为 float。
+    backward()：返回新 list[N][K]，被忽略样本的行全为 0.0，其余元素为
+    w_n * (p[n][k] - q[n][k]) / Σ_n w_n，均为 float。
     未成功 forward 前调用一律抛 ValueError；重复调用返回等值独立列表。
-    两个方法均不修改实参。
+    两个方法均不修改实参。默认参数时逐位等价于批均 one-hot 交叉熵。
     """
 
-    def __init__(self, label_smoothing=0.0):
+    def __init__(self, label_smoothing=0.0, class_weights=None,
+                 ignore_index=None):
         if isinstance(label_smoothing, bool) or not isinstance(
             label_smoothing, (int, float)
         ):
@@ -2688,20 +2699,73 @@ class SoftmaxCrossEntropy:
                 "label_smoothing 必须是 int/float（拒绝 bool），得到 %s"
                 % type(label_smoothing).__name__
             )
-        if not math.isfinite(label_smoothing):
+        # 超大整数（如 10**400）转 float 抛 OverflowError；统一按非有限
+        # 值以 ValueError 拒绝，不向上泄漏 OverflowError。
+        try:
+            smooth = float(label_smoothing)
+        except OverflowError:
+            raise ValueError(
+                "label_smoothing 必须是有限值（拒绝超大整数/NaN/inf）"
+            )
+        if not math.isfinite(smooth):
             raise ValueError("label_smoothing 必须是有限值（拒绝 NaN/inf）")
-        if label_smoothing < 0 or label_smoothing >= 1:
+        if smooth < 0.0 or smooth >= 1.0:
             raise ValueError(
                 "label_smoothing 必须在 [0, 1) 内，得到 %r"
                 % (label_smoothing,)
             )
-        self._label_smoothing = float(label_smoothing)
-        self._probs = None     # 最近一次成功 forward 的 softmax 概率
-        self._labels = None    # 最近一次成功 forward 的标签副本
+        self._label_smoothing = smooth
+
+        if class_weights is None:
+            self._class_weights = None
+        else:
+            _require_list(class_weights, "class_weights")
+            if len(class_weights) == 0:
+                raise ValueError("class_weights 不能为空 list")
+            weights = []
+            for i, w in enumerate(class_weights):
+                if isinstance(w, bool) or not isinstance(w, (int, float)):
+                    raise TypeError(
+                        "class_weights 的元素必须是 int/float（拒绝 bool），"
+                        "得到 %s" % type(w).__name__
+                    )
+                try:
+                    wf = float(w)
+                except OverflowError:
+                    raise ValueError(
+                        "class_weights[%d] 为非有限值（超大整数）" % i
+                    )
+                if not math.isfinite(wf):
+                    raise ValueError(
+                        "class_weights[%d] 为非有限值（NaN/inf）" % i
+                    )
+                if wf < 0.0:
+                    raise ValueError(
+                        "class_weights[%d] = %r 不能为负" % (i, w)
+                    )
+                weights.append(wf)
+            if not any(w > 0.0 for w in weights):
+                raise ValueError("class_weights 至少须有一项严格大于 0")
+            self._class_weights = weights
+
+        if ignore_index is not None:
+            if isinstance(ignore_index, bool) or not isinstance(
+                ignore_index, int
+            ):
+                raise TypeError(
+                    "ignore_index 必须是 int 或 None（拒绝 bool），得到 %s"
+                    % type(ignore_index).__name__
+                )
+        self._ignore_index = ignore_index
+
+        self._probs = None      # 最近一次成功 forward 的 softmax 概率
+        self._labels = None     # 最近一次成功 forward 的标签副本
+        self._weights = None    # 最近一次成功 forward 的逐样本权重副本
+        self._den = None        # 最近一次成功 forward 的有效权重和 Σ_n w_n
         self._out_shape = None  # 最近一次成功 forward 的 (N, K)
 
     def forward(self, logits, labels):
-        """计算批均 softmax 交叉熵损失，返回 float 并缓存概率与标签。"""
+        """计算（可加权/可忽略标签的）softmax 交叉熵，返回 float 并缓存。"""
         _require_list(logits, "logits")
         _require_list(labels, "labels")
         n_, k_ = _shape_of(logits, 2, "logits")
@@ -2710,6 +2774,14 @@ class SoftmaxCrossEntropy:
                 "labels 长度 %d 与 logits 样本数 %d 不符"
                 % (len(labels), n_)
             )
+        if self._class_weights is not None and len(self._class_weights) != k_:
+            raise ValueError(
+                "class_weights 长度 %d 与类别数 %d 不符"
+                % (len(self._class_weights), k_)
+            )
+
+        ignore = self._ignore_index
+        valid_count = 0
         for n in range(n_):
             label = labels[n]
             if isinstance(label, list):
@@ -2719,14 +2791,21 @@ class SoftmaxCrossEntropy:
                     "labels 的元素必须是 int（拒绝 bool），得到 %s"
                     % type(label).__name__
                 )
+            # 等于 ignore_index 的标签整体忽略（不做取值范围检查）。
+            if ignore is not None and label == ignore:
+                continue
             if label < 0 or label >= k_:
                 raise ValueError(
                     "labels[%d] = %d 超出 [0, %d) 范围" % (n, label, k_)
                 )
+            valid_count += 1
 
         smooth = self._label_smoothing
+        class_weights = self._class_weights
         probs = []
+        sample_weights = [0.0] * n_
         loss_sum = 0.0
+        den = 0.0
         for n in range(n_):
             row = logits[n]
             m = row[0]
@@ -2741,32 +2820,48 @@ class SoftmaxCrossEntropy:
                 z += e
             p = [e / z for e in exps]
             probs.append(p)
-            log_z = math.log(z)
             label = labels[n]
+            if ignore is not None and label == ignore:
+                continue
+            w = 1.0 if class_weights is None else class_weights[label]
+            sample_weights[n] = w
+            den += w
+            log_z = math.log(z)
             for k in range(k_):
                 q = (1.0 - smooth) * (1.0 if k == label else 0.0) \
                     + smooth / k_
-                loss_sum += q * (m + log_z - row[k])
-        loss = loss_sum / n_
+                loss_sum += w * (q * (m + log_z - row[k]))
+
+        if valid_count == 0:
+            raise ValueError("没有有效样本（全部标签被 ignore_index 忽略）")
+        if not math.isfinite(den):
+            raise ValueError("前向计算产生非有限值（权重和 NaN/inf）")
+        if den <= 0.0:
+            raise ValueError("有效样本权重之和非正（分母必须严格大于 0）")
 
         for n in range(n_):
             for k in range(k_):
                 if not math.isfinite(probs[n][k]):
                     raise ValueError("前向计算产生非有限值（NaN/inf）")
+        loss = loss_sum / den
         if not math.isfinite(loss):
             raise ValueError("前向计算产生非有限值（NaN/inf）")
 
         self._probs = probs
         self._labels = list(labels)
+        self._weights = sample_weights
+        self._den = den
         self._out_shape = (n_, k_)
         return loss
 
     def backward(self):
         """返回 logits 的梯度新 list[N][K]，元素均为 float。
 
-        元素为 (p[n][k] - q[n][k]) / N，其中
+        被忽略样本的行全为 0.0；其余元素为
+        w_n * (p[n][k] - q[n][k]) / Σ_n w_n，其中
         q[n][k] = (1 - s) * I(k == label[n]) + s / K，s 为
-        label_smoothing；未成功 forward 前调用一律抛 ValueError。
+        label_smoothing；默认参数下逐位等价于 (p - q) / N。
+        未成功 forward 前调用一律抛 ValueError。
         """
         if self._probs is None:
             raise ValueError("尚未成功执行 forward，无法 backward")
@@ -2774,16 +2869,23 @@ class SoftmaxCrossEntropy:
         n_, k_ = self._out_shape
         probs = self._probs
         labels = self._labels
+        weights = self._weights
+        den = self._den
         smooth = self._label_smoothing
+        ignore = self._ignore_index
         dx = []
         for n in range(n_):
-            p_row = probs[n]
             label = labels[n]
+            if ignore is not None and label == ignore:
+                dx.append([0.0] * k_)
+                continue
+            p_row = probs[n]
+            w = weights[n]
             row = []
             for k in range(k_):
                 q = (1.0 - smooth) * (1.0 if k == label else 0.0) \
                     + smooth / k_
-                row.append((p_row[k] - q) / n_)
+                row.append(w * (p_row[k] - q) / den)
             dx.append(row)
 
         for n in range(n_):
@@ -6795,6 +6897,7 @@ def _snapshot_layers(layers):
         },
         "loss": {
             "probs": loss._probs, "labels": loss._labels,
+            "weights": loss._weights, "den": loss._den,
             "out_shape": loss._out_shape,
         },
     }
@@ -6834,8 +6937,9 @@ def _restore_layers(layers, snap):
     linear._x, linear._out_shape = (
         snap["linear"]["x"], snap["linear"]["out_shape"]
     )
-    loss._probs, loss._labels, loss._out_shape = (
+    loss._probs, loss._labels, loss._weights, loss._den, loss._out_shape = (
         snap["loss"]["probs"], snap["loss"]["labels"],
+        snap["loss"]["weights"], snap["loss"]["den"],
         snap["loss"]["out_shape"],
     )
 
