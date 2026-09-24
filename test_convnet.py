@@ -10,7 +10,11 @@
   0 轮保持状态，JSON/轮数/路径等失败退出 1、空 stdout、不改 OUTPUT，
   参数数目错退出 2；load_norm_checkpoint 拒绝 JSON 常量与非规范 hex；
 - 参数数目错误退出 2；
-- 其余既有入口 train/evaluate/fitcnn/evalcnn 仍可成功运行。
+- 其余既有入口 train/evaluate/fitcnn/evalcnn 仍可成功运行；
+- train_deep_adam_accum_batches 接受 GroupNorm2D 九层链；
+  dump/load_deep_adam_checkpoint 往返逐字节，更新边界（四元 state）与
+  微批边界（八元 state）分段续训与连续训练的损失/范数/参数/矩/终态
+  完全一致，且严格拒绝坏 version/错序键/JSON 常量/非规范 hex 等。
 """
 
 import json
@@ -585,6 +589,382 @@ class NormCheckpointStrictTests(unittest.TestCase):
         payload = json.dumps(doc, separators=(",", ":")).encode()
         layers, _ = self._load(payload)
         self.assertEqual(layers[0]._weights[0][0][0][0], 0.0)
+
+
+class DeepAdamCheckpointTests(unittest.TestCase):
+    """dump/load_deep_adam_checkpoint 与 GN 链微批 Adam 续训的 API 测试。"""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, _HERE)
+        import convnet
+        cls.cn = convnet
+        # 4 个空间非常数的 1×2×2 样本（GN 不会把它们归零），标签交替。
+        cls.x = [
+            [[[0.0, 1.0], [1.0, 0.0]]],
+            [[[1.0, 0.2], [0.2, 1.0]]],
+            [[[0.1, 0.9], [0.5, 0.5]]],
+            [[[0.8, 0.3], [0.3, 0.8]]],
+        ]
+        cls.labels = [0, 1, 0, 1]
+        cls.kws = dict(
+            microbatch_size=1, accum_steps=2, epochs=3, lr=0.01,
+            seed=7, shuffle=True, clip=1.0,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.path.pop(0)
+
+    def _layers(self):
+        """benchmarkdeep 九层链，BN 换为 GroupNorm2D(2,[1,1],[0,0])。"""
+        cn = self.cn
+        conv = cn.Conv2D(cn._deep_copy(cn._CNN_CONV_INIT),
+                         [0.0] * cn._CNN_NUM_CLASSES)
+        gn = cn.GroupNorm2D(
+            2, cn._deep_copy(cn._NORM_GAMMA_INIT),
+            cn._deep_copy(cn._NORM_BETA_INIT), cn._NORM_EPS,
+        )
+        dropout = cn.Dropout(cn._NORM_DROPOUT_P, cn._NORM_DROPOUT_SEED)
+        pool = cn.MaxPool2D(2, 2, 0)
+        flatten = cn.Flatten()
+        linear1 = cn.Linear(cn._deep_copy(cn._BD_LINEAR1_INIT),
+                            [0.0] * cn._CNN_NUM_CLASSES)
+        relu = cn.ReLU()
+        linear2 = cn.Linear(cn._deep_copy(cn._CNN_LINEAR_INIT),
+                            [0.0] * cn._CNN_NUM_CLASSES)
+        loss = cn.SoftmaxCrossEntropy()
+        return [conv, gn, dropout, pool, flatten, linear1, relu,
+                linear2, loss]
+
+    def _zero_moments(self, layers):
+        refs = (
+            layers[0]._weights, layers[0]._bias, layers[1]._gamma,
+            layers[1]._beta, layers[5]._weights, layers[5]._bias,
+            layers[7]._weights, layers[7]._bias,
+        )
+        zeros = tuple(self.cn._zeros_like_tree(t) for t in refs)
+        return zeros, self.cn._deep_copy(zeros)
+
+    def _snapshot(self, layers):
+        cn = self.cn
+        return (
+            cn._deep_copy(layers[0]._weights),
+            cn._deep_copy(layers[0]._bias),
+            cn._deep_copy(layers[1]._gamma),
+            cn._deep_copy(layers[1]._beta),
+            cn._deep_copy(layers[5]._weights),
+            cn._deep_copy(layers[5]._bias),
+            cn._deep_copy(layers[7]._weights),
+            cn._deep_copy(layers[7]._bias),
+            layers[2]._s,
+        )
+
+    def _train(self, layers, **kw):
+        return self.cn.train_deep_adam_accum_batches(
+            layers, self.x, self.labels, **kw
+        )
+
+    def test_gn_chain_continuous_baseline(self):
+        layers = self._layers()
+        losses, norms, m, v, step, state = self._train(layers, **self.kws)
+        self.assertEqual(len(losses), 6)
+        self.assertEqual(len(norms), 6)
+        self.assertTrue(any(abs(x) > 1e-12 for x in norms))
+        self.assertEqual(step, 6)
+        self.assertEqual(len(state), 4)
+        self.assertEqual(state[0], 3)
+        self.assertEqual(state[1], [])
+        self.assertEqual(state[2], 0)
+
+    def _baseline_run(self):
+        layers = self._layers()
+        losses, norms, m, v, step, state = self._train(layers, **self.kws)
+        return losses, norms, m, v, step, state, self._snapshot(layers)
+
+    def test_roundtrip_byte_identical_update_boundary(self):
+        cn = self.cn
+        layers = self._layers()
+        _, _, m, v, step, st = self._train(
+            layers, max_updates=2, **self.kws
+        )
+        self.assertEqual(len(st), 4)
+        blob = cn.dump_deep_adam_checkpoint(layers, m, v, step, st)
+        self.assertIsInstance(blob, bytes)
+        self.assertTrue(blob.endswith(b"\n") and not blob.endswith(b"\n\n"))
+        # 同状态重复 dump 逐字节相同。
+        self.assertEqual(
+            blob, cn.dump_deep_adam_checkpoint(layers, m, v, step, st)
+        )
+        doc = json.loads(blob.decode())
+        self.assertEqual(
+            list(doc.keys()),
+            ["version", "model", "dropout_state", "m", "v", "step",
+             "state"],
+        )
+        self.assertEqual(doc["version"], 1)
+        self.assertEqual(
+            list(doc["model"].keys()),
+            ["conv", "groupnorm", "linear1", "linear2"],
+        )
+        self.assertEqual(
+            list(doc["model"]["groupnorm"].keys()), ["gamma", "beta"]
+        )
+        self.assertEqual(doc["step"], 2)
+        self.assertEqual(len(doc["m"]), 8)
+        self.assertEqual(len(doc["v"]), 8)
+        self.assertEqual(len(doc["state"]), 4)
+
+        loaded = cn.load_deep_adam_checkpoint(blob)
+        l2, m2, v2, s2, st2 = loaded
+        self.assertEqual(len(l2), 9)
+        self.assertIsInstance(l2[1], cn.GroupNorm2D)
+        self.assertEqual(l2[1]._num_groups, 2)
+        self.assertEqual(l2[1]._eps, cn._NORM_EPS)
+        self.assertTrue(l2[2]._training)
+        self.assertEqual(l2[2]._p, cn._NORM_DROPOUT_P)
+        self.assertEqual(l2[2]._seed, cn._NORM_DROPOUT_SEED)
+        # 加载层无任何前向缓存。
+        self.assertIsNone(l2[0]._x)
+        self.assertIsNone(l2[1]._z)
+        self.assertIsNone(l2[1]._var)
+        self.assertIsNone(l2[2]._mask)
+        self.assertIsNone(l2[3]._x_shape)
+        self.assertIsNone(l2[4]._x_shape)
+        self.assertIsNone(l2[5]._x)
+        self.assertIsNone(l2[6]._x)
+        self.assertIsNone(l2[7]._x)
+        # 往返逐字节相同，返回全新对象。
+        self.assertEqual(
+            cn.dump_deep_adam_checkpoint(l2, m2, v2, s2, st2), blob
+        )
+        self.assertIsNot(l2, layers)
+        self.assertIsNot(m2[0], m[0])
+        self.assertEqual(s2, step)
+        self.assertEqual(st2, st)
+        self.assertIsNot(st2[1], st[1])
+
+    def test_resume_at_update_boundary_matches_uninterrupted(self):
+        cn = self.cn
+        losses, norms, m, v, step, state, final = self._baseline_run()
+        layers = self._layers()
+        l1, n1, m1, v1, s1, st1 = self._train(
+            layers, max_updates=2, **self.kws
+        )
+        blob = cn.dump_deep_adam_checkpoint(layers, m1, v1, s1, st1)
+        l2, m2, v2, s2, st2 = cn.load_deep_adam_checkpoint(blob)
+        l3, n3, m3, v3, s3, st3 = self._train(
+            l2, m=m2, v=v2, step=s2, state=st2, **self.kws
+        )
+        self.assertEqual(l1 + l3, losses)
+        self.assertEqual(n1 + n3, norms)
+        self.assertEqual(m3, m)
+        self.assertEqual(v3, v)
+        self.assertEqual(s3, step)
+        self.assertEqual(st3, state)
+        self.assertEqual(self._snapshot(l2), final)
+
+    def test_resume_at_microbatch_boundary_matches_uninterrupted(self):
+        cn = self.cn
+        losses, norms, m, v, step, state, final = self._baseline_run()
+        layers = self._layers()
+        # 仅前向 1 个微批（未结算）：停在八元 state，无更新记录。
+        l1, n1, m1, v1, s1, st1 = self._train(
+            layers, max_microbatches=1, **self.kws
+        )
+        self.assertEqual(len(st1), 8)
+        self.assertEqual(l1, [])
+        self.assertEqual(n1, [])
+        blob = cn.dump_deep_adam_checkpoint(layers, m1, v1, s1, st1)
+        l2, m2, v2, s2, st2 = cn.load_deep_adam_checkpoint(blob)
+        self.assertEqual(len(st2), 8)
+        self.assertEqual(cn.dump_deep_adam_checkpoint(
+            l2, m2, v2, s2, st2), blob)
+        self.assertIsNot(st2[7], st1[7])
+        # 再前向 2 个微批（含一次结算），随后放足预算跑完。
+        l2b, n2b, m2b, v2b, s2b, st2b = self._train(
+            l2, m=m2, v=v2, step=s2, state=st2,
+            max_microbatches=2, **self.kws
+        )
+        l3, n3, m3, v3, s3, st3 = self._train(
+            l2, m=m2b, v=v2b, step=s2b, state=st2b, **self.kws
+        )
+        self.assertEqual(l2b + l3, losses)
+        self.assertEqual(n2b + n3, norms)
+        self.assertEqual(m3, m)
+        self.assertEqual(v3, v)
+        self.assertEqual(s3, step)
+        self.assertEqual(st3, state)
+        self.assertEqual(self._snapshot(l2), final)
+
+    def test_initial_checkpoint_resume_matches_uninterrupted(self):
+        cn = self.cn
+        losses, norms, m, v, step, state, final = self._baseline_run()
+        fresh = self._layers()
+        zm, zv = self._zero_moments(fresh)
+        blob = cn.dump_deep_adam_checkpoint(
+            fresh, zm, zv, 0, (0, [], 0, self.kws["seed"])
+        )
+        l2, m2, v2, s2, st2 = cn.load_deep_adam_checkpoint(blob)
+        l3, n3, m3, v3, s3, st3 = self._train(
+            l2, m=m2, v=v2, step=s2, state=st2, **self.kws
+        )
+        self.assertEqual(l3, losses)
+        self.assertEqual(n3, norms)
+        self.assertEqual(m3, m)
+        self.assertEqual(v3, v)
+        self.assertEqual(s3, step)
+        self.assertEqual(st3, state)
+        self.assertEqual(self._snapshot(l2), final)
+
+    def test_completion_state_roundtrip(self):
+        cn = self.cn
+        layers = self._layers()
+        _, _, m, v, step, st = self._train(layers, **self.kws)
+        self.assertEqual((st[0], st[1], st[2]), (3, [], 0))
+        blob = cn.dump_deep_adam_checkpoint(layers, m, v, step, st)
+        l2, m2, v2, s2, st2 = cn.load_deep_adam_checkpoint(blob)
+        self.assertEqual(
+            cn.dump_deep_adam_checkpoint(l2, m2, v2, s2, st2), blob
+        )
+        self.assertEqual(st2, st)
+
+    def test_groupnorm_chain_accepted_and_bn_still_accepted(self):
+        cn = self.cn
+        # GN 链可训练。
+        layers = self._layers()
+        r = self._train(layers, epochs=1, lr=0.01, seed=7)
+        self.assertEqual(len(r[0]), 2)
+        # 索引 1 为其他类型仍是 TypeError；本接口索引 2 不接受 Dropout2D。
+        bad = self._layers()
+        bad[1] = cn.ReLU()
+        with self.assertRaises(TypeError):
+            self._train(bad, epochs=1)
+        bad2 = self._layers()
+        bad2[2] = cn.Dropout2D(0.25, 7)
+        with self.assertRaises(TypeError):
+            self._train(bad2, epochs=1)
+        # BN 链契约保持不变。
+        bn = cn._build_deep_bench_layers()
+        x, labels = cn._load_cnn_samples()
+        r = cn.train_deep_adam_accum_batches(
+            bn, x, labels, epochs=1, lr=0.01, seed=7
+        )
+        self.assertEqual(len(r[0]), 1)
+
+    def test_dump_rejects_bn_chain_and_bad_arguments(self):
+        cn = self.cn
+        gn = self._layers()
+        zm, zv = self._zero_moments(gn)
+        with self.assertRaises(TypeError):
+            # m 必须是 tuple。
+            cn.dump_deep_adam_checkpoint(
+                gn, list(zm), zv, 0, (0, [], 0, 7))
+        with self.assertRaises(ValueError):
+            cn.dump_deep_adam_checkpoint(
+                gn, zm, zv, -1, (0, [], 0, 7))
+        with self.assertRaises(ValueError):
+            cn.dump_deep_adam_checkpoint(
+                gn, zm[:7], zv, 0, (0, [], 0, 7))
+        with self.assertRaises(TypeError):
+            # step 拒绝 bool。
+            cn.dump_deep_adam_checkpoint(
+                gn, zm, zv, True, (0, [], 0, 7))
+        # BN 九层链不能 dump 为 deep Adam 检查点（索引 1 必须是
+        # GroupNorm2D）。
+        bn = cn._build_deep_bench_layers()
+        refs = (
+            bn[0]._weights, bn[0]._bias, bn[1]._gamma, bn[1]._beta,
+            bn[5]._weights, bn[5]._bias, bn[7]._weights, bn[7]._bias,
+        )
+        bz = tuple(cn._zeros_like_tree(t) for t in refs)
+        with self.assertRaises(TypeError):
+            cn.dump_deep_adam_checkpoint(
+                bn, bz, cn._deep_copy(bz), 0, (0, [], 0, 7))
+
+    def test_load_rejects_malformed_documents(self):
+        cn = self.cn
+        layers = self._layers()
+        _, _, m, v, step, st = self._train(
+            layers, max_microbatches=3, **self.kws
+        )
+        good = cn.dump_deep_adam_checkpoint(layers, m, v, step, st)
+
+        def reload(doc):
+            return cn.load_deep_adam_checkpoint(
+                (json.dumps(doc, separators=(",", ":")) + "\n").encode()
+            )
+
+        with self.assertRaises(TypeError):
+            cn.load_deep_adam_checkpoint(bytearray(good))
+        with self.assertRaises(UnicodeDecodeError):
+            cn.load_deep_adam_checkpoint(b"\xff\xfe\n")
+        with self.assertRaises(ValueError):
+            cn.load_deep_adam_checkpoint(b"{}\n")
+        for token in ("NaN", "Infinity", "-Infinity"):
+            bad = good.replace(b'"step":' + str(step).encode(),
+                               b'"step":' + token.encode())
+            with self.assertRaises(ValueError, msg=token):
+                cn.load_deep_adam_checkpoint(bad)
+
+        doc = json.loads(good.decode())
+        # version 必须恰为 int 1（拒绝 2 与 bool）。
+        d = json.loads(good.decode()); d["version"] = 2
+        with self.assertRaises(ValueError):
+            reload(d)
+        d = json.loads(good.decode()); d["version"] = True
+        with self.assertRaises((ValueError, TypeError)):
+            reload(d)
+        # 顶层错序/缺键。
+        d = json.loads(good.decode())
+        ordered = list(d.items())
+        ordered[0], ordered[1] = ordered[1], ordered[0]
+        with self.assertRaises(ValueError):
+            cn.load_deep_adam_checkpoint(
+                (json.dumps(dict(ordered), separators=(",", ":"))
+                 + "\n").encode()
+            )
+        with self.assertRaises(ValueError):
+            cn.load_deep_adam_checkpoint(
+                (json.dumps({"version": 1}, separators=(",", ":"))
+                 + "\n").encode()
+            )
+        # model 键序错误。
+        d = json.loads(good.decode())
+        d["model"] = {
+            "conv": doc["model"]["conv"],
+            "linear1": doc["model"]["linear1"],
+            "groupnorm": doc["model"]["groupnorm"],
+            "linear2": doc["model"]["linear2"],
+        }
+        with self.assertRaises(ValueError):
+            reload(d)
+        # m/v 必须恰含 8 棵树。
+        d = json.loads(good.decode()); d["m"] = d["m"][:7]
+        with self.assertRaises(ValueError):
+            reload(d)
+        # 非规范/非 hex 叶值。
+        for spelling in ("0X1.0p+1", "0x1.0p+00", "1.0", "-0x0.0p+0"):
+            d = json.loads(good.decode())
+            d["model"]["groupnorm"]["gamma"][0] = spelling
+            with self.assertRaises((ValueError, TypeError), msg=spelling):
+                reload(d)
+        # dropout_state 越界、step 为负。
+        d = json.loads(good.decode()); d["dropout_state"] = 2 ** 32
+        with self.assertRaises(ValueError):
+            reload(d)
+        d = json.loads(good.decode()); d["step"] = -1
+        with self.assertRaises((ValueError, TypeError)):
+            reload(d)
+        # state：四元/八元以外的长度与八元态累计量正性。
+        d = json.loads(good.decode())
+        d["state"] = [0, [], 0, 7, 1]
+        with self.assertRaises(ValueError):
+            reload(d)
+        d = json.loads(good.decode())
+        d["state"][4] = 0  # pending_samples 必须为正
+        with self.assertRaises(ValueError):
+            reload(d)
 
 
 class ExistingEntryTests(unittest.TestCase):
