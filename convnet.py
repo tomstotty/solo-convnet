@@ -9,8 +9,10 @@
   （默认 "zeros"，越界采样坐标的映射规则见 Conv2D 文档）。
 - ConvTranspose2D 层：NCHW 嵌套 list 的转置卷积，weights
   [C][O/G][KH][KW]、bias [O]；stride 可为正 int 或 (SH, SW) tuple，
-  padding 可为非负 int 或 (PT,PB,PL,PR) tuple（规则同 Conv2D 的
-  stride/padding），dilation 可为正 int 或 (DH, DW) tuple（规则同
+  padding 可为非负 int、(PT,PB,PL,PR) tuple 或字符串
+  "same"/"valid"（"same" 按轴 T=E+OP-S 分摊补边使输出长度为输入
+  长度乘步幅，"valid" 四边补 0），dilation 可为正 int 或
+  (DH, DW) tuple（规则同
   Conv2D 的 dilation），output_padding 可为非负 int 或 (OPH, OPW)
   tuple（OPH<SH、OPW<SW），groups 为正 int 分组数（默认 1，C 与 O
   均须被其整除，输入通道 c 仅连接同组输出
@@ -431,11 +433,12 @@ def _check_padding2d(value):
 
 
 def _check_conv_padding2d(value):
-    """校验 Conv2D 补边：非负 int/四元非负 int tuple，或 "same"/"valid"。
+    """校验 Conv2D/ConvTranspose2D 补边：非负 int/四元非负 int tuple，
+    或 "same"/"valid"。
 
     int/tuple 的展开与校验完全沿用 _check_padding2d（拒绝 bool），返回
-    四元 tuple；字符串 "same"/"valid" 原样返回，实际四边补边在每次
-    forward 按输入形状解析。其他 str 抛 ValueError，其他类型（含 bool）
+    四元 tuple；字符串 "same"/"valid" 原样返回，实际四边补边由各层
+    按各自规则解析。其他 str 抛 ValueError，其他类型（含 bool）
     抛 TypeError。
     """
     if isinstance(value, str):
@@ -468,6 +471,23 @@ def _resolve_conv_padding2d(spec, h_, w_, sh_, sw_, ekh_, ekw_):
     qw_ = (w_ + sw_ - 1) // sw_
     pw_ = max((qw_ - 1) * sw_ + ekw_ - w_, 0)
     return (ph_ // 2, ph_ - ph_ // 2, pw_ // 2, pw_ - pw_ // 2)
+
+
+def _resolve_convtranspose_padding2d(spec, sh_, sw_, ekh_, ekw_, oph_, opw_):
+    """把 ConvTranspose2D 的 padding 配置解析为 (PT, PB, PL, PR)。
+
+    四元 tuple 原样返回；"valid" 四边取 0；"same" 按轴令
+    T=E+OP-S（E 为该轴有效核长 (K-1)*D+1，OP 为该轴输出补边；构造时
+    已保证 T 非负），前侧 T//2、后侧 T-T//2，使该轴输出长度恰为输入
+    长度乘步幅 S。解析与输入形状无关，仅依赖构造期参数。
+    """
+    if isinstance(spec, tuple):
+        return spec
+    if spec == "valid":
+        return (0, 0, 0, 0)
+    th_ = ekh_ + oph_ - sh_
+    tw_ = ekw_ + opw_ - sw_
+    return (th_ // 2, th_ - th_ // 2, tw_ // 2, tw_ - tw_ // 2)
 
 
 def _check_dilation2d(value):
@@ -846,7 +866,12 @@ class ConvTranspose2D:
     padding: 非负 int（展开为 (P, P, P, P)）或恰含
     (PT, PB, PL, PR) 的非负 int tuple，分别为上/下/左/右补边；整体
     与成员均须为 int 且拒绝 bool；类型错抛 TypeError，长度错或成员
-    为负抛 ValueError。
+    为负抛 ValueError。也接受字符串 "same"/"valid"："valid" 四边
+    补边恒为 0；"same" 按轴令 T=E+OP-S（E=(K-1)*D+1 为该轴有效核
+    长、S 为该轴步幅、OP 为该轴输出补边），前侧 T//2、后侧 T-T//2，
+    使该轴输出长度恰为输入长度乘 S；任一轴 T<0 时在构造时抛
+    ValueError。其他 str 抛 ValueError，其他类型（含 bool）抛
+    TypeError。
     dilation: 正 int（展开为 (D, D)）或恰含 (DH, DW) 的正 int tuple，
     整体与成员均须为 int 且拒绝 bool；类型错抛 TypeError，长度错或
     成员非正抛 ValueError。
@@ -857,23 +882,26 @@ class ConvTranspose2D:
     输出形状:
     [N][O][(H-1)*SH-PT-PB+(KH-1)*DH+1+OPH]
           [(W-1)*SW-PL-PR+(KW-1)*DW+1+OPW]，
-    输出高或宽非正抛 ValueError。每个输出从 bias[o] 起按组内 c→kh→kw
+    其中 (PT, PB, PL, PR) 为按 padding 配置解析的四边补边（"same"
+    时输出形状即 [N][O][H*SH][W*SW]，"valid" 时四边为 0）。输出高
+    或宽非正抛 ValueError。每个输出从 bias[o] 起按组内 c→kh→kw
     累加；仅当 (oh+PT-kh*DH) 可被 SH 整除、(ow+PL-kw*DW) 可被 SW
     整除，且其商 ih、iw 分别落在 [0,H)、[0,W) 内时，加入
     x[n][c][ih][iw]*weights[c][oi][kh][kw]（o=(c//(C/G))*(O/G)+oi）。
     backward(dy) 返回 (dx, dweights, dbias)，形状依次同 x、weights、
     bias，均为全新嵌套 list 且不修改任何实参，组间不串梯度。dx 各元素
     按组内 o→kh→kw、dweights 各元素按 n→ih→iw、dbias 各元素按
-    n→oh→ow 累加，累加坐标与前向完全一致。未成功 forward 前调用
+    n→oh→ow 累加，累加坐标与前向完全一致；补边使用最近一次成功
+    forward 解析的 (PT, PB, PL, PR)。未成功 forward 前调用
     backward、dy 与最近一次成功 forward 的输出不同形，或反向计算产生
-    非有限值，均抛 ValueError。forward 失败时旧缓存原样保留，仅成功
-    forward 才更新缓存。
+    非有限值，均抛 ValueError。forward 失败时旧缓存与旧解析补边原样
+    保留，仅成功 forward 才更新缓存与解析补边。
     """
 
     def __init__(self, weights, bias, stride=1, padding=0, dilation=1,
                  output_padding=0, groups=1):
         sh_, sw_ = _check_stride2d(stride)
-        pt_, pb_, pl_, pr_ = _check_padding2d(padding)
+        padding_spec = _check_conv_padding2d(padding)
         dh_, dw_ = _check_dilation2d(dilation)
         g_ = _check_groups(groups)
         oph_, opw_ = _check_output_padding2d(output_padding, sh_, sw_)
@@ -899,11 +927,29 @@ class ConvTranspose2D:
                 "weights 第二维 %d 不等于 O/G=%d（O=%d、G=%d）"
                 % (o_per_g, o_ch_ // g_, o_ch_, g_)
             )
+        if padding_spec == "same":
+            # "same" 要求各轴 T=E+OP-S 非负（构造期即可判定，与输入
+            # 形状无关），否则无法使输出长度为输入长度乘步幅。
+            th_ = (kh_ - 1) * dh_ + 1 + oph_ - sh_
+            tw_ = (kw_ - 1) * dw_ + 1 + opw_ - sw_
+            if th_ < 0 or tw_ < 0:
+                raise ValueError(
+                    "padding 'same' 要求各轴 T=E+OP-S 非负，"
+                    "得到高轴 T=%d、宽轴 T=%d" % (th_, tw_)
+                )
 
         self._weights = weights
         self._bias = bias
         self._stride = (sh_, sw_)
-        self._padding = (pt_, pb_, pl_, pr_)
+        # _padding_spec 为构造实参（四元 tuple 或 "same"/"valid"）；
+        # _padding 为最近一次成功 forward 解析出的 (PT,PB,PL,PR)，
+        # 字符串配置在首次成功 forward 前先置 (0,0,0,0)（此时
+        # backward 必因尚无缓存而抛错）。
+        self._padding_spec = padding_spec
+        if isinstance(padding_spec, tuple):
+            self._padding = padding_spec
+        else:
+            self._padding = (0, 0, 0, 0)
         self._dilation = (dh_, dw_)
         self._output_padding = (oph_, opw_)
         self._groups = g_
@@ -918,12 +964,16 @@ class ConvTranspose2D:
 
         输出 [N][O][OH][OW]，
         OH=(H-1)*SH-PT-PB+(KH-1)*DH+1+OPH、
-        OW=(W-1)*SW-PL-PR+(KW-1)*DW+1+OPW；每个输出从 bias[o] 起按组内
+        OW=(W-1)*SW-PL-PR+(KW-1)*DW+1+OPW，其中 (PT, PB, PL, PR) 按
+        padding 配置解析（tuple 原样、"valid" 四边 0、"same" 按
+        T=E+OP-S 分摊，此时 OH=H*SH、OW=W*SW）；每个输出从 bias[o]
+        起按组内
         c→kh→kw 累加，仅当 (oh+PT-kh*DH)、(ow+PL-kw*DW) 分别可被 SH、
         SW 整除且商 ih、iw 有效时加入乘积（是否命中完全由上述坐标条件
         决定，output_padding 仅扩大输出窗口）。输出高/宽非正或计算出现
-        非有限值抛 ValueError。校验或计算失败不改变实参与旧缓存；成功
-        后才缓存输入与输出形状。
+        非有限值抛 ValueError。校验或计算失败不改变实参、旧缓存与旧的
+        解析补边；成功后才缓存输入、输出形状与本次解析的
+        (PT, PB, PL, PR)。
         """
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
@@ -936,11 +986,18 @@ class ConvTranspose2D:
             )
         o_ch_ = self._o_channels
         sh_, sw_ = self._stride
-        pt_, pb_, pl_, pr_ = self._padding
         dh_, dw_ = self._dilation
         oph_, opw_ = self._output_padding
-        oh_ = (h_ - 1) * sh_ - pt_ - pb_ + (kh_ - 1) * dh_ + 1 + oph_
-        ow_ = (w_ - 1) * sw_ - pl_ - pr_ + (kw_ - 1) * dw_ + 1 + opw_
+        ekh_ = (kh_ - 1) * dh_ + 1
+        ekw_ = (kw_ - 1) * dw_ + 1
+        # 本次 forward 实际四边补边：tuple 原样、valid 全 0、same 按
+        # T=E+OP-S 解析（仅写入局部变量，成功末尾才提交到
+        # self._padding）。
+        pt_, pb_, pl_, pr_ = _resolve_convtranspose_padding2d(
+            self._padding_spec, sh_, sw_, ekh_, ekw_, oph_, opw_
+        )
+        oh_ = (h_ - 1) * sh_ - pt_ - pb_ + ekh_ + oph_
+        ow_ = (w_ - 1) * sw_ - pl_ - pr_ + ekw_ + opw_
         if oh_ <= 0 or ow_ <= 0:
             raise ValueError(
                 "转置卷积输出尺寸非正：OH=%d、OW=%d" % (oh_, ow_)
@@ -993,13 +1050,17 @@ class ConvTranspose2D:
 
         self._x = x
         self._out_shape = (n_, o_ch_, oh_, ow_)
+        # 仅在输出完整构建后提交本次解析的补边，失败路径保留旧值与旧缓存。
+        self._padding = (pt_, pb_, pl_, pr_)
         return out
 
     def backward(self, dy):
         """根据上游梯度 dy 返回 (dx, dweights, dbias)。
 
         dy 的形状必须等于最近一次成功 forward 的输出形状。未成功
-        forward 前调用一律抛 ValueError。dx 形状同 x、dweights 形状同
+        forward 前调用一律抛 ValueError。补边使用最近一次成功
+        forward 解析的 (PT, PB, PL, PR)（"same"/"valid" 为按构造
+        参数解析的四边补边）。dx 形状同 x、dweights 形状同
         weights、dbias 形状同 bias；梯度不跨组：dx 各元素仅按组内
         o→kh→kw、dweights 各元素按 n→ih→iw、dbias 各元素按
         n→oh→ow 累加，累加坐标 oh=ih*SH-PT+kh*DH、
