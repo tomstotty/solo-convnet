@@ -12073,7 +12073,8 @@ def load_data_checkpoint(data, data_sha256):
 # ---------------------------------------------------------------------------
 # 微批 Adam 续训检查点：
 # dump_deep_adam_checkpoint(layers, m, v, step, state)、
-# load_deep_adam_checkpoint(data)
+# load_deep_adam_checkpoint(data)、
+# resume_deep_adam(checkpoint, x, labels, epochs=20)
 #
 # layers 为 benchmarkdeep 九层链把索引 1 的 BatchNorm2D 换成
 # GroupNorm2D(2, [1.0, 1.0], [0.0, 0.0]) 的版本；m/v/step/state 沿用
@@ -12534,7 +12535,10 @@ def _parse_ckpt_state(obj):
     前四元为 [epoch, order, cursor, rng]：非负 int、非负 int 数组、
     非负 int、[0, 2^32-1] 内 int；八元态另含正 int pending_samples、
     正 int pending_microbatches、规范 hex float pending_loss 与八组
-    pending_grads（同 m/v 形状）。键序/长度/类型/形状/hex 非法分别抛
+    pending_grads（同 m/v 形状）。跨字段一致性：非空 order 必须恰是
+    0..len(order)-1 的一个全排列且 0 < cursor < len(order)（轮中）；
+    空 order（轮界或完成态）必须 cursor == 0 且为四元态；八元态必须
+    pending_samples <= cursor。键序/长度/类型/形状/hex 非法分别抛
     ValueError/TypeError。
     """
     if not isinstance(obj, list):
@@ -12573,6 +12577,28 @@ def _parse_ckpt_state(obj):
     if rng < 0 or rng > 0xFFFFFFFF:
         raise ValueError("state 的 rng 必须满足 0 <= rng <= 2^32-1")
 
+    # 跨字段一致性：非空 order 须为 0..len(order)-1 的全排列且游标停在
+    # 轮内（0 < cursor < len(order)）；空 order 表示轮界或完成态，游标
+    # 必须为 0 且不携带累计量（必为四元态）。
+    if not order:
+        if cursor != 0:
+            raise ValueError("state 的 order 为空时 cursor 必须为 0")
+        if len(obj) != 4:
+            raise ValueError(
+                "state 的 order 为空时必须为四元（不得携带累计量）"
+            )
+    else:
+        if sorted(order) != list(range(len(order))):
+            raise ValueError(
+                "state 的 order 必须恰是 0..%d 的一个全排列"
+                % (len(order) - 1)
+            )
+        if cursor <= 0 or cursor >= len(order):
+            raise ValueError(
+                "state 的 cursor 必须满足 0 < cursor < order 长度（%d）"
+                % len(order)
+            )
+
     if len(obj) == 4:
         return (int(epoch), order, int(cursor), int(rng))
 
@@ -12586,6 +12612,11 @@ def _parse_ckpt_state(obj):
         )
     if pending_samples <= 0:
         raise ValueError("state 的 pending_samples 必须是正整数")
+    if pending_samples > cursor:
+        raise ValueError(
+            "state 的 pending_samples（%d）不得超过 cursor（%d）"
+            % (pending_samples, cursor)
+        )
     if isinstance(pending_micro, bool) or not isinstance(pending_micro, int):
         raise TypeError(
             "state 的 pending_microbatches 必须是 int（拒绝 bool），得到 %s"
@@ -12632,7 +12663,10 @@ def load_deep_adam_checkpoint(data):
     NaN/Infinity/-Infinity 常量、重复/缺失/额外/错序键、非法或非规范
     hex（仅接受 dump 的规范小写串，负零仅 "0x0.0p+0"）、形状/范围错或
     非有限值抛 ValueError，容器或字段类型错抛 TypeError（异常与编码
-    规则沿用 load_norm_checkpoint）。
+    规则沿用 load_norm_checkpoint）。state 另须满足跨字段一致性：非空
+    order 恰是 0..len(order)-1 的一个全排列且 0 < cursor < len(order)
+    （轮中）；空 order（轮界或完成态）cursor 为 0 且 state 为四元；
+    八元态 pending_samples <= cursor，否则抛 ValueError。
 
     返回 (layers, m, v, step, state)：layers 为九层新 list
     （Conv2D/GroupNorm2D(2, gamma, beta, eps=1e-5)/Dropout(p=0.25,
@@ -12762,6 +12796,105 @@ def load_deep_adam_checkpoint(data):
         conv, gn, dropout, pool, flatten, linear1, relu, linear2, loss,
     ]
     return layers, m, v, int(step), state
+
+
+def resume_deep_adam(checkpoint, x, labels, epochs=20):
+    """从 deep Adam 微批检查点续训至 epochs 轮，返回完成态检查点 bytes。
+
+    checkpoint 必须是 dump_deep_adam_checkpoint 所得 bytes（其他类型一律
+    TypeError；内容非法沿用 load_deep_adam_checkpoint 的异常）。加载后按
+    x 的样本数 N 校验续训进度：state 的 order 非空时长度须等于 N，epoch
+    须满足 epoch <= epochs，且 epoch == epochs 的完成态 order 必须为空；
+    默认超参（microbatch_size=1、accum_steps=2）下四元态轮中 cursor 须为
+    正偶数（更新边界），八元态轮中 cursor 须为正奇数且 pending_samples、
+    pending_microbatches 均恰为 1（微批边界）；step 须恰为
+    epoch*⌈N/2⌉+⌊cursor/2⌋。任一不符抛 ValueError。
+
+    epochs 必须是正 int（拒绝 bool）：类型错抛 TypeError，非正抛
+    ValueError。x、labels 的校验与训练计算异常（含失败回滚）均沿用
+    train_deep_adam_accum_batches。校验通过后以
+    train_deep_adam_accum_batches 的默认超参（microbatch_size=1、
+    accum_steps=2、lr=0.001、seed=0、shuffle=True、clip=None、beta1=0.9、
+    beta2=0.999、eps=1e-8）自检查点状态续训至 epochs 轮，返回
+    dump_deep_adam_checkpoint 所得 bytes；合法微批/更新边界检查点续训至
+    同 epochs 的结果与不中断训练的检查点逐字节相同。任一失败都不修改
+    实参 checkpoint、x、labels。
+    """
+    if not isinstance(checkpoint, bytes):
+        raise TypeError(
+            "checkpoint 必须是 bytes，得到 %s" % type(checkpoint).__name__
+        )
+    layers, m, v, step, state = load_deep_adam_checkpoint(checkpoint)
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError(
+            "epochs 必须是 int（拒绝 bool），得到 %s" % type(epochs).__name__
+        )
+    if epochs <= 0:
+        raise ValueError("epochs 必须为正整数")
+    _require_list(x, "x")
+    x_shape = _shape_of(x, 4, "x")
+    n_ = x_shape[0]
+    _require_list(labels, "labels")
+    if len(labels) != n_:
+        raise ValueError(
+            "labels 长度 %d 与 x 样本数 %d 不符" % (len(labels), n_)
+        )
+
+    # 续训进度与样本数 N、目标轮数 epochs 的一致性（默认超参
+    # microbatch_size=1、accum_steps=2：每次更新恰结算 2 个微批，轮末
+    # 短组结算 1 个，故每轮更新 ⌈N/2⌉ 次）。
+    epoch, order, cursor = state[0], state[1], state[2]
+    if epoch > epochs:
+        raise ValueError(
+            "state 的 epoch（%d）不得超过 epochs（%d）" % (epoch, epochs)
+        )
+    if order:
+        if len(order) != n_:
+            raise ValueError(
+                "state 的 order 长度 %d 必须等于样本数 %d"
+                % (len(order), n_)
+            )
+        if epoch == epochs:
+            raise ValueError(
+                "state 的 epoch 已等于 epochs（%d），order 必须为空" % epochs
+            )
+        if len(state) == 4:
+            # 四元态只停在更新边界：轮中游标为 accum_steps（2）个微批后
+            # 的下一组起点，即正偶数（0 < cursor < N 已由加载保证）。
+            if cursor % 2 != 0:
+                raise ValueError(
+                    "四元 state 的 cursor %d 必须是正偶数（更新边界）"
+                    % cursor
+                )
+        else:
+            # 八元态停在组内微批边界：microbatch_size=1 时游标为正奇数，
+            # 且组内恰累计 1 个微批、1 个样本。
+            if cursor % 2 != 1:
+                raise ValueError(
+                    "八元 state 的 cursor %d 必须是正奇数（微批边界）"
+                    % cursor
+                )
+            if state[4] != 1 or state[5] != 1:
+                raise ValueError(
+                    "八元 state 的 pending_samples 与 pending_microbatches "
+                    "必须均恰为 1，得到 %d、%d" % (state[4], state[5])
+                )
+    expected_step = epoch * ((n_ + 1) // 2) + cursor // 2
+    if step != expected_step:
+        raise ValueError(
+            "step（%d）与进度不符：必须为 epoch*⌈N/2⌉+⌊cursor/2⌋（%d）"
+            % (step, expected_step)
+        )
+
+    _losses, _grad_norms, out_m, out_v, out_step, out_state = (
+        train_deep_adam_accum_batches(
+            layers, x, labels, epochs=epochs,
+            m=m, v=v, step=step, state=state,
+        )
+    )
+    return dump_deep_adam_checkpoint(
+        layers, out_m, out_v, out_step, out_state
+    )
 
 
 def _parse_resume_epochs(text):
