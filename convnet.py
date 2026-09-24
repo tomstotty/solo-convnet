@@ -620,6 +620,36 @@ def _check_output_padding2d(value, sh_, sw_):
     return (oph_, opw_)
 
 
+def _check_convtranspose_output_size(value):
+    """校验 ConvTranspose2D.forward 的 output_size：None 或恰含 (OH, OW) 的正 int tuple。
+
+    None 原样返回（沿用构造时 output_padding）；tuple 成员均须为正 int
+    且拒绝 bool。整体类型错（含 bool）抛 TypeError，tuple 长度错或成员
+    非正抛 ValueError，成员类型错（含 bool）抛 TypeError。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, tuple):
+        raise TypeError(
+            "output_size 必须是 tuple 或 None，得到 %s"
+            % type(value).__name__
+        )
+    if len(value) != 2:
+        raise ValueError("output_size tuple 必须恰含 (OH, OW) 两个元素")
+    oh_, ow_ = value
+    for member_name, member in (("OH", oh_), ("OW", ow_)):
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise TypeError(
+                "output_size 的 %s 必须是 int，得到 %s"
+                % (member_name, type(member).__name__)
+            )
+        if member <= 0:
+            raise ValueError(
+                "output_size 的 %s 必须为正整数" % member_name
+            )
+    return (oh_, ow_)
+
+
 _PADDING_MODES = ("zeros", "replicate", "circular", "reflect")
 
 
@@ -941,6 +971,14 @@ class ConvTranspose2D:
     "same"/"valid" 的四边补边按每次 forward 解析（"same" 与输入形状
     无关，每次相同），backward 使用最近一次成功 forward 解析的
     (PT, PB, PL, PR)。
+    forward 的 output_size 仅可为 None 或恰含 (OH, OW) 的正 int tuple
+    （成员拒绝 bool）；整体或成员类型错（含 bool）抛 TypeError，长度错
+    或成员非正抛 ValueError。每次先按既有规则解析四边补边，令
+    BH=(H-1)*SH-PT-PB+(KH-1)*DH+1、BW=(W-1)*SW-PL-PR+(KW-1)*DW+1；
+    output_size 为 None 时沿用构造时 OPH/OPW，为 tuple 时令本次
+    OPH=OH-BH、OPW=OW-BW，任一不满足 0≤OPH<SH、0≤OPW<SW 抛
+    ValueError。该覆盖只作用于本次调用，不修改构造配置；前向坐标、
+    分组、累加顺序与非有限值处理不变。
     backward(dy) 返回 (dx, dweights, dbias)，形状依次同 x、weights、
     bias，均为全新嵌套 list 且不修改任何实参，组间不串梯度。dx 各元素
     按组内 o→kh→kw、dweights 各元素按 n→ih→iw、dbias 各元素按
@@ -1012,20 +1050,26 @@ class ConvTranspose2D:
         self._x = None           # 最近一次成功 forward 的输入
         self._out_shape = None   # 最近一次成功 forward 的输出形状
 
-    def forward(self, x):
+    def forward(self, x, output_size=None):
         """按分组转置卷积规则计算输出并缓存输入，返回全新嵌套 list。
 
         数值补边与 "valid" 的输出 [N][O][OH][OW] 为
         OH=(H-1)*SH-PT-PB+(KH-1)*DH+1+OPH、
         OW=(W-1)*SW-PL-PR+(KW-1)*DW+1+OPW；"same" 为 OH=H*SH、
-        OW=W*SW（四边补边见类文档）。每个输出从 bias[o] 起按组内
-        c→kh→kw 累加，仅当 (oh+PT-kh*DH)、(ow+PL-kw*DW) 分别可被 SH、
-        SW 整除且商 ih、iw 有效时加入乘积（是否命中完全由上述坐标条件
-        决定，output_padding 仅扩大输出窗口）。输出高/宽非正或计算出现
-        非有限值抛 ValueError。padding 为 "same"/"valid" 时按本次
-        forward 解析四边补边。校验或计算失败不改变实参、旧缓存与旧的
-        解析补边；成功后才缓存输入、输出形状与本次解析的
-        (PT, PB, PL, PR)。
+        OW=W*SW（四边补边见类文档）。output_size 仅可为 None 或恰含
+        (OH, OW) 的正 int tuple（成员拒绝 bool；整体或成员类型错抛
+        TypeError，长度错或成员非正抛 ValueError）：每次先按既有规则
+        解析四边补边，令 BH=(H-1)*SH-PT-PB+(KH-1)*DH+1、
+        BW=(W-1)*SW-PL-PR+(KW-1)*DW+1；None 沿用构造时 OPH/OPW，
+        tuple 则令本次 OPH=OH-BH、OPW=OW-BW，任一不满足
+        0≤OPH<SH、0≤OPW<SW 抛 ValueError。该覆盖只作用于本次调用，
+        不修改构造配置。每个输出从 bias[o] 起按组内 c→kh→kw 累加，仅当
+        (oh+PT-kh*DH)、(ow+PL-kw*DW) 分别可被 SH、SW 整除且商 ih、iw
+        有效时加入乘积（是否命中完全由上述坐标条件决定，output_padding
+        仅扩大输出窗口）。输出高/宽非正或计算出现非有限值抛 ValueError。
+        padding 为 "same"/"valid" 时按本次 forward 解析四边补边。校验
+        或计算失败不改变实参、旧缓存与旧的解析补边；成功后才缓存输入、
+        输出形状与本次解析的 (PT, PB, PL, PR)。
         """
         _require_list(x, "x")
         n_, c_, h_, w_ = _shape_of(x, 4, "x")
@@ -1039,21 +1083,34 @@ class ConvTranspose2D:
         o_ch_ = self._o_channels
         sh_, sw_ = self._stride
         dh_, dw_ = self._dilation
-        oph_, opw_ = self._output_padding
         ekh_ = (kh_ - 1) * dh_ + 1
         ekw_ = (kw_ - 1) * dw_ + 1
         # 本次 forward 实际四边补边：tuple 原样、valid 全 0、same 按
         # T=E+OP-S 解析（仅写入局部变量，成功末尾才提交到 self._padding）。
+        # 四边补边与 output_size 无关，一律按构造时 OPH/OPW 解析。
+        oph_, opw_ = self._output_padding
         pt_, pb_, pl_, pr_ = _resolve_convtranspose_padding2d(
             self._padding_spec, h_, w_, sh_, sw_,
             ekh_, ekw_, oph_, opw_,
         )
-        if self._padding_spec == "same":
-            oh_ = h_ * sh_
-            ow_ = w_ * sw_
-        else:
-            oh_ = (h_ - 1) * sh_ - pt_ - pb_ + ekh_ + oph_
-            ow_ = (w_ - 1) * sw_ - pl_ - pr_ + ekw_ + opw_
+        # 无输出补边时的输出高/宽 BH/BW；output_size 的结构校验也在此步
+        # （补边解析之后）进行。
+        bh_ = (h_ - 1) * sh_ - pt_ - pb_ + ekh_
+        bw_ = (w_ - 1) * sw_ - pl_ - pr_ + ekw_
+        output_size = _check_convtranspose_output_size(output_size)
+        if output_size is not None:
+            # 本次调用的输出补边覆盖：OPH=OH-BH、OPW=OW-BW 须满足
+            # 0≤OP<对应步幅，只作用于本次调用，不改构造时 output_padding。
+            oph_ = output_size[0] - bh_
+            opw_ = output_size[1] - bw_
+            if not (0 <= oph_ < sh_) or not (0 <= opw_ < sw_):
+                raise ValueError(
+                    "output_size 隐含的输出补边越界：OPH=%d、SH=%d、"
+                    "OPW=%d、SW=%d（须满足 0≤OPH<SH、0≤OPW<SW）"
+                    % (oph_, sh_, opw_, sw_)
+                )
+        oh_ = bh_ + oph_
+        ow_ = bw_ + opw_
         if oh_ <= 0 or ow_ <= 0:
             raise ValueError(
                 "转置卷积输出尺寸非正：OH=%d、OW=%d" % (oh_, ow_)
