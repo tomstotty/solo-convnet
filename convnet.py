@@ -74,18 +74,22 @@
   批顺序排列、长度 epochs*ceil(N/batch_size) 的各批更新前批均损失
   新 list[float]；任何异常都把七层整体恢复到函数入口状态。
 - train_deep_step(layers, x, labels, lr=0.1)：对
-  Conv2D→BatchNorm2D→Dropout→(MaxPool2D、AdaptiveAvgPool2D 或
+  Conv2D→BatchNorm2D→(Dropout 或 Dropout2D)→(MaxPool2D、
+  AdaptiveAvgPool2D 或
   AdaptiveMaxPool2D)→Flatten→Linear→ReLU→Linear→SoftmaxCrossEntropy
-  九层（双层分类头）按序前向、自损失层起逆序反传，以新 list 同步
+  九层（双层分类头；索引 2 接受 Dropout 或整通道 Dropout2D，其余类型
+  抛 TypeError）按序前向、自损失层起逆序反传，以新 list 同步
   更新 conv 权重/偏置、BN gamma/beta 及两个 Linear 权重/偏置（损失
   梯度已批均，不再除 N），返回更新前 float 批均损失；容器/成员类型
-  错抛 TypeError，长度错或 BN/Dropout 非训练态抛 ValueError；成功
+  错抛 TypeError，长度错或 BN/Dropout/Dropout2D 非训练态抛
+  ValueError；成功
   保留更新与状态推进，任何异常都把九层（含参数引用）恢复到入口状态。
 - train_deep_batches(layers, x, labels, batch_size=1, epochs=1, lr=0.1,
   seed=0, shuffle=True, clip=None, state=None, max_batches=None)：每轮按
   [0,…,N-1]（shuffle 为真时以 seed 起始、跨轮延续的 32 位 LCG 做
   Fisher–Yates 洗牌）切分为大小 batch_size 的批（末批可短），逐批按
-  train_deep_step 次序前反向（九层结构同 train_deep_step，第 4 层接受
+  train_deep_step 次序前反向（九层结构同 train_deep_step，索引 2 接受
+  Dropout 或 Dropout2D，第 4 层接受
   MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D，后者反向按首个
   最大坐标传梯度并累加重叠分箱），并在同步 SGD 更新前依次展平 conv
   权重/偏置、BN gamma/beta、两个 Linear 权重/偏置八组梯度，以
@@ -131,7 +135,8 @@
 - train_deep_accum_batches(layers, x, labels, microbatch_size=1,
   accum_steps=2, epochs=1, lr=0.1, seed=0, shuffle=True, clip=None,
   state=None, max_updates=None, max_microbatches=None)：
-  九层结构、顺序与 x、labels 异常沿用 train_deep_step（第 4 层接受
+  九层结构、顺序与 x、labels 异常沿用 train_deep_step（索引 2 接受
+  Dropout 或 Dropout2D，第 4 层接受
   MaxPool2D、AdaptiveAvgPool2D、AdaptiveMaxPool2D，AdaptiveMaxPool2D
   反向按首个最大坐标传梯度并累加重叠分箱）；其余参数、异常与 LCG 洗牌
   沿用 train_deep_batches（microbatch_size、accum_steps 为正 int 且
@@ -158,12 +163,15 @@
   容器或叶类型错抛 TypeError，长度、形状、排列、范围、非有限或字段不
   一致抛 ValueError；累计量不跨轮，轮末短组必结算。无累计量返回四元
   状态，否则返回八元状态。不修改入参 state，任意微批/更新边界分段的两
-  列表拼接、八组参数、BN 统计、Dropout 状态与终态均与一次训练完成完全
-  相同。累计、求均值、范数或新参数非有限抛 ValueError；失败恢复入口
-  状态与参数引用且不改 x、labels，成功保留 BN 统计与 Dropout 推进，
-  相同入口确定。
+  列表拼接、八组参数、BN 统计、Dropout/Dropout2D 状态与终态均与一次
+  训练完成完全相同。累计、求均值、范数或新参数非有限抛 ValueError；
+  失败恢复入口
+  状态与参数引用且不改 x、labels，成功保留 BN 统计与 Dropout/Dropout2D
+  推进，相同入口确定。
 - check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6,
-  rtol=1e-4)：以中心差分依次检验 x 与上述八组参数的数值梯度，损失、
+  rtol=1e-4)：以中心差分依次检验 x 与上述八组参数的数值梯度（索引 2
+  接受 Dropout 或 Dropout2D，每次前向前恢复入口随机状态以重放同一
+  掩码），损失、
   误差、容差判定与 (ok, max_e, max_r) 返回沿用 check_train_gradients；
   pool 为 AdaptiveMaxPool2D 时任一次前向中任一分箱并列最大抛
   ValueError；结束时（含异常路径）九层入口状态与参数引用整体恢复，
@@ -7324,6 +7332,20 @@ _DEEP_BATCH_LAYER_NAMES = (
     "Flatten", "Linear", "ReLU", "Linear", "SoftmaxCrossEntropy",
 )
 
+# train_deep_step/check_deep_gradients/train_deep_batches/
+# train_deep_accum_batches 四个接口的第 3 层（索引 2）接受 Dropout 或
+# Dropout2D（整通道 dropout）；其余 deep 训练接口仍只接受 Dropout。
+_DEEP2_LAYER_TYPES = (
+    Conv2D, BatchNorm2D, (Dropout, Dropout2D),
+    (MaxPool2D, AdaptiveAvgPool2D, AdaptiveMaxPool2D),
+    Flatten, Linear, ReLU, Linear, SoftmaxCrossEntropy,
+)
+_DEEP2_LAYER_NAMES = (
+    "Conv2D", "BatchNorm2D", "Dropout 或 Dropout2D",
+    "MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D",
+    "Flatten", "Linear", "ReLU", "Linear", "SoftmaxCrossEntropy",
+)
+
 
 def _check_deep_layer_types(
     layers, expected=_DEEP_LAYER_TYPES, names=_DEEP_LAYER_NAMES
@@ -7385,6 +7407,22 @@ def _validate_deep_batch_layers(layers):
         raise ValueError("Dropout 必须处于训练态")
 
 
+def _validate_deep2_layers(layers):
+    """严格九层结构校验（索引 2 接受 Dropout2D 的四个 deep 接口契约）。
+
+    与 _validate_deep_layers 相同，但 layers[2] 接受 Dropout 或
+    Dropout2D 实例：容器或成员类型错抛 TypeError，长度错或
+    BN/Dropout/Dropout2D 非训练态抛 ValueError。
+    """
+    _check_deep_layer_types(layers, _DEEP2_LAYER_TYPES, _DEEP2_LAYER_NAMES)
+    if not layers[1]._training:
+        raise ValueError("BatchNorm2D 必须处于训练态")
+    if not layers[2]._training:
+        raise ValueError(
+            "%s 必须处于训练态" % type(layers[2]).__name__
+        )
+
+
 def _snapshot_deep_layers(layers):
     """快照九层的全部实例 __dict__（含参数引用、缓存与随机状态）。"""
     return tuple(dict(layer.__dict__) for layer in layers)
@@ -7409,14 +7447,17 @@ def _check_deep_scalar(value, name):
 
 
 def train_deep_step(layers, x, labels, lr=0.1):
-    """九层网络（Conv2D/BN/Dropout/(MaxPool、AdaptiveAvgPool 或
-    AdaptiveMaxPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头）
+    """九层网络（Conv2D/BN/(Dropout 或 Dropout2D)/(MaxPool、
+    AdaptiveAvgPool 或 AdaptiveMaxPool)/Flatten/Linear/ReLU/Linear/
+    SoftmaxCE，双层分类头）
     的一步训练：按列表顺序前向，自损失层 backward() 起逆序反传，以新
     list 同步把 conv 的 weights/bias、BN 的 gamma/beta、两个 Linear 的
     weights/bias 各减去 lr 乘对应梯度，返回更新前 float 批均损失。
 
-    layers 必须是恰含上述九层实例的 list：容器/成员类型错抛 TypeError，
-    长度错或 BN/Dropout 非训练态抛 ValueError。lr 必须是正的有限
+    layers 必须是恰含上述九层实例的 list（索引 2 接受 Dropout 或
+    Dropout2D，其余类型抛 TypeError；Dropout2D 按 n→c 逐通道推进随机
+    状态并广播整通道掩码完成前反向）：容器/成员类型错抛 TypeError，
+    长度错或 BN/Dropout/Dropout2D 非训练态抛 ValueError。lr 必须是正的有限
     int/float（拒绝 bool）：类型错抛 TypeError，非有限或非正抛
     ValueError。x 的校验沿各层 forward，labels 的校验沿损失层 forward；
     维度或标签不匹配等被调层错误原样传播（含展平维度与首个 Linear
@@ -7426,13 +7467,13 @@ def train_deep_step(layers, x, labels, lr=0.1):
     损失、任一传播梯度/参数梯度或更新后的参数含非有限值均抛
     ValueError。
 
-    成功时以新 list 同步替换层内参数，前向缓存、BN 运行统计与 Dropout
-    随机推进均保留；任何路径都不修改 x、labels 及构造参数所用的原
-    list；一旦出错（含校验与非有限值），九层全部恢复到入口状态
+    成功时以新 list 同步替换层内参数，前向缓存、BN 运行统计与 Dropout/
+    Dropout2D 随机推进均保留；任何路径都不修改 x、labels 及构造参数所用
+    的原 list；一旦出错（含校验与非有限值），九层全部恢复到入口状态
     （含参数引用、随机状态、运行统计与旧缓存），如同本次调用从未发生。
     相同入口状态结果完全确定。
     """
-    _validate_deep_layers(layers)
+    _validate_deep2_layers(layers)
     _check_deep_scalar(lr, "lr")
     if lr <= 0:
         raise ValueError("lr 必须为正数")
@@ -7519,10 +7560,11 @@ def train_deep_step(layers, x, labels, lr=0.1):
 def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
     """用中心差分数值梯度检验九层双层分类头训练链。
 
-    layers 须为恰含 Conv2D/BatchNorm2D/Dropout/(MaxPool2D、
+    layers 须为恰含 Conv2D/BatchNorm2D/(Dropout 或 Dropout2D)/(MaxPool2D、
     AdaptiveAvgPool2D 或 AdaptiveMaxPool2D)/Flatten/Linear/ReLU/Linear/
-    SoftmaxCrossEntropy 九层实例的 list：容器/成员类型错抛 TypeError，
-    长度错或 BN/Dropout 非训练态抛 ValueError。前向按 conv→bn→dropout→
+    SoftmaxCrossEntropy 九层实例的 list（索引 2 为其他类型抛
+    TypeError）：容器/成员类型错抛 TypeError，
+    长度错或 BN/Dropout/Dropout2D 非训练态抛 ValueError。前向按 conv→bn→dropout→
     pool→flatten→linear1→relu→linear2 执行得 logits，标量损失 L =
     loss.forward(logits, labels) 为 float 批均损失；解析梯度自
     loss.backward() 起按 linear2→relu→linear1→flatten→pool→dropout→
@@ -7533,7 +7575,8 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
     Linear 的 weights/bias、第二个 Linear 的 weights/bias（各张量内部按
     嵌套序），n = (L(v+eps) - L(v-eps)) / (2*eps)。每次前向（含解析
     梯度前向与每次正、负扰动前向）之前都把 dropout 的随机状态 _s 恢复
-    为入口值，使各次前向重放同一掩码，故同一入口状态结果确定。
+    为入口值，使各次前向重放同一掩码（Dropout2D 重放同一 [N][C] 通道
+    掩码），故同一入口状态结果确定。
     BatchNorm2D 每次数值前向都重新按当前批次统计。pool 为 MaxPool2D
     时，任一次前向中任一池化有效窗口并列最大（补边位置不参与比较）
     一律抛 ValueError；pool 为 AdaptiveMaxPool2D 时，任一次前向中任一
@@ -7549,11 +7592,11 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
     eps 非正、容差为负或任一非有限抛 ValueError。x 的校验沿各层
     forward，labels 的校验沿 loss.forward；维度或标签不匹配、计算或
     梯度非有限均抛 ValueError。x、labels、参数及九层实例状态（训练/
-    推理模式、缓存、Dropout 随机状态与掩码、BatchNorm2D 运行统计、
-    SoftmaxCrossEntropy 缓存）在所有成功或异常路径均原样恢复（含参数
-    引用），重复调用结果一致。
+    推理模式、缓存、Dropout/Dropout2D 随机状态与掩码、BatchNorm2D 运行
+    统计、SoftmaxCrossEntropy 缓存）在所有成功或异常路径均原样恢复
+    （含参数引用），重复调用结果一致。
     """
-    _check_deep_layer_types(layers)
+    _check_deep_layer_types(layers, _DEEP2_LAYER_TYPES, _DEEP2_LAYER_NAMES)
     for name, val in (("eps", eps), ("atol", atol), ("rtol", rtol)):
         _check_deep_scalar(val, name)
     if eps <= 0:
@@ -7565,7 +7608,9 @@ def check_deep_gradients(layers, x, labels, eps=1e-6, atol=1e-6, rtol=1e-4):
     if not layers[1]._training:
         raise ValueError("BatchNorm2D 仅在训练态支持梯度检查")
     if not layers[2]._training:
-        raise ValueError("Dropout 仅在训练态支持梯度检查")
+        raise ValueError(
+            "%s 仅在训练态支持梯度检查" % type(layers[2]).__name__
+        )
 
     conv, bn, dropout, pool, flatten, linear1, relu, linear2, loss = layers
     saved_state = _snapshot_deep_layers(layers)
@@ -7797,10 +7842,11 @@ def train_deep_batches(
     layers, x, labels, batch_size=1, epochs=1, lr=0.1, seed=0,
     shuffle=True, clip=None, state=None, max_batches=None,
 ):
-    """九层网络（Conv2D/BN/Dropout/(MaxPool、AdaptiveAvgPool 或
-    AdaptiveMaxPool)/Flatten/Linear/ReLU/Linear/SoftmaxCE，双层分类头；
-    第 4 层接受 MaxPool2D、AdaptiveAvgPool2D 或 AdaptiveMaxPool2D，
-    其他类型抛 TypeError）
+    """九层网络（Conv2D/BN/(Dropout 或 Dropout2D)/(MaxPool、
+    AdaptiveAvgPool 或 AdaptiveMaxPool)/Flatten/Linear/ReLU/Linear/
+    SoftmaxCE，双层分类头；
+    第 3 层（索引 2）接受 Dropout 或 Dropout2D，第 4 层接受 MaxPool2D、
+    AdaptiveAvgPool2D 或 AdaptiveMaxPool2D，其他类型抛 TypeError）
     的分轮分批训练：每轮按顺序 [0,…,N-1]（shuffle 为真时先做 Fisher–
     Yates 洗牌）切分若干批，逐批按 train_deep_step 的次序前向、自损失层
     起逆序反传，并在同步 SGD 更新前对全部八组参数梯度做可选全局范数裁剪；
@@ -7833,10 +7879,11 @@ def train_deep_batches(
     后 cursor 前进一个批长（最后一批可为短批）；cursor 到达 N 即轮毕：
     epoch 加一、order 清空、cursor 归 0（rng 保持轮界洗牌后的值）。
     入参 state 不会被修改。任意批边界切分后多次调用的两列表拼接、八组
-    参数、BN 运行统计、Dropout 随机状态（含掩码）及终态，均与原函数一次
-    训练完成完全相同。
+    参数、BN 运行统计、Dropout/Dropout2D 随机状态（含掩码）及终态，
+    均与原函数一次训练完成完全相同。
 
-    layers 的九层类型/顺序与 BN/Dropout 训练态校验、lr 校验以及各批 x、
+    layers 的九层类型/顺序与 BN/Dropout/Dropout2D 训练态校验、lr 校验
+    以及各批 x、
     labels 的校验均沿用 train_deep_step（各批仅切取 x、labels 的新子
     list 传入，不复制样本；pool 为 AdaptiveMaxPool2D 时反向把各分箱
     梯度累加到 forward 记录的首个最大坐标，重叠分箱的梯度累加）；另要求
@@ -7862,10 +7909,10 @@ def train_deep_batches(
     更新时不额外除批量。
 
     任一失败（含参数校验、x/labels 不匹配与各批前反向、非有限值错误）都把
-    九层的参数引用、模式、缓存、BN 运行统计、Dropout 随机状态与掩码整体
-    恢复到函数入口状态，且不修改 x、labels 及构造参数所用的原 list；成功时
-    保留全部参数更新与各批带来的 BN 统计、Dropout 随机推进。相同入口状态
-    结果完全确定。
+    九层的参数引用、模式、缓存、BN 运行统计、Dropout/Dropout2D 随机状态
+    与掩码整体恢复到函数入口状态，且不修改 x、labels 及构造参数所用的原
+    list；成功时保留全部参数更新与各批带来的 BN 统计、Dropout/Dropout2D
+    随机推进。相同入口状态结果完全确定。
     """
     if isinstance(batch_size, bool) or not isinstance(batch_size, int):
         raise TypeError(
@@ -7891,7 +7938,7 @@ def train_deep_batches(
         raise TypeError(
             "shuffle 必须是 bool，得到 %s" % type(shuffle).__name__
         )
-    _validate_deep_batch_layers(layers)
+    _validate_deep2_layers(layers)
     _check_deep_scalar(lr, "lr")
     if lr <= 0:
         raise ValueError("lr 必须为正数")
@@ -9182,7 +9229,8 @@ def train_deep_accum_batches(
     seed=0, shuffle=True, clip=None, state=None, max_updates=None,
     max_microbatches=None,
 ):
-    """九层网络（结构同 train_deep_step，第 4 层接受 MaxPool2D、
+    """九层网络（结构同 train_deep_step，索引 2 接受 Dropout 或
+    Dropout2D，第 4 层接受 MaxPool2D、
     AdaptiveAvgPool2D 或 AdaptiveMaxPool2D）的微批梯度累积分轮训练：
     每轮按 [0,…,N-1]（shuffle 为真时以 seed 起始、跨轮延续的 32 位
     LCG 做 Fisher–Yates 洗牌）切分为大小 microbatch_size 的微批（末批
@@ -9229,10 +9277,11 @@ def train_deep_accum_batches(
     完成态（epoch == epochs）仅对正数预算（max_updates 或
     max_microbatches 为正）抛 ValueError，预算均为 None 或 0 时原样
     返回。不修改入参 state；任意微批/更新边界分段后多次调用的
-    losses/grad_norms 拼接、八组参数、BN 运行统计、Dropout 随机状态与
-    终态，均与一次训练完成完全相同。
+    losses/grad_norms 拼接、八组参数、BN 运行统计、Dropout/Dropout2D
+    随机状态与终态，均与一次训练完成完全相同。
 
-    layers 的九层类型/顺序与 BN/Dropout 训练态校验、lr 校验以及各微批
+    layers 的九层类型/顺序与 BN/Dropout/Dropout2D 训练态校验、lr 校验
+    以及各微批
     x、labels 的校验均沿用 train_deep_step（各微批仅切取 x、labels 的
     新子 list 传入，不复制样本），另要求 labels 与 x 样本数相等，否则
     抛 ValueError。pool 为 AdaptiveMaxPool2D 时反向把各分箱梯度累加到
@@ -9250,10 +9299,10 @@ def train_deep_accum_batches(
 
     累计、求均值、范数或更新后的参数含非有限值均抛 ValueError。任一
     失败（含参数校验、x/labels 不匹配与各微批前反向、非有限值错误）
-    都把九层的参数引用、模式、缓存、BN 运行统计、Dropout 随机状态与
-    掩码整体恢复到函数入口状态，且不修改 x、labels 及构造参数所用的
-    原 list；成功时保留全部参数更新与各微批带来的 BN 统计、Dropout
-    随机推进。相同入口状态结果完全确定。
+    都把九层的参数引用、模式、缓存、BN 运行统计、Dropout/Dropout2D
+    随机状态与掩码整体恢复到函数入口状态，且不修改 x、labels 及构造参数
+    所用的原 list；成功时保留全部参数更新与各微批带来的 BN 统计、
+    Dropout/Dropout2D 随机推进。相同入口状态结果完全确定。
     """
     if isinstance(microbatch_size, bool) or not isinstance(
         microbatch_size, int
@@ -9288,7 +9337,7 @@ def train_deep_accum_batches(
         raise TypeError(
             "shuffle 必须是 bool，得到 %s" % type(shuffle).__name__
         )
-    _validate_deep_layers(layers)
+    _validate_deep2_layers(layers)
     _check_deep_scalar(lr, "lr")
     if lr <= 0:
         raise ValueError("lr 必须为正数")
